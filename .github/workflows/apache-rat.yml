@@ -1,0 +1,66 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Apache RAT Scan
+
+on:
+  push:
+    branches: [ "**" ]
+    paths-ignore:
+      - "**/*.md"
+      - ".rat-excludes"
+      - "LICENSE"
+  pull_request:
+    branches: [ "main" ]
+    paths-ignore:
+      - "**/*.md"
+      - ".rat-excludes"
+      - "LICENSE"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rat-scan:
+    name: Apache RAT Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Cache Apache RAT
+        id: cache-rat
+        uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+        with:
+          path: apache-rat-0.17.jar
+          key: rat-0.17
+
+      - name: Download Apache RAT
+        if: steps.cache-rat.outputs.cache-hit != 'true'
+        run: |
+          curl -sL https://repo1.maven.org/maven2/org/apache/rat/apache-rat/0.17/apache-rat-0.17.jar -o apache-rat-0.17.jar
+
+      - name: Run Apache RAT Scan
+        run: |
+          # Use pre-installed Java to save time and API calls
+          java -jar apache-rat-0.17.jar --input-exclude-file .rat-excludes -- .
