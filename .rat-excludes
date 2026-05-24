@@ -15,24 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-notifications:
-  commits: commits@fineract.apache.org
-  pullrequests: issues@fineract.apache.org
-github:
-  enabled_merge_buttons:
-    merge: true
-    squash: false
-    rebase: false
-  rulesets:
-    - name: 'Branch Protection'
-      type: branch
-      branches:
-        includes:
-          - 'main'
-      restrict_deletion: true
-      restrict_force_push: true
-      required_signatures: true
-      required_linear_history: false
-      required_conversation_resolution: true
-      required_pull_request_reviews:
-        required_approving_review_count: 1
+**/node_modules/**
+**/target/**
+**/dist/**
+**/build/**
+.rat-excludes
+LICENSE
+*.jar
