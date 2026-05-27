@@ -22,3 +22,5 @@
 .rat-excludes
 LICENSE
 *.jar
+bom.json
+bom.xml
