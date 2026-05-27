@@ -1,0 +1,103 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Dependency License Check
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**/requirements*.txt"
+      - "scripts/check_licenses.py"
+      - ".github/workflows/license-check.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "**/requirements*.txt"
+      - "scripts/check_licenses.py"
+      - ".github/workflows/license-check.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-license-check:
+    name: Dependency License Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "**/requirements*.txt"
+
+      - name: Install project dependencies
+        run: |
+          req_files=$(find . -name "requirements*.txt" \
+            -not -path "./.git/*" | sort)
+
+          if [ -z "$req_files" ]; then
+            echo "No requirements files found — nothing to install."
+            exit 0
+          fi
+
+          echo "Installing from:"
+          for f in $req_files; do
+            echo "  $f"
+            pip install --quiet -r "$f"
+          done
+
+      - name: Check ASF license compliance
+        run: python scripts/check_licenses.py
+
+      - name: Install CycloneDX BOM tool
+        run: pip install --quiet "cyclonedx-bom>=4,<5"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          cyclonedx-py environment \
+            --of JSON \
+            --outfile bom.json
+          python -c "
+          import json
+          bom = json.load(open('bom.json'))
+          components = bom.get('components', [])
+          print(f'  Components: {len(components)}')
+          print(f'  BOM version: {bom.get(\"version\", \"?\")}')
+          print(f'  Spec version: {bom.get(\"specVersion\", \"?\")}')
+          "
+
+      - name: Upload CycloneDX BOM
+        if: always()
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+        with:
+          name: cyclonedx-bom
+          path: bom.json
+          if-no-files-found: warn
+          retention-days: 90
