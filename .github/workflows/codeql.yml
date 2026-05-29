@@ -20,12 +20,8 @@ name: 'CodeQL Advanced'
 on:
   push:
     branches: ['**']
-    paths:
-      - '.github/workflows/**'
   pull_request:
     branches: ['main']
-    paths:
-      - '.github/workflows/**'
   schedule:
     - cron: '40 11 * * 4'
 
@@ -51,6 +47,8 @@ jobs:
       matrix:
         include:
           - language: actions
+            build-mode: none
+          - language: python
             build-mode: none
     steps:
       - name: Checkout repository
