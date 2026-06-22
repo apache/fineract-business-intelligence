@@ -69,7 +69,7 @@ REVOKE ALL ON SCHEMA staging FROM ${WAREHOUSE_READER_USER};
 REVOKE ALL ON SCHEMA intermediate FROM ${WAREHOUSE_READER_USER};
 EOSQL
 
-# Grant admin access to superset_metadata database.
+
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "superset_metadata" <<EOSQL
 GRANT ALL PRIVILEGES ON DATABASE superset_metadata TO ${POSTGRES_USER};
 EOSQL

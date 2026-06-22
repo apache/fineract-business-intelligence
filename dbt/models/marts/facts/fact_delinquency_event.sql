@@ -13,6 +13,13 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+{{
+    config(
+        materialized='incremental',
+        unique_key='delinquency_event_key'
+    )
+}}
+
 with ordered_events as (
     select
         tenant_id,

@@ -69,13 +69,11 @@ services:
       dockerfile: docker/extractor/Dockerfile
     container_name: fineract-bi-extractor
     depends_on:
-      fineract-db:
-        condition: service_healthy
       warehouse:
         condition: service_healthy
     environment:
-      SOURCE_DB_HOST: fineract-db
-      SOURCE_DB_PORT: "5432"
+      SOURCE_DB_HOST: ${SOURCE_DB_HOST:-host.docker.internal}
+      SOURCE_DB_PORT: ${SOURCE_DB_HOST_PORT:-5432}
       SOURCE_DB_NAME: ${SOURCE_DB_NAME:?SOURCE_DB_NAME must be set}
       SOURCE_DB_USER: ${SOURCE_REPLICA_USER:?SOURCE_REPLICA_USER must be set}
       SOURCE_DB_PASSWORD: ${SOURCE_REPLICA_PASSWORD:?SOURCE_REPLICA_PASSWORD must be set}
@@ -90,12 +88,28 @@ services:
       REPLICA_LAG_THRESHOLD_SECONDS: "300"
       COB_LOOKBACK_HOURS: "9999"
       EXTRACT_LOOKBACK_SECONDS: "600"
+      PIPELINE_MODE: ${PIPELINE_MODE:-incremental}
+      PIPELINE_INTERVAL_SECONDS: ${PIPELINE_INTERVAL_SECONDS:-3600}
       PYTHONPATH: /app
       PYTHONUNBUFFERED: "1"
+    networks:
+      - default
+      - fineract_network
     volumes:
       - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
     working_dir: /app
-    command: ["tail", "-f", "/dev/null"]
+    command: >
+      bash -c "
+        echo '[pipeline] Waiting 30s for Superset to finish initialising...';
+        sleep 30;
+        bash /app/scripts/run_pipeline.sh backfill;
+        while true; do
+          bash /app/scripts/run_pipeline.sh incremental || true;
+          echo \"[pipeline] Sleeping \$${PIPELINE_INTERVAL_SECONDS}s\";
+          sleep \$${PIPELINE_INTERVAL_SECONDS};
+        done
+      "
 
   dbt:
     build:
@@ -155,3 +169,10 @@ volumes:
   fineract_db_data:
   warehouse_data:
   superset_home:
+
+networks:
+  default:
+    name: fineract-business-intelligence_default
+  fineract_network:
+    external: true
+    name: fineract_default

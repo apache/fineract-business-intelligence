@@ -15,4 +15,4 @@
 # specific language governing permissions and limitations
 # under the License.
 
-dbt-postgres>=1.10.0,<2.0
+dbt-postgres>=1.8.0,<2.0.0a1
