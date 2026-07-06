@@ -22,8 +22,8 @@ fineract_bi:
       type: postgres
       host: "{{ env_var('PGHOST', 'warehouse') }}"
       port: "{{ env_var('PGPORT', '5432') | int }}"
-      user: "{{ env_var('PGUSER') }}"
-      password: "{{ env_var('PGPASSWORD') }}"
+      user: "{{ env_var('PGUSER', 'ci') }}"
+      password: "{{ env_var('PGPASSWORD', 'ci') }}"
       dbname: "{{ env_var('PGDATABASE', 'analytics') }}"
       schema: analytics
       threads: 4

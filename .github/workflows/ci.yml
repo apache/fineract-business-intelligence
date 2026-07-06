@@ -1,0 +1,354 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI Build & Verification
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  compilation-checks:
+    name: Compile & Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            extractor/requirements.txt
+            dbt/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r extractor/requirements.txt
+          pip install -r dbt/requirements.txt
+
+      - name: Python syntax check - extractor
+        run: python -m py_compile extractor/*.py
+
+      - name: Python syntax check - bootstrap
+        run: python -m py_compile docker/superset/bootstrap_superset_assets.py
+
+      - name: Python syntax check - scripts
+        run: python -m py_compile scripts/check_licenses.py
+
+      - name: dbt parse - validate all SQL models and refs (no DB connection)
+        run: |
+          cd dbt
+          dbt parse --profiles-dir . --target local
+
+  integration-test:
+    name: End-to-End Build & Smoke Test
+    runs-on: ubuntu-24.04
+    needs: compilation-checks
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Copy env config
+        run: |
+          cp .env.example .env
+          echo "SOURCE_DB_HOST=fineract-db" >> .env
+          echo "SOURCE_DB_HOST_PORT=5432" >> .env
+
+      - name: Remove stale volumes from any previous run
+        run: docker compose down -v --remove-orphans 2>/dev/null || true
+
+      - name: Create external Docker network required by extractor service
+        run: docker network create fineract_default || true
+
+      - name: Build Docker images
+        run: docker compose build
+
+      - name: Start data services
+        run: docker compose up -d fineract-db warehouse extractor dbt
+
+      - name: Wait for fineract-db to be ready
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect --format='{{.State.Status}}' fineract-bi-fineract-db 2>/dev/null || echo "missing")
+            if [ "$STATUS" = "exited" ] || [ "$STATUS" = "dead" ]; then
+              echo "ERROR: fineract-db container exited unexpectedly"
+              docker logs fineract-bi-fineract-db
+              exit 1
+            fi
+            docker exec fineract-bi-fineract-db pg_isready -U root -d postgres && break
+            [ "$i" -eq 30 ] && { echo "ERROR: fineract-db never became ready"; docker logs fineract-bi-fineract-db; exit 1; }
+            sleep 3
+          done
+
+      - name: Wait for warehouse to be ready
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect --format='{{.State.Status}}' fineract-bi-warehouse 2>/dev/null || echo "missing")
+            if [ "$STATUS" = "exited" ] || [ "$STATUS" = "dead" ]; then
+              echo "ERROR: warehouse container exited unexpectedly"
+              docker logs fineract-bi-warehouse
+              exit 1
+            fi
+            docker exec fineract-bi-warehouse pg_isready -U analytics_admin -d analytics && break
+            [ "$i" -eq 30 ] && { echo "ERROR: warehouse never became ready"; docker logs fineract-bi-warehouse; exit 1; }
+            sleep 3
+          done
+
+      - name: Create Fineract schema in source database
+        run: |
+          docker exec -i \
+            -e PGPASSWORD=skdcnwauicn2ucnaecasdsajdnizucawencascdca \
+            fineract-bi-fineract-db \
+            psql -U root -d fineract_default \
+            < warehouse/seed/schema_fineract_source.sql
+
+      - name: Seed Fineract source database
+        run: |
+          docker exec -i \
+            -e PGPASSWORD=skdcnwauicn2ucnaecasdsajdnizucawencascdca \
+            fineract-bi-fineract-db \
+            psql -U root -d fineract_default \
+            < warehouse/seed/seed_fineract_source.sql
+
+      - name: Create bi_connector_source views and grant reader access
+        run: |
+          docker exec -i \
+            -e PGPASSWORD=skdcnwauicn2ucnaecasdsajdnizucawencascdca \
+            fineract-bi-fineract-db \
+            psql -U root -d fineract_default <<'SQL'
+          CREATE SCHEMA IF NOT EXISTS bi_connector_source;
+          CREATE OR REPLACE VIEW bi_connector_source.m_office AS
+            SELECT id, parent_id, hierarchy, external_id, name, opening_date,
+              '1970-01-01 00:00:00+00'::timestamptz AS created_on_utc,
+              '1970-01-01 00:00:00+00'::timestamptz AS last_modified_on_utc
+            FROM public.m_office;
+          CREATE OR REPLACE VIEW bi_connector_source.m_currency AS
+            SELECT id, code, decimal_places, currency_multiplesof, display_symbol,
+              name, internationalized_name_code,
+              '1970-01-01 00:00:00+00'::timestamptz AS created_on_utc,
+              '1970-01-01 00:00:00+00'::timestamptz AS last_modified_on_utc
+            FROM public.m_currency;
+          CREATE OR REPLACE VIEW bi_connector_source.m_client AS
+            SELECT id, account_no, external_id, status_enum, activation_date,
+              office_joining_date, office_id, staff_id, gender_cv_id,
+              date_of_birth, legal_form_enum, submittedon_date, updated_on,
+              created_on_utc, last_modified_on_utc
+            FROM public.m_client;
+          CREATE OR REPLACE VIEW bi_connector_source.m_product_loan AS
+            SELECT id, short_name, currency_code, currency_digits, currency_multiplesof,
+              principal_amount, min_principal_amount, max_principal_amount,
+              arrearstolerance_amount, name, description,
+              nominal_interest_rate_per_period, annual_nominal_interest_rate,
+              repay_every, repayment_period_frequency_enum, number_of_repayments,
+              overdue_days_for_npa, start_date, close_date,
+              '1970-01-01 00:00:00+00'::timestamptz AS created_on_utc,
+              '1970-01-01 00:00:00+00'::timestamptz AS last_modified_on_utc
+            FROM public.m_product_loan;
+          CREATE OR REPLACE VIEW bi_connector_source.m_loan AS
+            SELECT id, account_no, external_id, client_id, product_id,
+              loan_status_id, loan_type_enum, currency_code, currency_digits,
+              currency_multiplesof, principal_amount_proposed, principal_amount,
+              approved_principal, net_disbursal_amount,
+              annual_nominal_interest_rate, nominal_interest_rate_per_period,
+              interest_method_enum, interest_calculated_in_period_enum,
+              term_frequency, term_period_frequency_enum, repay_every,
+              repayment_period_frequency_enum, number_of_repayments,
+              amortization_method_enum, submittedon_date, approvedon_date,
+              expected_disbursedon_date, expected_firstrepaymenton_date,
+              disbursedon_date, expected_maturedon_date, maturedon_date,
+              principal_disbursed_derived, principal_repaid_derived,
+              principal_writtenoff_derived, principal_outstanding_derived,
+              interest_charged_derived, interest_repaid_derived,
+              interest_writtenoff_derived, interest_outstanding_derived,
+              fee_charges_outstanding_derived, penalty_charges_outstanding_derived,
+              total_expected_repayment_derived, total_repayment_derived,
+              total_writtenoff_derived, total_outstanding_derived,
+              loan_counter, is_npa,
+              created_on_utc, last_modified_on_utc
+            FROM public.m_loan;
+          CREATE OR REPLACE VIEW bi_connector_source.m_loan_transaction AS
+            SELECT id, loan_id, office_id, is_reversed, transaction_type_enum,
+              transaction_date, amount, principal_portion_derived,
+              interest_portion_derived, fee_charges_portion_derived,
+              penalty_charges_portion_derived, outstanding_loan_balance_derived,
+              transaction_date AS submitted_on_date,
+              created_on_utc, last_modified_on_utc
+            FROM public.m_loan_transaction;
+          CREATE OR REPLACE VIEW bi_connector_source.m_delinquency_range AS
+            SELECT id, classification, min_age_days, max_age_days,
+              created_on_utc, last_modified_on_utc
+            FROM public.m_delinquency_range;
+          CREATE OR REPLACE VIEW bi_connector_source.m_delinquency_bucket AS
+            SELECT id, name, created_on_utc, last_modified_on_utc
+            FROM public.m_delinquency_bucket;
+          CREATE OR REPLACE VIEW bi_connector_source.m_delinquency_bucket_mappings AS
+            SELECT id, delinquency_range_id, delinquency_bucket_id,
+              created_on_utc, last_modified_on_utc
+            FROM public.m_delinquency_bucket_mappings;
+          CREATE OR REPLACE VIEW bi_connector_source.m_loan_delinquency_tag_history AS
+            SELECT id, delinquency_range_id, loan_id, addedon_date, liftedon_date,
+              created_on_utc, last_modified_on_utc
+            FROM public.m_loan_delinquency_tag_history;
+          CREATE OR REPLACE VIEW bi_connector_source.batch_job_execution AS
+            SELECT job_execution_id, status,
+              start_time::timestamptz AS start_time,
+              end_time::timestamptz AS end_time,
+              exit_code, exit_message,
+              create_time::timestamptz AS created_on_utc,
+              last_updated::timestamptz AS last_modified_on_utc
+            FROM public.batch_job_execution;
+          GRANT USAGE ON SCHEMA public TO fineract_reader;
+          GRANT SELECT ON ALL TABLES IN SCHEMA public TO fineract_reader;
+          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fineract_reader;
+          GRANT USAGE ON SCHEMA bi_connector_source TO fineract_reader;
+          GRANT SELECT ON ALL TABLES IN SCHEMA bi_connector_source TO fineract_reader;
+          SQL
+
+      - name: Run ELT pipeline (backfill)
+        run: docker compose exec -T extractor python -m extractor.cli backfill
+
+      - name: Run dbt models
+        run: docker compose exec -T dbt dbt run
+
+      - name: Run dbt tests
+        run: docker compose exec -T dbt dbt test
+
+      - name: Smoke 01 - PAR hierarchy PAR 30 >= PAR 60 >= PAR 90 always
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par WHERE bucket_key = -1 AND (par_30_ratio < par_60_ratio OR par_60_ratio < par_90_ratio)"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "PAR hierarchy violations: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: PAR cumulative invariant broken"; exit 1; }
+
+      - name: Smoke 02 - standard_par_band only contains expected values
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par WHERE standard_par_band NOT IN ('Performing','Watch-list','PAR 30-59','PAR 60-89','PAR 90+','All Portfolio')"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Invalid par_band values: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: unexpected standard_par_band value"; exit 1; }
+
+      - name: Smoke 03 - rollup completeness every office+product+date has bucket_key=-1 row
+        run: |
+          SQL="SELECT COUNT(*) FROM (SELECT DISTINCT snapshot_date, office_id, product_id FROM analytics.mart_delinquency_par WHERE bucket_key <> -1) combos LEFT JOIN analytics.mart_delinquency_par r ON r.snapshot_date = combos.snapshot_date AND r.office_id = combos.office_id AND r.product_id = combos.product_id AND r.bucket_key = -1 WHERE r.snapshot_date IS NULL"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Missing rollup rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: missing All Portfolio rollup row for some office+product+date"; exit 1; }
+
+      - name: Smoke 04 - no orphan mart rows office_id not in dim_office
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par p LEFT JOIN analytics.dim_office o ON p.office_id = o.office_id WHERE o.office_id IS NULL"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Orphan rows (no dim_office match): $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: mart has office_ids not in dim_office"; exit 1; }
+
+      - name: Smoke 05 - no date spine gaps within each office+product series
+        run: |
+          SQL="SELECT COUNT(*) FROM (SELECT spine.d, combos.office_id, combos.product_id FROM (SELECT office_id, product_id, MIN(snapshot_date) AS min_d, MAX(snapshot_date) AS max_d FROM analytics.mart_delinquency_par WHERE bucket_key = -1 GROUP BY office_id, product_id) combos CROSS JOIN LATERAL (SELECT generate_series(combos.min_d, combos.max_d, '1 day'::interval)::date AS d) spine) expected LEFT JOIN analytics.mart_delinquency_par p ON p.snapshot_date = expected.d AND p.office_id = expected.office_id AND p.product_id = expected.product_id AND p.bucket_key = -1 WHERE p.snapshot_date IS NULL"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Missing date spine rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: gaps in daily snapshot series within a combo's active range"; exit 1; }
+
+      - name: Smoke 06 - NPA amount never exceeds total portfolio amount
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par WHERE bucket_key = -1 AND npa_amount > total_portfolio_amount * 1.001"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "NPA > portfolio rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: npa_amount exceeds total_portfolio_amount"; exit 1; }
+
+      - name: Smoke 07 - each PAR ratio is between 0 and 1
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par WHERE bucket_key = -1 AND (par_30_ratio < 0 OR par_30_ratio > 1 OR par_60_ratio < 0 OR par_60_ratio > 1 OR par_90_ratio < 0 OR par_90_ratio > 1 OR npa_ratio < 0 OR npa_ratio > 1)"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Out-of-range ratio rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: ratio outside [0,1]"; exit 1; }
+
+      - name: Smoke 08 - per-component amounts never exceed GLP in portfolio health
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_portfolio_health WHERE par_outstanding_amount > gross_loan_portfolio * 1.001 OR npa_outstanding_amount > gross_loan_portfolio * 1.001 OR performing_outstanding_amount > gross_loan_portfolio * 1.001"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Component > GLP rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: portfolio component exceeds GLP"; exit 1; }
+
+      - name: Smoke 09 - disbursement transactions exist pipeline wrote data
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_portfolio_health WHERE disbursed_amount_on_date > 0"
+          COUNT=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Rows with disbursements: $COUNT"
+          [ "$COUNT" -gt 0 ] || { echo "FAIL: no disbursement rows - extractor wrote nothing"; exit 1; }
+
+      - name: Smoke 10 - all expected offices present in latest snapshot
+        run: |
+          SQL="SELECT COUNT(DISTINCT office_id) FROM analytics.mart_portfolio_health WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM analytics.mart_portfolio_health)"
+          COUNT=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Offices in latest snapshot: $COUNT"
+          [ "$COUNT" -ge 3 ] || { echo "FAIL: expected >=3 offices, got $COUNT"; exit 1; }
+
+      - name: Smoke 11 - no future snapshot dates date spine not beyond today
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par WHERE snapshot_date > CURRENT_DATE"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Future snapshot rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: snapshot_date beyond today"; exit 1; }
+
+      - name: Start Superset
+        run: docker compose up -d superset
+
+      - name: Wait for Superset to be healthy
+        run: |
+          for i in $(seq 1 40); do
+            docker compose exec -T superset curl -sf http://localhost:8088/health | grep -q OK && break
+            [ "$i" -eq 40 ] && { echo "ERROR: Superset never became healthy"; exit 1; }
+            sleep 5
+          done
+
+      - name: Smoke 12 - Superset is up and serving the health endpoint
+        run: |
+          docker compose exec -T superset curl -sf http://localhost:8088/health | grep -q OK
+          echo "Superset health: OK"
+
+      - name: Collect container logs on failure
+        if: failure()
+        run: |
+          mkdir -p ci-logs
+          docker compose logs --no-color --timestamps > ci-logs/docker-compose.log 2>&1 || true
+          docker ps -a > ci-logs/docker-ps.txt 2>&1 || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ github.run_id }}
+          path: ci-logs/
+          retention-days: 5
+
+      - name: Tear down
+        if: always()
+        run: docker compose down
