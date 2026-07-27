@@ -334,6 +334,55 @@ jobs:
           docker compose exec -T superset curl -sf http://localhost:8088/health | grep -q OK
           echo "Superset health: OK"
 
+      - name: Smoke 13 - repayment schedule rows were extracted to raw
+        run: |
+          SQL="SELECT COUNT(*) FROM raw.raw_m_loan_repayment_schedule"
+          COUNT=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "raw_m_loan_repayment_schedule rows: $COUNT"
+          [ "$COUNT" -gt 0 ] || { echo "FAIL: no repayment schedule rows in raw layer"; exit 1; }
+
+      - name: Smoke 14 - mart_repayment_behavior collection efficiency ratio is between 0 and 2
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_repayment_behavior WHERE collection_efficiency_ratio < 0 OR collection_efficiency_ratio > 2"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Collection efficiency out-of-range rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: collection_efficiency_ratio outside expected bounds"; exit 1; }
+
+      - name: Smoke 15 - repayment component parts do not exceed total repayment amount
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_repayment_behavior WHERE (principal_collected + interest_collected + fee_collected + penalty_collected + overpayment_collected) > actual_collected_amount * 1.001"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Component sum exceeds total rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: repayment component sum exceeds actual_collected_amount"; exit 1; }
+
+      - name: Smoke 16 - on_time_payment_count uses obligations_met_on_date logic
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_repayment_behavior WHERE on_time_payment_count < 0"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Negative on_time_payment_count rows: $BAD"
+          [ "$BAD" -eq 0 ] || { echo "FAIL: on_time_payment_count is negative"; exit 1; }
+
+      - name: Smoke 17 - restructured_installment_count is non-negative and seed has some
+        run: |
+          SQL="SELECT COUNT(*) FROM analytics.mart_repayment_behavior WHERE restructured_installment_count < 0"
+          BAD=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          [ "$BAD" -eq 0 ] || { echo "FAIL: restructured_installment_count is negative"; exit 1; }
+          SQL2="SELECT SUM(restructured_installment_count) FROM analytics.mart_repayment_behavior"
+          TOTAL=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL2")
+          echo "Total restructured installments: $TOTAL"
+          [ "$TOTAL" -gt 0 ] || { echo "FAIL: no restructured installments found in seed data"; exit 1; }
+
+      - name: Smoke 18 - recovery repayments extracted and visible in mart
+        run: |
+          SQL="SELECT COUNT(*) FROM raw.raw_m_loan_transaction WHERE transaction_type_enum = 8"
+          COUNT=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL")
+          echo "Recovery repayment raw rows: $COUNT"
+          [ "$COUNT" -gt 0 ] || { echo "FAIL: no recovery repayment transactions (type=8) in raw layer"; exit 1; }
+          SQL2="SELECT SUM(recovery_repayment_amount) FROM analytics.mart_repayment_behavior"
+          TOTAL=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL2")
+          echo "Total recovery amount in mart: $TOTAL"
+          [ "$TOTAL" != "" ] || { echo "FAIL: recovery_repayment_amount missing from mart"; exit 1; }
+
       - name: Collect container logs on failure
         if: failure()
         run: |

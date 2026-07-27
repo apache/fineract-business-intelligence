@@ -29,9 +29,10 @@ select
     coalesce(interest_portion_derived, 0)                       as interest_portion_derived,
     coalesce(fee_charges_portion_derived, 0)                    as fee_charges_portion_derived,
     coalesce(penalty_charges_portion_derived, 0)                as penalty_charges_portion_derived,
+    coalesce(overpayment_portion_derived, 0)                    as overpayment_portion_derived,
     outstanding_loan_balance_derived,
+    is_reversed,
     submitted_on_date,
     created_on_utc,
     last_modified_on_utc
 from source
-where not is_reversed

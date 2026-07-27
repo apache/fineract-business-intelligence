@@ -102,6 +102,7 @@ flow_metrics as (
     inner join loan_dimensions ld
         on t.tenant_id = ld.tenant_id
        and t.loan_id = ld.loan_id
+    where t.is_reversed = false
     group by 1, 2, 3, 4, 5
 ),
 
