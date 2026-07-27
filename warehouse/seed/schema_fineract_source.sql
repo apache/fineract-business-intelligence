@@ -497,6 +497,10 @@ CREATE TABLE public.m_loan_repayment_schedule (
     completed_derived               BOOLEAN NOT NULL DEFAULT FALSE,
     obligations_met_on_date         DATE,
     is_re_aged                      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_by                      BIGINT NOT NULL DEFAULT 1,
+    last_modified_by                BIGINT NOT NULL DEFAULT 1,
+    created_on_utc                  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    last_modified_on_utc            TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     lastmodified_date               TIMESTAMP NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_repayment_schedule_loan FOREIGN KEY (loan_id)
         REFERENCES public.m_loan(id) ON UPDATE RESTRICT ON DELETE RESTRICT

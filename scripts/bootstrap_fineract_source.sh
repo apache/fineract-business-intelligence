@@ -118,7 +118,7 @@ SELECT id, account_no, external_id, client_id, product_id, loan_status_id, loan_
 FROM public.m_loan;
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_loan_transaction AS
-SELECT id, loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount, principal_portion_derived, interest_portion_derived, fee_charges_portion_derived, penalty_charges_portion_derived, outstanding_loan_balance_derived, submitted_on_date, created_on_utc, last_modified_on_utc
+SELECT id, loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount, principal_portion_derived, interest_portion_derived, fee_charges_portion_derived, penalty_charges_portion_derived, overpayment_portion_derived, outstanding_loan_balance_derived, submitted_on_date, created_on_utc, last_modified_on_utc
 FROM public.m_loan_transaction;
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_delinquency_range AS
