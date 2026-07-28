@@ -111,6 +111,7 @@ PORTFOLIO_COLUMNS: list[dict] = [
 
 REPAYMENT_COLUMNS: list[dict] = [
     {"name": "reporting_date",                        "type": "DATE",    "is_dttm": True},
+    {"name": "client_hash",                           "type": "TEXT"},
     {"name": "office_id",                             "type": "BIGINT"},
     {"name": "office_name",                           "type": "TEXT"},
     {"name": "product_id",                            "type": "BIGINT"},
@@ -128,6 +129,19 @@ REPAYMENT_COLUMNS: list[dict] = [
     {"name": "interest_collected",                    "type": "NUMERIC"},
     {"name": "fee_collected",                         "type": "NUMERIC"},
     {"name": "penalty_collected",                     "type": "NUMERIC"},
+    {"name": "overpayment_collected",                 "type": "NUMERIC"},
+    {"name": "waived_amount",                         "type": "NUMERIC"},
+    {"name": "paid_in_advance_amount",                "type": "NUMERIC"},
+    {"name": "paid_late_amount",                      "type": "NUMERIC"},
+    {"name": "early_payment_count",                   "type": "BIGINT"},
+    {"name": "on_time_payment_count",                 "type": "BIGINT"},
+    {"name": "late_payment_count",                    "type": "BIGINT"},
+    {"name": "restructured_installment_count",        "type": "BIGINT"},
+    {"name": "overdue_penalty_charged",               "type": "NUMERIC"},
+    {"name": "overdue_penalty_waived",                "type": "NUMERIC"},
+    {"name": "total_installments_due",                "type": "BIGINT"},
+    {"name": "recovery_repayment_amount",             "type": "NUMERIC"},
+    {"name": "recovery_loan_count",                   "type": "BIGINT"},
 ]
 
 DELINQUENCY_METRICS: list[dict] = [
@@ -746,28 +760,28 @@ def create_repayment_assets(owner, database: Database) -> None:
 
     charts = [
         ensure_chart("Collection Efficiency KPI", "big_number_total", all_ds, {
-            "metric": adhoc_metric("Efficiency", eff_expr),
-            "metrics": [adhoc_metric("Efficiency", eff_expr)],
-            "number_format": ".1%",
-            "subheader": "Overall collection efficiency",
+            "metric": adhoc_metric("Efficiency %", f"({eff_expr})*100"),
+            "metrics": [adhoc_metric("Efficiency %", f"({eff_expr})*100")],
+            "number_format": ",.2f",
+            "subheader": "% of due amount collected (principal + interest + fees + penalties)",
         }, owner),
         ensure_chart("Collected Amount KPI", "big_number_total", all_ds, {
             "metric": adhoc_metric("Collected", "SUM(actual_collected_amount)"),
             "metrics": [adhoc_metric("Collected", "SUM(actual_collected_amount)")],
             "number_format": "$,.0f",
-            "subheader": "Total collected amount",
+            "subheader": "Total cash collected (principal + interest + fees + penalties)",
         }, owner),
         ensure_chart("Repayment Transactions KPI", "big_number_total", all_ds, {
             "metric": adhoc_metric("Txns", "SUM(repayment_transaction_count)"),
             "metrics": [adhoc_metric("Txns", "SUM(repayment_transaction_count)")],
             "number_format": ",d",
-            "subheader": "Total repayment transactions",
+            "subheader": "Total payment events (one borrower can have multiple)",
         }, owner),
         ensure_chart("Repaying Borrowers KPI", "big_number_total", all_ds, {
-            "metric": adhoc_metric("Borrowers", "SUM(repaying_borrower_count)"),
-            "metrics": [adhoc_metric("Borrowers", "SUM(repaying_borrower_count)")],
+            "metric": adhoc_metric("Borrowers", "COUNT(DISTINCT client_hash)"),
+            "metrics": [adhoc_metric("Borrowers", "COUNT(DISTINCT client_hash)")],
             "number_format": ",d",
-            "subheader": "Unique repaying borrowers",
+            "subheader": "Unique clients who made a payment (not loan count)",
         }, owner),
         ensure_chart("Repayment Collection Trend", "line", all_ds, {
             "granularity_sqla": "reporting_date",
@@ -785,9 +799,9 @@ def create_repayment_assets(owner, database: Database) -> None:
         ensure_chart("Collection Efficiency Trend", "line", all_ds, {
             "granularity_sqla": "reporting_date",
             "time_grain_sqla": "P1D",
-            "metrics": [adhoc_metric("Efficiency", eff_expr)],
+            "metrics": [adhoc_metric("Efficiency %", f"({eff_expr})*100")],
             "row_limit": 5000,
-            "y_axis_format": ".1%",
+            "y_axis_format": ",.1f",
             "zoomable": False,
             "show_brush": "no",
             "bottom_margin": 60,
@@ -833,31 +847,94 @@ def create_repayment_assets(owner, database: Database) -> None:
             "bottom_margin": 150,
             "left_margin": 80,
         }, owner),
+        ensure_chart("Payment Discipline Trend", "bar", all_ds, {
+            "granularity_sqla": "reporting_date",
+            "time_grain_sqla": "P1D",
+            "metrics": [
+                adhoc_metric("Early",   "SUM(early_payment_count)"),
+                adhoc_metric("On Time", "SUM(on_time_payment_count)"),
+                adhoc_metric("Late",    "SUM(late_payment_count)"),
+            ],
+            "row_limit": 5000,
+            "y_axis_format": ",d",
+            "x_axis_format": "%b %Y",
+            "bottom_margin": 60,
+        }, owner),
+        ensure_chart("Waiver & Late Payment Trend", "line", all_ds, {
+            "granularity_sqla": "reporting_date",
+            "time_grain_sqla": "P1D",
+            "metrics": [
+                adhoc_metric("Waived",     "SUM(waived_amount)"),
+                adhoc_metric("Paid Late",  "SUM(paid_late_amount)"),
+                adhoc_metric("Paid Early", "SUM(paid_in_advance_amount)"),
+            ],
+            "row_limit": 5000,
+            "y_axis_format": "$,.0f",
+            "x_axis_format": "%b %Y",
+            "zoomable": False,
+            "show_brush": "no",
+            "bottom_margin": 60,
+        }, owner),
+        ensure_chart("Collection Efficiency by Branch", "dist_bar", all_ds, {
+            "groupby": ["office_name"],
+            "metrics": [
+                adhoc_metric("Efficiency %", f"({eff_expr})*100"),
+            ],
+            "y_axis_format": ".1f",
+            "bottom_margin": 100,
+            "left_margin": 80,
+            "color_scheme": "googleCategory10c",
+        }, owner),
+        ensure_chart("Collection Efficiency by Product", "dist_bar", all_ds, {
+            "groupby": ["product_name"],
+            "metrics": [
+                adhoc_metric("Efficiency %", f"({eff_expr})*100"),
+            ],
+            "y_axis_format": ".1f",
+            "bottom_margin": 150,
+            "left_margin": 80,
+            "color_scheme": "googleCategory10c",
+        }, owner),
+
+
+
         ensure_chart("Repayment Summary Table", "table", all_ds, {
             "groupby": ["office_name", "product_name"],
             "metrics": [
-                adhoc_metric("Collected",  "SUM(actual_collected_amount)"),
-                adhoc_metric("Due",        "SUM(contractually_due_amount)"),
-                adhoc_metric("Efficiency", eff_expr),
-                adhoc_metric("Principal",  "SUM(principal_collected)"),
-                adhoc_metric("Interest",   "SUM(interest_collected)"),
-                adhoc_metric("Txns",       "SUM(repayment_transaction_count)"),
+                adhoc_metric("Collected ($)",       "SUM(actual_collected_amount)"),
+                adhoc_metric("Due ($)",              "SUM(contractually_due_amount)"),
+                adhoc_metric("Efficiency %",         f"ROUND(({eff_expr})*100, 2)"),
+                adhoc_metric("Principal ($)",        "SUM(principal_collected)"),
+                adhoc_metric("Interest ($)",         "SUM(interest_collected)"),
+                adhoc_metric("Waived ($)",           "SUM(waived_amount)"),
+                adhoc_metric("Penalty Charged ($)",  "SUM(overdue_penalty_charged)"),
+                adhoc_metric("Restructured (#)",     "SUM(restructured_installment_count)"),
+                adhoc_metric("Late Count (#)",       "SUM(late_payment_count)"),
+                adhoc_metric("On-Time Count (#)",    "SUM(on_time_payment_count)"),
+                adhoc_metric("Recovery ($)",         "SUM(recovery_repayment_amount)"),
+                adhoc_metric("Txns (#)",             "SUM(repayment_transaction_count)"),
             ],
             "table_timestamp_format": "%Y-%m-%d",
         }, owner),
     ]
 
     ensure_dashboard("repayment_behavior_dashboard.json", owner, charts, [
-        {"id": "ROW-RP-KPIS",      "charts": ["Collection Efficiency KPI", "Collected Amount KPI", "Repayment Transactions KPI", "Repaying Borrowers KPI"],
+        {"id": "ROW-RP-KPIS",       "charts": ["Collection Efficiency KPI", "Collected Amount KPI", "Repayment Transactions KPI", "Repaying Borrowers KPI"],
          "default_width": 3, "default_height": 20},
-        {"id": "ROW-RP-TRENDS1",   "charts": ["Repayment Collection Trend", "Collection Efficiency Trend"],
+        {"id": "ROW-RP-TRENDS1",    "charts": ["Repayment Collection Trend", "Collection Efficiency Trend"],
          "default_width": 6, "default_height": 42},
-        {"id": "ROW-RP-TRENDS2",   "charts": ["Repayment Component Breakdown", "Collection Mix"],
+        {"id": "ROW-RP-TRENDS2",    "charts": ["Repayment Component Breakdown", "Collection Mix"],
          "default_width": 6, "default_height": 42},
-        {"id": "ROW-RP-BREAKDOWN", "charts": ["Collected Amount by Branch", "Collected Amount by Product"],
+        {"id": "ROW-RP-BREAKDOWN",  "charts": ["Collected Amount by Branch", "Collected Amount by Product"],
          "default_width": 6, "default_height": 42},
-        {"id": "ROW-RP-TABLE",     "charts": ["Repayment Summary Table"],
-         "default_width": 12, "default_height": 36},
+        {"id": "ROW-RP-DISCIPLINE", "charts": ["Payment Discipline Trend", "Waiver & Late Payment Trend"],
+         "default_width": 6, "default_height": 42},
+        {"id": "ROW-RP-EFFBRANCH",  "charts": ["Collection Efficiency by Branch", "Collection Efficiency by Product"],
+         "default_width": 6, "default_height": 42},
+
+
+        {"id": "ROW-RP-TABLE",      "charts": ["Repayment Summary Table"],
+         "default_width": 12, "default_height": 40},
     ])
     print("[assets] Repayment Behavior dashboard created.")
 

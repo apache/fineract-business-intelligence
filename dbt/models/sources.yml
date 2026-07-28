@@ -67,6 +67,16 @@ sources:
           Reversed transactions are flagged with is_reversed = true and
           must be excluded from analytical aggregations.
 
+      - name: raw_m_loan_repayment_schedule
+        description: >
+          Contractual repayment schedule for each loan — one row per
+          installment.  Stores the principal, interest, fee, and penalty
+          amounts due on each duedate alongside the corresponding
+          completed_derived, waived, and paid_in_advance / paid_late
+          amounts updated by Fineract batch jobs as payments are
+          processed.  Used to compute collection efficiency ratios and
+          on-time / early / late payment behaviour metrics.
+
       - name: raw_m_delinquency_range
         description: >
           Configurable delinquency age bands (e.g. 1–29 days, 30–59 days)

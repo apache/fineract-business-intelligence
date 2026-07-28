@@ -152,6 +152,19 @@ SELECT id, delinquency_range_id, loan_id, addedon_date, liftedon_date,
        created_on_utc, last_modified_on_utc
 FROM public.m_loan_delinquency_tag_history;
 
+CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_loan_repayment_schedule AS
+SELECT id, loan_id, fromdate, duedate, installment,
+    principal_amount, principal_completed_derived, principal_writtenoff_derived,
+    interest_amount, interest_completed_derived, interest_writtenoff_derived, interest_waived_derived,
+    fee_charges_amount, fee_charges_completed_derived, fee_charges_writtenoff_derived, fee_charges_waived_derived,
+    penalty_charges_amount, penalty_charges_completed_derived, penalty_charges_writtenoff_derived, penalty_charges_waived_derived,
+    total_paid_in_advance_derived, total_paid_late_derived,
+    completed_derived, obligations_met_on_date, is_re_aged,
+    lastmodified_date::timestamptz AS lastmodified_date
+FROM public.m_loan_repayment_schedule;
+-- Note: dev seed schema uses lastmodified_date (TIMESTAMP); Fineract prod uses last_modified_on_utc (TIMESTAMPTZ).
+-- Both views expose it as lastmodified_date for uniform extractor cursor_column handling.
+
 -- batch_job_execution: real schema uses timestamp without time zone
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
 SELECT

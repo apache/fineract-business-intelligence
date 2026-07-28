@@ -118,7 +118,7 @@ SELECT id, account_no, external_id, client_id, product_id, loan_status_id, loan_
 FROM public.m_loan;
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_loan_transaction AS
-SELECT id, loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount, principal_portion_derived, interest_portion_derived, fee_charges_portion_derived, penalty_charges_portion_derived, outstanding_loan_balance_derived, submitted_on_date, created_on_utc, last_modified_on_utc
+SELECT id, loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount, principal_portion_derived, interest_portion_derived, fee_charges_portion_derived, penalty_charges_portion_derived, overpayment_portion_derived, outstanding_loan_balance_derived, submitted_on_date, created_on_utc, last_modified_on_utc
 FROM public.m_loan_transaction;
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_delinquency_range AS
@@ -136,6 +136,17 @@ FROM public.m_delinquency_bucket_mappings;
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_loan_delinquency_tag_history AS
 SELECT id, delinquency_range_id, loan_id, addedon_date, liftedon_date, created_on_utc, last_modified_on_utc
 FROM public.m_loan_delinquency_tag_history;
+
+CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_loan_repayment_schedule AS
+SELECT id, loan_id, fromdate, duedate, installment,
+    principal_amount, principal_completed_derived, principal_writtenoff_derived,
+    interest_amount, interest_completed_derived, interest_writtenoff_derived, interest_waived_derived,
+    fee_charges_amount, fee_charges_completed_derived, fee_charges_writtenoff_derived, fee_charges_waived_derived,
+    penalty_charges_amount, penalty_charges_completed_derived, penalty_charges_writtenoff_derived, penalty_charges_waived_derived,
+    total_paid_in_advance_derived, total_paid_late_derived,
+    completed_derived, obligations_met_on_date, is_re_aged,
+    last_modified_on_utc AS lastmodified_date
+FROM public.m_loan_repayment_schedule;
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
 SELECT job_execution_id, status, start_time AT TIME ZONE 'UTC' AS start_time, end_time AT TIME ZONE 'UTC' AS end_time, exit_code, exit_message, create_time AT TIME ZONE 'UTC' AS created_on_utc, last_updated AT TIME ZONE 'UTC' AS last_modified_on_utc
