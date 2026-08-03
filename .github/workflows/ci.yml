@@ -249,10 +249,13 @@ jobs:
       - name: Run ELT pipeline (backfill)
         run: docker compose exec -T extractor python -m extractor.cli backfill
 
+      - name: Install dbt packages (dbt-utils)
+        run: docker compose exec -T dbt dbt deps
+
       - name: Run dbt models
         run: docker compose exec -T dbt dbt run
 
-      - name: Run dbt tests
+      - name: Run dbt tests - schema, dbt-utils expression and singular tests
         run: docker compose exec -T dbt dbt test
 
       - name: Smoke 01 - PAR hierarchy PAR 30 >= PAR 60 >= PAR 90 always

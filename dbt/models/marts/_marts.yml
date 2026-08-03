@@ -148,6 +148,13 @@ models:
       amounts, NPA metrics, and average loan outstanding.  Rows are
       provided at both bucket-level grain and an 'All Portfolio' rollup
       (bucket_key = -1) per snapshot_date / office / product / currency.
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "par_30_amount >= par_60_amount"
+      - dbt_utils.expression_is_true:
+          expression: "par_60_amount >= par_90_amount"
+      - dbt_utils.expression_is_true:
+          expression: "npa_amount <= total_portfolio_amount * 1.001"
     columns:
       - name: snapshot_date
         description: The calendar date of this reporting snapshot.
@@ -157,10 +164,31 @@ models:
         description: Foreign key to dim_office.
         tests:
           - not_null
+          - relationships:
+              to: ref('dim_office')
+              field: office_id
       - name: product_id
         description: Foreign key to dim_product.
         tests:
           - not_null
+          - relationships:
+              to: ref('dim_product')
+              field: product_id
+      - name: standard_par_band
+        description: >
+          CGAP-standard delinquency band label.  The visualization layer
+          filters and colour-codes on these exact strings, so an unexpected
+          value silently drops rows from every band-aware chart.
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - 'Performing'
+                - 'Watch-list'
+                - 'PAR 30-59'
+                - 'PAR 60-89'
+                - 'PAR 90+'
+                - 'All Portfolio'
       - name: par_30_ratio
         description: >
           Cumulative PAR 30 ratio (CGAP standard): outstanding principal
@@ -224,6 +252,16 @@ models:
       behavioural signals (collection efficiency ratio, early / on-time / late
       payment counts, waiver amounts).  Grain is one row per
       (reporting_date, office_id, product_id, currency_code).
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "repaying_borrower_count <= repayment_transaction_count"
+      - dbt_utils.expression_is_true:
+          expression: >
+            principal_collected + interest_collected + fee_collected
+            + penalty_collected + overpayment_collected
+            <= actual_collected_amount * 1.001
+      - dbt_utils.expression_is_true:
+          expression: "overdue_penalty_waived <= overdue_penalty_charged * 1.001"
     columns:
       - name: reporting_date
         description: The calendar date of this repayment reporting record.
