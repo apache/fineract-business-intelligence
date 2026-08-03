@@ -63,6 +63,7 @@ jobs:
       - name: dbt parse - validate all SQL models and refs (no DB connection)
         run: |
           cd dbt
+          dbt deps
           dbt parse --profiles-dir . --target local
 
   integration-test:
