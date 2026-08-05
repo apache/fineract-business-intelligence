@@ -47,8 +47,8 @@ CREATE TABLE IF NOT EXISTS meta.user_office_mapping (
 INSERT INTO meta.user_office_mapping (username, office_id, role_name)
 VALUES
     ('admin', NULL, 'ADMIN'),
-    ('north_manager', 2, 'BRANCH_MANAGER'),
-    ('south_manager', 3, 'BRANCH_MANAGER')
+    ('north_manager', 101, 'BRANCH_MANAGER'),
+    ('south_manager', 102, 'BRANCH_MANAGER')
 ON CONFLICT (username) DO UPDATE
 SET office_id = EXCLUDED.office_id,
     role_name = EXCLUDED.role_name,

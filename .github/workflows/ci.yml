@@ -263,6 +263,24 @@ jobs:
       - name: Run dbt tests - schema, dbt-utils expression and singular tests
         run: docker compose exec -T dbt dbt test
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install RLS test dependencies
+        run: |
+          pip install -r extractor/requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: RLS isolation tests - office-level row security on Superset datasets
+        env:
+          WAREHOUSE_DB_HOST: localhost
+          WAREHOUSE_DB_PORT: "5434"
+          WAREHOUSE_DB_NAME: analytics
+          WAREHOUSE_READER_USER: analytics_reader
+          WAREHOUSE_READER_PASSWORD: analytics_reader_dev_only
+        run: pytest tests/integration/test_rls_isolation.py -v
+
       - name: Smoke 01 - PAR hierarchy PAR 30 >= PAR 60 >= PAR 90 always
         run: |
           SQL="SELECT COUNT(*) FROM analytics.mart_delinquency_par WHERE bucket_key = -1 AND (par_30_ratio < par_60_ratio OR par_60_ratio < par_90_ratio)"
