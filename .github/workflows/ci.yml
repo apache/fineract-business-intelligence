@@ -50,6 +50,7 @@ jobs:
         run: |
           pip install -r extractor/requirements.txt
           pip install -r dbt/requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Python syntax check - extractor
         run: python -m py_compile extractor/*.py
@@ -59,6 +60,9 @@ jobs:
 
       - name: Python syntax check - scripts
         run: python -m py_compile scripts/check_licenses.py
+
+      - name: Unit tests - extractor (no database)
+        run: pytest tests/unit/extractor -v
 
       - name: dbt parse - validate all SQL models and refs (no DB connection)
         run: |
