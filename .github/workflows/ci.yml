@@ -56,13 +56,16 @@ jobs:
         run: python -m py_compile extractor/*.py
 
       - name: Python syntax check - bootstrap
-        run: python -m py_compile docker/superset/bootstrap_superset_assets.py
+        run: python -m py_compile docker/superset/bootstrap_superset_assets.py docker/superset/asset_specs.py
 
       - name: Python syntax check - scripts
         run: python -m py_compile scripts/check_licenses.py
 
       - name: Unit tests - extractor (no database)
         run: pytest tests/unit/extractor -v
+
+      - name: Unit tests - superset (no database)
+        run: pytest tests/unit/superset -v
 
       - name: dbt parse - validate all SQL models and refs (no DB connection)
         run: |
