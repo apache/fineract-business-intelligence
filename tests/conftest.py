@@ -113,6 +113,7 @@ def app_config():
         tenant_id="default",
         replica_lag_threshold_seconds=300,
         cob_lookback_hours=48,
+        cob_job_name="LOAN_COB",
         extract_batch_size=1000,
         extract_lookback_seconds=600,
     )

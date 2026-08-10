@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS raw.raw_m_loan_delinquency_tag_history (
 CREATE TABLE IF NOT EXISTS raw.raw_batch_job_execution (
     tenant_id TEXT NOT NULL,
     job_execution_id BIGINT NOT NULL,
+    job_name TEXT NOT NULL,
     status TEXT NOT NULL,
     start_time TIMESTAMPTZ NOT NULL,
     end_time TIMESTAMPTZ,
@@ -267,3 +268,9 @@ CREATE TABLE IF NOT EXISTS raw.raw_batch_job_execution (
     source_loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (tenant_id, job_execution_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_raw_m_loan_transaction_loan_lookup
+    ON raw.raw_m_loan_transaction (tenant_id, loan_id, transaction_date);
+
+CREATE INDEX IF NOT EXISTS idx_raw_m_loan_repayment_schedule_loan_lookup
+    ON raw.raw_m_loan_repayment_schedule (tenant_id, loan_id, duedate);

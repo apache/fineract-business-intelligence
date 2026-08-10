@@ -126,7 +126,8 @@ SELECT
     id, loan_id, office_id, is_reversed, transaction_type_enum,
     transaction_date, amount, principal_portion_derived,
     interest_portion_derived, fee_charges_portion_derived,
-    penalty_charges_portion_derived, outstanding_loan_balance_derived,
+    penalty_charges_portion_derived, overpayment_portion_derived,
+    outstanding_loan_balance_derived,
     transaction_date AS submitted_on_date,
     created_on_utc, last_modified_on_utc
 FROM public.m_loan_transaction;
@@ -166,15 +167,18 @@ FROM public.m_loan_repayment_schedule;
 -- batch_job_execution: real schema uses timestamp without time zone
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
 SELECT
-    job_execution_id,
-    status,
-    start_time   ::timestamptz AS start_time,
-    end_time     ::timestamptz AS end_time,
-    exit_code,
-    exit_message,
-    create_time  ::timestamptz AS created_on_utc,
-    last_updated ::timestamptz AS last_modified_on_utc
-FROM public.batch_job_execution;
+    bje.job_execution_id,
+    bji.job_name,
+    bje.status,
+    bje.start_time   ::timestamptz AS start_time,
+    bje.end_time     ::timestamptz AS end_time,
+    bje.exit_code,
+    bje.exit_message,
+    bje.create_time  ::timestamptz AS created_on_utc,
+    bje.last_updated ::timestamptz AS last_modified_on_utc
+FROM public.batch_job_execution bje
+INNER JOIN public.batch_job_instance bji
+    ON bje.job_instance_id = bji.job_instance_id;
 SQL
 
 log "Compatibility views created in schema '${SOURCE_DB_SCHEMA}'"

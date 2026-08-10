@@ -100,3 +100,21 @@ def test_loan_transaction_spec_carries_the_fields_the_repayment_mart_needs():
         "fee_charges_portion_derived",
     ):
         assert required in columns
+
+
+def test_null_cursor_values_are_coalesced_to_an_epoch_sentinel_in_the_projection(extractor):
+    sql, _ = extractor._build_source_query(_spec("m_loan"), None)
+
+    projection = sql.split(" FROM ")[0]
+    assert (
+        'COALESCE("last_modified_on_utc", TIMESTAMP \'1970-01-01 00:00:00+00\') '
+        'AS "last_modified_on_utc"'
+    ) in projection
+
+
+def test_only_the_cursor_column_is_coalesced_not_other_columns(extractor):
+    sql, _ = extractor._build_source_query(_spec("m_loan"), None)
+
+    projection = sql.split(" FROM ")[0]
+    assert 'COALESCE("principal_outstanding_derived"' not in projection
+    assert '"principal_outstanding_derived"' in projection

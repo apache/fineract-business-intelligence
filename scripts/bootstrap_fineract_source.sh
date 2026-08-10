@@ -149,8 +149,9 @@ SELECT id, loan_id, fromdate, duedate, installment,
 FROM public.m_loan_repayment_schedule;
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
-SELECT job_execution_id, status, start_time AT TIME ZONE 'UTC' AS start_time, end_time AT TIME ZONE 'UTC' AS end_time, exit_code, exit_message, create_time AT TIME ZONE 'UTC' AS created_on_utc, last_updated AT TIME ZONE 'UTC' AS last_modified_on_utc
-FROM public.batch_job_execution;
+SELECT bje.job_execution_id, bji.job_name, bje.status, bje.start_time AT TIME ZONE 'UTC' AS start_time, bje.end_time AT TIME ZONE 'UTC' AS end_time, bje.exit_code, bje.exit_message, bje.create_time AT TIME ZONE 'UTC' AS created_on_utc, bje.last_updated AT TIME ZONE 'UTC' AS last_modified_on_utc
+FROM public.batch_job_execution bje
+INNER JOIN public.batch_job_instance bji ON bje.job_instance_id = bji.job_instance_id;
 EOF
 
   docker compose -f "${COMPOSE_FILE}" cp "${sql_file}" fineract-db:/tmp/create_views.sql

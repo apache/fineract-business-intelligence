@@ -104,3 +104,46 @@ def test_reversed_transactions_are_loaded_rather_than_filtered(extractor):
     sql = connection.cursor().last_sql
     assert '"is_reversed"' in sql
     assert "WHERE" not in sql
+
+
+def test_empty_rows_executes_nothing(extractor):
+    connection = FakeConnection()
+
+    extractor._upsert_rows(connection, SPEC, [])
+
+    assert connection.cursor().executed == []
+
+
+def test_upsert_splits_into_multiple_statements_when_over_the_parameter_limit(extractor, monkeypatch):
+    monkeypatch.setattr(FineractExtractor, "_POSTGRES_MAX_BIND_PARAMETERS", len(SPEC.columns) + 1)
+    connection = FakeConnection()
+    rows = [_row(SPEC, marker) for marker in range(3)]
+
+    extractor._upsert_rows(connection, SPEC, rows)
+
+    assert len(connection.cursor().executed) == 3
+
+
+def test_upsert_never_exceeds_the_configured_parameter_limit_per_statement(extractor, monkeypatch):
+    limit = (len(SPEC.columns) + 1) * 2
+    monkeypatch.setattr(FineractExtractor, "_POSTGRES_MAX_BIND_PARAMETERS", limit)
+    connection = FakeConnection()
+    rows = [_row(SPEC, marker) for marker in range(5)]
+
+    extractor._upsert_rows(connection, SPEC, rows)
+
+    for _, values in connection.cursor().executed:
+        assert len(values) <= limit
+
+
+def test_all_rows_are_represented_exactly_once_across_chunked_statements(extractor, monkeypatch):
+    monkeypatch.setattr(FineractExtractor, "_POSTGRES_MAX_BIND_PARAMETERS", len(SPEC.columns) + 1)
+    connection = FakeConnection()
+    rows = [_row(SPEC, marker) for marker in range(4)]
+
+    extractor._upsert_rows(connection, SPEC, rows)
+
+    all_bound_values = [values for _, values in connection.cursor().executed]
+    tenant_and_row_tuples = [tuple(v) for v in all_bound_values]
+    expected = [("default", *row) for row in rows]
+    assert tenant_and_row_tuples == expected

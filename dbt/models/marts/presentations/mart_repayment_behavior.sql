@@ -139,7 +139,7 @@ due_amounts as (
         count(case when s.is_re_aged = true then 1 end)    as restructured_installment_count,
 
         count(*)                                            as total_installments_due
-    from {{ source('raw', 'raw_m_loan_repayment_schedule') }} s
+    from {{ ref('stg_m_loan_repayment_schedule') }} s
     inner join loan_dimensions ld
         on s.tenant_id = ld.tenant_id
        and s.loan_id   = ld.loan_id

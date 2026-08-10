@@ -264,13 +264,15 @@ jobs:
               lastmodified_date
             FROM public.m_loan_repayment_schedule;
           CREATE OR REPLACE VIEW bi_connector_source.batch_job_execution AS
-            SELECT job_execution_id, status,
-              start_time::timestamptz AS start_time,
-              end_time::timestamptz AS end_time,
-              exit_code, exit_message,
-              create_time::timestamptz AS created_on_utc,
-              last_updated::timestamptz AS last_modified_on_utc
-            FROM public.batch_job_execution;
+            SELECT bje.job_execution_id, bji.job_name, bje.status,
+              bje.start_time::timestamptz AS start_time,
+              bje.end_time::timestamptz AS end_time,
+              bje.exit_code, bje.exit_message,
+              bje.create_time::timestamptz AS created_on_utc,
+              bje.last_updated::timestamptz AS last_modified_on_utc
+            FROM public.batch_job_execution bje
+            INNER JOIN public.batch_job_instance bji
+              ON bje.job_instance_id = bji.job_instance_id;
           GRANT USAGE ON SCHEMA public TO fineract_reader;
           GRANT SELECT ON ALL TABLES IN SCHEMA public TO fineract_reader;
           GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fineract_reader;

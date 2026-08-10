@@ -36,7 +36,7 @@ def _extractor_with_cob(app_config, last_completed):
 def test_raises_when_no_completed_cob_execution_exists(app_config):
     extractor, connection = _extractor_with_cob(app_config, None)
 
-    with pytest.raises(RuntimeError, match="No completed COB execution found"):
+    with pytest.raises(RuntimeError, match="No completed 'LOAN_COB' execution found"):
         extractor._ensure_cob_completed(connection)
 
 
@@ -83,5 +83,25 @@ def test_query_filters_on_completed_status_and_configured_schema(app_config):
     sql, params = connection.cursor().executed[0]
     assert "batch_job_execution" in sql
     assert "MAX(end_time)" in sql
-    assert params == ("COMPLETED",)
+    assert "job_name" in sql
+    assert params == ("COMPLETED", "LOAN_COB")
     assert '"bi_connector_source"' in sql
+
+
+@freeze_time(FROZEN_NOW)
+def test_query_scopes_to_the_configured_cob_job_name_not_any_completed_job(app_config):
+    from dataclasses import replace
+
+    custom_config = replace(app_config, cob_job_name="CUSTOM_LOAN_COB")
+    recent = datetime(2026, 8, 2, 6, 0, tzinfo=timezone.utc)
+
+    from extractor.extractor import FineractExtractor
+    from tests.conftest import FakeConnection, FakeCursor
+
+    extractor = FineractExtractor(custom_config)
+    connection = FakeConnection(FakeCursor(fetchone_results=[(recent,)]))
+
+    extractor._ensure_cob_completed(connection)
+
+    _, params = connection.cursor().executed[0]
+    assert params == ("COMPLETED", "CUSTOM_LOAN_COB")

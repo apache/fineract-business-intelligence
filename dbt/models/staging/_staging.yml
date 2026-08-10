@@ -152,3 +152,26 @@ models:
         description: Full currency display name.
         tests:
           - not_null
+
+  - name: stg_m_loan_repayment_schedule
+    description: >
+      Cleaned loan amortization schedule — one row per installment.
+      All _derived amount columns are coalesced to 0.
+      obligations_met_on_date is deliberately left NULL when unset: it is
+      the authoritative record of when (if ever) an installment was fully
+      settled, and downstream days-past-due calculations depend on being
+      able to distinguish "not yet paid" from "paid on date X".
+    columns:
+      - name: loan_repayment_schedule_id
+        description: Surrogate primary key — renamed from raw id.
+        tests:
+          - not_null
+          - unique
+      - name: loan_id
+        description: Foreign key to stg_m_loan.
+        tests:
+          - not_null
+      - name: duedate
+        description: Installment due date — the basis for days-past-due calculations.
+        tests:
+          - not_null

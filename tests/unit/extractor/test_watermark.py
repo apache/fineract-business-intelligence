@@ -53,7 +53,7 @@ def test_get_scopes_the_query_by_tenant_id():
     assert params == (OTHER_TENANT, "m_loan")
 
 
-def test_update_upserts_and_commits():
+def test_update_upserts_the_watermark_row():
     connection = FakeConnection()
     manager = WatermarkManager(connection, TENANT)
     value = datetime(2026, 8, 2, 9, 30, tzinfo=UTC)
@@ -65,7 +65,16 @@ def test_update_upserts_and_commits():
     assert "ON CONFLICT (tenant_id, table_name)" in sql
     assert "DO UPDATE SET" in sql
     assert params == (TENANT, "m_loan", "last_modified_on_utc", value)
-    assert connection.committed == 1
+
+
+def test_update_does_not_commit_leaving_transaction_boundary_to_the_caller():
+    connection = FakeConnection()
+    manager = WatermarkManager(connection, TENANT)
+    value = datetime(2026, 8, 2, 9, 30, tzinfo=timezone.utc)
+
+    manager.update("m_loan", "last_modified_on_utc", value)
+
+    assert connection.committed == 0
 
 
 def test_update_never_writes_outside_its_own_tenant():

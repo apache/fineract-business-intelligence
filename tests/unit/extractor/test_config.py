@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import ssl
 
 import pytest
 
@@ -33,13 +34,16 @@ OPTIONAL = [
     "SOURCE_DB_PORT",
     "SOURCE_DB_NAME",
     "SOURCE_DB_SCHEMA",
+    "SOURCE_DB_SSL_MODE",
     "WAREHOUSE_DB_HOST",
     "WAREHOUSE_DB_PORT",
     "WAREHOUSE_DB_NAME",
     "WAREHOUSE_DB_SCHEMA",
+    "WAREHOUSE_DB_SSL_MODE",
     "TENANT_ID",
     "REPLICA_LAG_THRESHOLD_SECONDS",
     "COB_LOOKBACK_HOURS",
+    "COB_JOB_NAME",
     "EXTRACT_BATCH_SIZE",
     "EXTRACT_LOOKBACK_SECONDS",
 ]
@@ -86,8 +90,28 @@ def test_defaults_are_applied_for_optional_settings(clean_env):
     assert config.warehouse.schema == "raw"
     assert config.replica_lag_threshold_seconds == 300
     assert config.cob_lookback_hours == 48
+    assert config.cob_job_name == "LOAN_COB"
+    assert config.source.ssl_mode == "disable"
+    assert config.warehouse.ssl_mode == "disable"
     assert config.extract_batch_size == 1000
     assert config.extract_lookback_seconds == 600
+
+
+def test_cob_job_name_can_be_overridden(clean_env):
+    clean_env.setenv("COB_JOB_NAME", "CUSTOM_COB_JOB")
+
+    config = AppConfig.from_env()
+
+    assert config.cob_job_name == "CUSTOM_COB_JOB"
+
+
+def test_ssl_mode_can_be_required_independently_per_database(clean_env):
+    clean_env.setenv("SOURCE_DB_SSL_MODE", "require")
+
+    config = AppConfig.from_env()
+
+    assert config.source.ssl_mode == "require"
+    assert config.warehouse.ssl_mode == "disable"
 
 
 def test_numeric_settings_are_cast_from_strings(clean_env):
@@ -129,6 +153,22 @@ def test_connect_kwargs_does_not_leak_the_schema_to_the_driver():
     ).connect_kwargs
 
     assert "schema" not in kwargs
+
+
+def test_connect_kwargs_omits_ssl_context_by_default():
+    kwargs = DatabaseConfig(
+        host="h", port=5432, dbname="d", user="u", password="p"
+    ).connect_kwargs
+
+    assert "ssl_context" not in kwargs
+
+
+def test_connect_kwargs_includes_an_ssl_context_when_ssl_mode_is_require():
+    kwargs = DatabaseConfig(
+        host="h", port=5432, dbname="d", user="u", password="p", ssl_mode="require"
+    ).connect_kwargs
+
+    assert isinstance(kwargs["ssl_context"], ssl.SSLContext)
 
 
 def test_config_objects_are_immutable(app_config):
