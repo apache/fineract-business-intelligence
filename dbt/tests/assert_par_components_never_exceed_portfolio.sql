@@ -24,9 +24,10 @@ select
     watch_list_amount,
     current_amount
 from {{ ref('mart_delinquency_par') }}
-where par_30_amount      > total_portfolio_amount * 1.001
-   or npa_amount         > total_portfolio_amount * 1.001
-   or watch_list_amount  > total_portfolio_amount * 1.001
-   or current_amount     > total_portfolio_amount * 1.001
-   or par_30_loan_count  > total_loan_count
-   or npa_loan_count     > total_loan_count
+where
+    par_30_amount > total_portfolio_amount * 1.001
+    or npa_amount > total_portfolio_amount * 1.001
+    or watch_list_amount > total_portfolio_amount * 1.001
+    or current_amount > total_portfolio_amount * 1.001
+    or par_30_loan_count > total_loan_count
+    or npa_loan_count > total_loan_count

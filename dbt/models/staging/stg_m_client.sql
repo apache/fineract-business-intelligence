@@ -19,10 +19,10 @@ with source as (
 
 select
     tenant_id,
-    id                                          as client_id,
-    account_no                                  as client_account_no,
-    external_id                                 as client_external_id,
-    md5(tenant_id || '::' || id::text)          as client_hash,
+    id as client_id,
+    account_no as client_account_no,
+    external_id as client_external_id,
+    md5(tenant_id || '::' || id::text) as client_hash,
     status_enum,
     activation_date,
     office_joining_date,
@@ -46,5 +46,5 @@ select
         when extract(year from age(current_date, date_of_birth)) < 55
             then '45-54'
         else '55+'
-    end                                         as age_band
+    end as age_band
 from source

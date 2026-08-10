@@ -1,0 +1,4 @@
+dbt/models/marts/presentations/mart_delinquency_par.sql
+dbt/models/marts/presentations/mart_portfolio_health.sql
+dbt/models/marts/presentations/mart_repayment_behavior.sql
+dbt/tests/assert_no_pii_columns_in_marts.sql

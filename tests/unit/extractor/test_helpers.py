@@ -15,7 +15,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import dataclasses
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -34,7 +35,7 @@ def test_none_passes_through():
 def test_naive_datetime_is_assumed_to_be_utc():
     result = as_utc_datetime(datetime(2026, 8, 2, 12, 0))
 
-    assert result.tzinfo == timezone.utc
+    assert result.tzinfo == UTC
     assert result.hour == 12
 
 
@@ -42,12 +43,12 @@ def test_aware_datetime_is_converted_rather_than_relabelled():
     ist = timezone(timedelta(hours=5, minutes=30))
     result = as_utc_datetime(datetime(2026, 8, 2, 17, 30, tzinfo=ist))
 
-    assert result.tzinfo == timezone.utc
+    assert result.tzinfo == UTC
     assert result.hour == 12
 
 
 def test_utc_datetime_is_unchanged():
-    value = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    value = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
     assert as_utc_datetime(value) == value
 
 
@@ -112,5 +113,5 @@ def test_all_tables_required_by_the_marts_are_extracted():
 
 
 def test_table_specs_are_immutable():
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         TABLE_SPECS[0].source_table = "hacked"

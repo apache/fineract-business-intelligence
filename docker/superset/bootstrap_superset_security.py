@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import os
 
-from superset import security_manager
 from superset.app import create_app
+
+from superset import security_manager
 
 _BRANCH_USERS: list[dict] = [
     {

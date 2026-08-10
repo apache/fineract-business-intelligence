@@ -19,11 +19,11 @@ with source as (
 
 select
     tenant_id,
-    id                                      as office_id,
-    parent_id                               as parent_office_id,
+    id as office_id,
+    parent_id as parent_office_id,
     hierarchy,
-    external_id                             as office_external_id,
-    name                                    as office_name,
+    external_id as office_external_id,
+    name as office_name,
     opening_date,
     created_on_utc,
     last_modified_on_utc

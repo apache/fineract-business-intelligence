@@ -16,28 +16,31 @@
 with delinquency_events as (
     select
         d.tenant_id,
-        d.id                                    as delinquency_event_id,
+        d.id as delinquency_event_id,
         d.loan_id,
         d.delinquency_range_id,
-        r.classification                        as delinquency_range_classification,
+        r.classification as delinquency_range_classification,
         r.min_age_days,
         r.max_age_days,
-        m.delinquency_bucket_id                 as bucket_id,
-        b.name                                  as bucket_name,
+        m.delinquency_bucket_id as bucket_id,
+        b.name as bucket_name,
         d.addedon_date,
         d.liftedon_date,
         d.created_on_utc,
         d.last_modified_on_utc
     from {{ source('raw', 'raw_m_loan_delinquency_tag_history') }} d
     left join {{ source('raw', 'raw_m_delinquency_range') }} r
-        on d.tenant_id = r.tenant_id
-       and d.delinquency_range_id = r.id
+        on
+            d.tenant_id = r.tenant_id
+            and d.delinquency_range_id = r.id
     left join {{ source('raw', 'raw_m_delinquency_bucket_mappings') }} m
-        on r.tenant_id = m.tenant_id
-       and r.id = m.delinquency_range_id
+        on
+            r.tenant_id = m.tenant_id
+            and r.id = m.delinquency_range_id
     left join {{ source('raw', 'raw_m_delinquency_bucket') }} b
-        on m.tenant_id = b.tenant_id
-       and m.delinquency_bucket_id = b.id
+        on
+            m.tenant_id = b.tenant_id
+            and m.delinquency_bucket_id = b.id
 )
 
 select * from delinquency_events

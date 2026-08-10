@@ -14,8 +14,8 @@
 -- limitations under the License.
 
 select
-    'mart_delinquency_par'  as model_name,
-    snapshot_date           as offending_date
+    'mart_delinquency_par' as model_name,
+    snapshot_date as offending_date
 from {{ ref('mart_delinquency_par') }}
 where snapshot_date > current_date
 
@@ -23,14 +23,14 @@ union all
 
 select
     'mart_portfolio_health' as model_name,
-    snapshot_date           as offending_date
+    snapshot_date as offending_date
 from {{ ref('mart_portfolio_health') }}
 where snapshot_date > current_date
 
 union all
 
 select
-    'fact_loan_snapshot'    as model_name,
-    snapshot_date           as offending_date
+    'fact_loan_snapshot' as model_name,
+    snapshot_date as offending_date
 from {{ ref('fact_loan_snapshot') }}
 where snapshot_date > current_date

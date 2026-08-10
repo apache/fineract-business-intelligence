@@ -152,7 +152,7 @@ def _scan_direct_deps(direct_dep_names: frozenset[str]) -> list[dict]:
 def _print_table(results: list[dict]) -> None:
     W = [36, 12, 46, 14]
     headers = ["Package", "Version", "License", "Status"]
-    header_row = "  ".join(h.ljust(w) for h, w in zip(headers, W))
+    header_row = "  ".join(h.ljust(w) for h, w in zip(headers, W, strict=False))
     print(header_row)
     print("-" * len(header_row))
     marker_map = {"SAFE": "[OK]  ", "RESTRICTED": "[FAIL]", "UNKNOWN": "[WARN]"}

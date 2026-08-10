@@ -61,6 +61,30 @@ jobs:
       - name: Python syntax check - scripts
         run: python -m py_compile scripts/check_licenses.py
 
+      - name: Lint - ruff
+        run: ruff check .
+
+      - name: Lint - shellcheck
+        run: |
+          shellcheck --severity=warning \
+            docker/fineract-postgresql/initdb/001_init_fineract_databases.sh \
+            docker/postgres-warehouse/initdb/002_create_warehouse_roles.sh \
+            docker/superset/init_superset.sh \
+            docker/superset/refresh_superset_assets.sh \
+            scripts/bootstrap_fineract_source.sh \
+            scripts/bootstrap_source.sh \
+            scripts/common.sh \
+            scripts/run_extractor_backfill.sh \
+            scripts/run_extractor_incremental.sh \
+            scripts/run_pipeline.sh \
+            scripts/stop_fineract_backend.sh \
+            scripts/verify_extraction.sh
+
+      - name: Lint - sqlfluff
+        run: |
+          sqlfluff lint dbt/models dbt/tests \
+            --exclude-rules structure.column_order,structure.join_condition_order,references.qualification
+
       - name: Unit tests - extractor (no database)
         run: pytest tests/unit/extractor -v
 

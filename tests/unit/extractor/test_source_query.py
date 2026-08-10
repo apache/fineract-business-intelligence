@@ -15,13 +15,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
 from extractor.extractor import TABLE_SPECS, FineractExtractor
 
-WATERMARK = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+WATERMARK = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture

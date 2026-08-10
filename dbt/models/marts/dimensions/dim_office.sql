@@ -30,5 +30,5 @@ select
             ),
             1
         )
-    )                                       as office_level
+    ) as office_level
 from {{ ref('stg_m_office') }}

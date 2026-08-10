@@ -19,9 +19,9 @@ with source as (
 
 select
     tenant_id,
-    id                                      as product_id,
+    id as product_id,
     short_name,
-    name                                    as product_name,
+    name as product_name,
     description,
     currency_code,
     currency_digits,

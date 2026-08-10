@@ -22,8 +22,9 @@ left join {{ ref('dim_office') }} o
     on p.office_id = o.office_id
 left join {{ ref('dim_product') }} pr
     on p.product_id = pr.product_id
-where o.office_id is null
-   or pr.product_id is null
+where
+    o.office_id is null
+    or pr.product_id is null
 
 union all
 
@@ -36,5 +37,6 @@ left join {{ ref('dim_office') }} o
     on r.office_id = o.office_id
 left join {{ ref('dim_product') }} pr
     on r.product_id = pr.product_id
-where o.office_id is null
-   or pr.product_id is null
+where
+    o.office_id is null
+    or pr.product_id is null

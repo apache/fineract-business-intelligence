@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from extractor.config import AppConfig, DatabaseConfig, require_env
@@ -130,5 +132,5 @@ def test_connect_kwargs_does_not_leak_the_schema_to_the_driver():
 
 
 def test_config_objects_are_immutable(app_config):
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         app_config.tenant_id = "other"

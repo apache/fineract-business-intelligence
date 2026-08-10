@@ -27,20 +27,21 @@ select
     late_payment_count,
     restructured_installment_count
 from {{ ref('mart_repayment_behavior') }}
-where actual_collected_amount        < 0
-   or contractually_due_amount       < 0
-   or principal_collected            < 0
-   or interest_collected             < 0
-   or fee_collected                  < 0
-   or penalty_collected              < 0
-   or overpayment_collected          < 0
-   or waived_amount                  < 0
-   or recovery_repayment_amount      < 0
-   or repayment_transaction_count    < 0
-   or repaying_borrower_count        < 0
-   or repaid_loan_count              < 0
-   or early_payment_count            < 0
-   or on_time_payment_count          < 0
-   or late_payment_count             < 0
-   or restructured_installment_count < 0
-   or total_installments_due         < 0
+where
+    actual_collected_amount < 0
+    or contractually_due_amount < 0
+    or principal_collected < 0
+    or interest_collected < 0
+    or fee_collected < 0
+    or penalty_collected < 0
+    or overpayment_collected < 0
+    or waived_amount < 0
+    or recovery_repayment_amount < 0
+    or repayment_transaction_count < 0
+    or repaying_borrower_count < 0
+    or repaid_loan_count < 0
+    or early_payment_count < 0
+    or on_time_payment_count < 0
+    or late_payment_count < 0
+    or restructured_installment_count < 0
+    or total_installments_due < 0

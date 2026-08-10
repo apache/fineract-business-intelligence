@@ -23,7 +23,8 @@ select
     par_90_ratio,
     npa_ratio
 from {{ ref('mart_delinquency_par') }}
-where par_30_ratio not between 0 and 1
-   or par_60_ratio not between 0 and 1
-   or par_90_ratio not between 0 and 1
-   or npa_ratio    not between 0 and 1
+where
+    par_30_ratio not between 0 and 1
+    or par_60_ratio not between 0 and 1
+    or par_90_ratio not between 0 and 1
+    or npa_ratio not between 0 and 1
