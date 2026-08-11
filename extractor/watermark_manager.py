@@ -60,3 +60,13 @@ class WatermarkManager:
             (self._tenant_id, table_name, cursor_column, last_cursor_value),
         )
         self._conn.commit()
+
+    def reset_all(self) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            """
+            DELETE FROM meta.watermarks
+            WHERE tenant_id = %s
+            """,
+            (self._tenant_id,),
+        )

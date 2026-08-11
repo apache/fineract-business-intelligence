@@ -22,5 +22,6 @@ select
     contractually_due_amount,
     collection_efficiency_ratio
 from {{ ref('mart_repayment_behavior') }}
-where collection_efficiency_ratio is not null
-  and collection_efficiency_ratio not between 0 and 10
+where
+    collection_efficiency_ratio is not null
+    and collection_efficiency_ratio not between 0 and 10

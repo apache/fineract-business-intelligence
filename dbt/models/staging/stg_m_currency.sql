@@ -18,9 +18,9 @@ with source as (
 )
 
 select
-    id                                      as currency_id,
-    code                                    as currency_code,
-    name                                    as currency_name,
+    id as currency_id,
+    code as currency_code,
+    name as currency_name,
     display_symbol,
     decimal_places,
     currency_multiplesof,

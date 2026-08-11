@@ -25,7 +25,8 @@ select
     par_60_loan_count,
     par_90_loan_count
 from {{ ref('mart_delinquency_par') }}
-where par_30_amount < par_60_amount
-   or par_60_amount < par_90_amount
-   or par_30_loan_count < par_60_loan_count
-   or par_60_loan_count < par_90_loan_count
+where
+    par_30_amount < par_60_amount
+    or par_60_amount < par_90_amount
+    or par_30_loan_count < par_60_loan_count
+    or par_60_loan_count < par_90_loan_count

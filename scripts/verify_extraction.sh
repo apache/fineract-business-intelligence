@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -u
+set -uo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
@@ -27,9 +27,11 @@ FAIL=0
 check() {
   local label="$1"
   shift
-  local out
+  local out rc
+  set +e
   out=$("$@" 2>&1)
-  local rc=$?
+  rc=$?
+  set -e
   if [[ $rc -eq 0 && -n "$out" ]]; then
     echo "  ✅ ${label}"
     PASS=$((PASS + 1))

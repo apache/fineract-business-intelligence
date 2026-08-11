@@ -22,6 +22,7 @@ select
     repaying_borrower_count,
     repaid_loan_count
 from {{ ref('mart_repayment_behavior') }}
-where repaying_borrower_count > repayment_transaction_count
-   or repaid_loan_count       > repayment_transaction_count
-   or repaying_borrower_count > repaid_loan_count
+where
+    repaying_borrower_count > repayment_transaction_count
+    or repaid_loan_count > repayment_transaction_count
+    or repaying_borrower_count > repaid_loan_count

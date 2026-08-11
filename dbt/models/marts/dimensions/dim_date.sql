@@ -22,18 +22,18 @@ with date_spine as (
 )
 
 select
-    to_char(date_day, 'YYYYMMDD')::bigint                                   as date_key,
+    to_char(date_day, 'YYYYMMDD')::bigint as date_key,
     date_day,
-    extract(year from date_day)::int                                        as year_number,
-    extract(quarter from date_day)::int                                     as quarter_number,
-    extract(month from date_day)::int                                       as month_number,
-    to_char(date_day, 'Month')                                              as month_name,
-    to_char(date_day, 'Mon')                                                as month_short_name,
-    extract(week from date_day)::int                                        as week_number,
-    extract(isodow from date_day)::int                                      as day_of_week_number,
-    to_char(date_day, 'Day')                                                as day_name,
-    (extract(isodow from date_day) in (6, 7))                               as is_weekend,
-    date_trunc('month', date_day)::date                                     as first_day_of_month,
-    (date_trunc('month', date_day) + interval '1 month - 1 day')::date     as last_day_of_month,
-    date_trunc('quarter', date_day)::date                                   as first_day_of_quarter
+    extract(year from date_day)::int as year_number,
+    extract(quarter from date_day)::int as quarter_number,
+    extract(month from date_day)::int as month_number,
+    to_char(date_day, 'Month') as month_name,
+    to_char(date_day, 'Mon') as month_short_name,
+    extract(week from date_day)::int as week_number,
+    extract(isodow from date_day)::int as day_of_week_number,
+    to_char(date_day, 'Day') as day_name,
+    (extract(isodow from date_day) in (6, 7)) as is_weekend,
+    date_trunc('month', date_day)::date as first_day_of_month,
+    (date_trunc('month', date_day) + interval '1 month - 1 day')::date as last_day_of_month,
+    date_trunc('quarter', date_day)::date as first_day_of_quarter
 from date_spine

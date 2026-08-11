@@ -49,13 +49,13 @@ run_once() {
     fi
     log "Step 1/3 — Extractor OK"
 
-    local dbt_args="dbt build"
+    local dbt_args=(dbt build)
     if [[ "${DBT_FULL_REFRESH}" == "true" || "${mode}" == "backfill" ]]; then
-        dbt_args="dbt build --full-refresh"
+        dbt_args=(dbt build --full-refresh)
     fi
 
-    log "Step 2/3 — dbt (${dbt_args})"
-    if ! docker compose -f "${COMPOSE_FILE}" exec -T dbt ${dbt_args}; then
+    log "Step 2/3 — dbt (${dbt_args[*]})"
+    if ! docker compose -f "${COMPOSE_FILE}" exec -T dbt "${dbt_args[@]}"; then
         fail "dbt build failed. Superset refresh skipped to avoid showing broken data."
     fi
     log "Step 2/3 — dbt OK"

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pg8000.dbapi
 
@@ -33,8 +33,8 @@ def as_utc_datetime(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _quote_identifier(name: str) -> str:
@@ -405,13 +405,7 @@ class FineractExtractor:
                 f"DELETE FROM raw.{_quote_identifier(spec.raw_table)} WHERE tenant_id = %s",
                 (self.config.tenant_id,),
             )
-        cursor.execute(
-            """
-            DELETE FROM meta.watermarks
-            WHERE tenant_id = %s
-            """,
-            (self.config.tenant_id,),
-        )
+        watermark_manager.reset_all()
         logger.info("Backfill reset completed for raw layer and watermarks.")
 
     def _insert_pipeline_state(self, warehouse_conn, run_id: uuid.UUID, mode: str, status: str) -> None:
@@ -429,7 +423,7 @@ class FineractExtractor:
             )
             VALUES (%s, %s, %s, %s, %s, 0, 0)
             """,
-            (str(run_id), self.config.tenant_id, mode, datetime.now(timezone.utc), status),
+            (str(run_id), self.config.tenant_id, mode, datetime.now(UTC), status),
         )
         warehouse_conn.commit()
 
@@ -454,7 +448,7 @@ class FineractExtractor:
             WHERE run_id = %s
             """,
             (
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 status,
                 rows_extracted,
                 rows_loaded,
@@ -479,10 +473,11 @@ class FineractExtractor:
         if last_completed is None:
             raise RuntimeError("No completed COB execution found in batch_job_execution.")
 
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=self.config.cob_lookback_hours)
+        cutoff = datetime.now(UTC) - timedelta(hours=self.config.cob_lookback_hours)
         if last_completed < cutoff:
             raise RuntimeError(
-                f"Latest COB completion {last_completed.isoformat()} is older than {self.config.cob_lookback_hours} hours."
+                f"Latest COB completion {last_completed.isoformat()} is older than "
+                f"{self.config.cob_lookback_hours} hours."
             )
         logger.info("COB completion gate passed with latest completion at %s.", last_completed.isoformat())
 

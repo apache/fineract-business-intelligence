@@ -26,7 +26,7 @@
 
 select
     md5(tenant_id || '::' || loan_id::text || '::' || snapshot_date::text)
-                                            as snapshot_key,
+        as snapshot_key,
     tenant_id,
     to_char(snapshot_date, 'YYYYMMDD')::bigint as date_key,
     snapshot_date,
@@ -52,13 +52,14 @@ select
     is_par_90
 from {{ ref('int_loan_delinquency_status') }}
 {% if is_incremental() %}
-where snapshot_date >= (
-    (
-        select coalesce(
-            max(snapshot_date),
-            '{{ var("historical_start_date", "2010-01-01") }}'::date
-        )
-        from {{ this }}
-    ) - interval '{{ lookback_days }} days'
-)::date
+    where snapshot_date >= (
+        (
+            select
+                coalesce(
+                    max(snapshot_date),
+                    '{{ var("historical_start_date", "2010-01-01") }}'::date
+                )
+            from {{ this }}
+        ) - interval '{{ lookback_days }} days'
+    )::date
 {% endif %}

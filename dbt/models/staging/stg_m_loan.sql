@@ -19,9 +19,9 @@ with source as (
 
 select
     tenant_id,
-    id                                      as loan_id,
-    account_no                              as loan_account_no,
-    external_id                             as loan_external_id,
+    id as loan_id,
+    account_no as loan_account_no,
+    external_id as loan_external_id,
     client_id,
     product_id,
     loan_status_id,

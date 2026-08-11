@@ -19,9 +19,6 @@ import json
 import os
 from pathlib import Path
 
-from sqlalchemy import text
-from superset.app import create_app
-
 from asset_specs import (
     DELINQUENCY_COLUMNS,
     DELINQUENCY_METRICS,
@@ -31,6 +28,8 @@ from asset_specs import (
     build_layout,
     sql_filter,
 )
+from sqlalchemy import text
+from superset.app import create_app
 
 ROOT = Path("/workspace")
 DATASET_DIR = ROOT / "superset" / "datasets"
@@ -39,26 +38,26 @@ DASHBOARD_DIR = ROOT / "superset" / "dashboards"
 app = create_app()
 app.app_context().push()
 
-from superset import security_manager  # noqa: E402
-from superset.connectors.sqla.models import SqlMetric, SqlaTable, TableColumn  # noqa: E402
+from superset.connectors.sqla.models import SqlaTable, SqlMetric, TableColumn  # noqa: E402
 from superset.extensions import db  # noqa: E402
 from superset.models.core import Database  # noqa: E402
 from superset.models.dashboard import Dashboard  # noqa: E402
 from superset.models.slice import Slice  # noqa: E402
 
+from superset import security_manager  # noqa: E402
+
 
 def mart_exists(database: Database, table_name: str) -> bool:
-    with database.get_sqla_engine() as engine:
-        with engine.connect() as connection:
-            result = connection.execute(
-                text(
-                    "SELECT EXISTS ("
-                    "  SELECT 1 FROM information_schema.tables"
-                    "  WHERE table_schema = 'analytics' AND table_name = :t"
-                    ")"
-                ),
-                {"t": table_name},
-            ).scalar()
+    with database.get_sqla_engine() as engine, engine.connect() as connection:
+        result = connection.execute(
+            text(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM information_schema.tables"
+                "  WHERE table_schema = 'analytics' AND table_name = :t"
+                ")"
+            ),
+            {"t": table_name},
+        ).scalar()
     return bool(result)
 
 
@@ -428,8 +427,14 @@ def create_portfolio_assets(owner, database: Database) -> None:
             "subheader": "Non-performing loans as % of total outstanding principal",
         }, owner),
         ensure_chart("Average Loan Size", "big_number_total", lat_ds, {
-            "metric": adhoc_metric("Avg Loan Size ($)", "SUM(gross_loan_portfolio)/NULLIF(SUM(active_loan_count),0)"),
-            "metrics": [adhoc_metric("Avg Loan Size ($)", "SUM(gross_loan_portfolio)/NULLIF(SUM(active_loan_count),0)")],
+            "metric": adhoc_metric(
+                "Avg Loan Size ($)", "SUM(gross_loan_portfolio)/NULLIF(SUM(active_loan_count),0)"
+            ),
+            "metrics": [
+                adhoc_metric(
+                    "Avg Loan Size ($)", "SUM(gross_loan_portfolio)/NULLIF(SUM(active_loan_count),0)"
+                )
+            ],
             "number_format": "$,.0f",
             "subheader": "Average outstanding principal per active loan",
         }, owner),
@@ -537,16 +542,24 @@ def create_portfolio_assets(owner, database: Database) -> None:
                 adhoc_metric("Outstanding Principal ($)", "SUM(gross_loan_portfolio)"),
                 adhoc_metric("Active Loans (#)",          "SUM(active_loan_count)"),
                 adhoc_metric("Active Borrowers (#)",      "SUM(active_borrower_count)"),
-                adhoc_metric("Avg Loan Size ($)",         "SUM(gross_loan_portfolio)/NULLIF(SUM(active_loan_count),0)"),
-                adhoc_metric("NPA Loans (#)",             "SUM(npa_loan_count)"),
-                adhoc_metric("NPA Ratio %",               "(SUM(npa_outstanding_amount)*100)/NULLIF(SUM(gross_loan_portfolio),0)"),
+                adhoc_metric(
+                    "Avg Loan Size ($)", "SUM(gross_loan_portfolio)/NULLIF(SUM(active_loan_count),0)"
+                ),
+                adhoc_metric("NPA Loans (#)", "SUM(npa_loan_count)"),
+                adhoc_metric(
+                    "NPA Ratio %",
+                    "(SUM(npa_outstanding_amount)*100)/NULLIF(SUM(gross_loan_portfolio),0)",
+                ),
             ],
             "table_timestamp_format": "%Y-%m-%d",
         }, owner),
     ]
 
     ensure_dashboard("portfolio_health_dashboard.json", owner, charts, [
-        {"id": "ROW-PH-KPIS",      "charts": ["Gross Loan Portfolio", "Active Loans", "Active Borrowers", "NPA Ratio", "Average Loan Size"],
+        {"id": "ROW-PH-KPIS",
+         "charts": [
+             "Gross Loan Portfolio", "Active Loans", "Active Borrowers", "NPA Ratio", "Average Loan Size"
+         ],
          "default_width": 2, "default_height": 20,
          "chart_sizes": {"Gross Loan Portfolio": {"width": 4, "height": 20}}},
         {"id": "ROW-PH-COMPOSITION", "charts": ["Portfolio Composition Trend", "Portfolio Quality Trend"],
@@ -578,25 +591,25 @@ def create_repayment_assets(owner, database: Database) -> None:
     )
 
     charts = [
-        ensure_chart("Collection Efficiency KPI", "big_number_total", all_ds, {
+        ensure_chart("Collection Efficiency KPI", "big_number_total", lat_ds, {
             "metric": adhoc_metric("Efficiency %", f"({eff_expr})*100"),
             "metrics": [adhoc_metric("Efficiency %", f"({eff_expr})*100")],
             "number_format": ",.2f",
             "subheader": "% of due amount collected (principal + interest + fees + penalties)",
         }, owner),
-        ensure_chart("Collected Amount KPI", "big_number_total", all_ds, {
+        ensure_chart("Collected Amount KPI", "big_number_total", lat_ds, {
             "metric": adhoc_metric("Collected", "SUM(actual_collected_amount)"),
             "metrics": [adhoc_metric("Collected", "SUM(actual_collected_amount)")],
             "number_format": "$,.0f",
             "subheader": "Total cash collected (principal + interest + fees + penalties)",
         }, owner),
-        ensure_chart("Repayment Transactions KPI", "big_number_total", all_ds, {
+        ensure_chart("Repayment Transactions KPI", "big_number_total", lat_ds, {
             "metric": adhoc_metric("Txns", "SUM(repayment_transaction_count)"),
             "metrics": [adhoc_metric("Txns", "SUM(repayment_transaction_count)")],
             "number_format": ",d",
             "subheader": "Total payment events (one borrower can have multiple)",
         }, owner),
-        ensure_chart("Repaying Borrowers KPI", "big_number_total", all_ds, {
+        ensure_chart("Repaying Borrowers KPI", "big_number_total", lat_ds, {
             "metric": adhoc_metric("Borrowers", "COUNT(DISTINCT client_hash)"),
             "metrics": [adhoc_metric("Borrowers", "COUNT(DISTINCT client_hash)")],
             "number_format": ",d",
@@ -640,13 +653,13 @@ def create_repayment_assets(owner, database: Database) -> None:
             "zoomable": False,
             "bottom_margin": 60,
         }, owner),
-        ensure_chart("Collection Mix", "pie", all_ds, {
+        ensure_chart("Collection Mix", "pie", lat_ds, {
             "groupby": ["office_name"],
             "metric": adhoc_metric("Collected", "SUM(actual_collected_amount)"),
             "metrics": [adhoc_metric("Collected", "SUM(actual_collected_amount)")],
             "number_format": "$,.0f",
         }, owner),
-        ensure_chart("Collected Amount by Branch", "dist_bar", all_ds, {
+        ensure_chart("Collected Amount by Branch", "dist_bar", lat_ds, {
             "groupby": ["office_name"],
             "metrics": [
                 adhoc_metric("Collected", "SUM(actual_collected_amount)"),
@@ -656,7 +669,7 @@ def create_repayment_assets(owner, database: Database) -> None:
             "bottom_margin": 100,
             "left_margin": 80,
         }, owner),
-        ensure_chart("Collected Amount by Product", "dist_bar", all_ds, {
+        ensure_chart("Collected Amount by Product", "dist_bar", lat_ds, {
             "groupby": ["product_name"],
             "metrics": [
                 adhoc_metric("Collected", "SUM(actual_collected_amount)"),
@@ -694,7 +707,7 @@ def create_repayment_assets(owner, database: Database) -> None:
             "show_brush": "no",
             "bottom_margin": 60,
         }, owner),
-        ensure_chart("Collection Efficiency by Branch", "dist_bar", all_ds, {
+        ensure_chart("Collection Efficiency by Branch", "dist_bar", lat_ds, {
             "groupby": ["office_name"],
             "metrics": [
                 adhoc_metric("Efficiency %", f"({eff_expr})*100"),
@@ -704,7 +717,7 @@ def create_repayment_assets(owner, database: Database) -> None:
             "left_margin": 80,
             "color_scheme": "googleCategory10c",
         }, owner),
-        ensure_chart("Collection Efficiency by Product", "dist_bar", all_ds, {
+        ensure_chart("Collection Efficiency by Product", "dist_bar", lat_ds, {
             "groupby": ["product_name"],
             "metrics": [
                 adhoc_metric("Efficiency %", f"({eff_expr})*100"),
@@ -717,7 +730,7 @@ def create_repayment_assets(owner, database: Database) -> None:
 
 
 
-        ensure_chart("Repayment Summary Table", "table", all_ds, {
+        ensure_chart("Repayment Summary Table", "table", lat_ds, {
             "groupby": ["office_name", "product_name"],
             "metrics": [
                 adhoc_metric("Collected ($)",       "SUM(actual_collected_amount)"),
@@ -738,7 +751,11 @@ def create_repayment_assets(owner, database: Database) -> None:
     ]
 
     ensure_dashboard("repayment_behavior_dashboard.json", owner, charts, [
-        {"id": "ROW-RP-KPIS",       "charts": ["Collection Efficiency KPI", "Collected Amount KPI", "Repayment Transactions KPI", "Repaying Borrowers KPI"],
+        {"id": "ROW-RP-KPIS",
+         "charts": [
+             "Collection Efficiency KPI", "Collected Amount KPI",
+             "Repayment Transactions KPI", "Repaying Borrowers KPI"
+         ],
          "default_width": 3, "default_height": 20},
         {"id": "ROW-RP-TRENDS1",    "charts": ["Repayment Collection Trend", "Collection Efficiency Trend"],
          "default_width": 6, "default_height": 42},

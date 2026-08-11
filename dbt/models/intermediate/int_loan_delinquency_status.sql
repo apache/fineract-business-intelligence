@@ -36,11 +36,14 @@ with loan_base as (
         l.is_npa
     from {{ ref('stg_m_loan') }} l
     inner join {{ ref('stg_m_client') }} c
-        on l.tenant_id = c.tenant_id
-       and l.client_id = c.client_id
-    where l.loan_status_id = 300
-      and l.disbursedon_date is not null
+        on
+            l.tenant_id = c.tenant_id
+            and l.client_id = c.client_id
+    where
+        l.loan_status_id = 300
+        and l.disbursedon_date is not null
 ),
+
 date_spine as (
     select generate_series(
         '{{ var("historical_start_date", "2010-01-01") }}'::date,
@@ -48,6 +51,7 @@ date_spine as (
         make_interval(days => 1)
     )::date as snapshot_date
 ),
+
 loan_snapshots as (
     select
         lb.tenant_id,
@@ -64,9 +68,11 @@ loan_snapshots as (
         lb.is_npa
     from loan_base lb
     inner join date_spine ds
-        on ds.snapshot_date >= lb.disbursedon_date
-       and ds.snapshot_date <= lb.effective_maturity_date
+        on
+            ds.snapshot_date >= lb.disbursedon_date
+            and ds.snapshot_date <= lb.effective_maturity_date
 ),
+
 delinquency_matches as (
     select
         ls.*,
@@ -82,10 +88,11 @@ delinquency_matches as (
         ) as rn
     from loan_snapshots ls
     left join {{ ref('stg_m_delinquency') }} d
-        on ls.tenant_id = d.tenant_id
-       and ls.loan_id = d.loan_id
-       and d.addedon_date <= ls.snapshot_date
-       and (d.liftedon_date is null or d.liftedon_date > ls.snapshot_date)
+        on
+            ls.tenant_id = d.tenant_id
+            and ls.loan_id = d.loan_id
+            and d.addedon_date <= ls.snapshot_date
+            and (d.liftedon_date is null or d.liftedon_date > ls.snapshot_date)
 )
 
 select
@@ -97,26 +104,26 @@ select
     office_id,
     product_id,
     currency_code,
-    coalesce(bucket_id, 0)::bigint                              as bucket_key,
-    coalesce(bucket_name, 'Current')                            as bucket_name,
-    coalesce(delinquency_range_classification, 'Current')       as delinquency_range_classification,
-    coalesce(min_age_days, 0)                                   as days_past_due_lower_bound,
-    coalesce(max_age_days, 0)                                   as days_past_due_upper_bound,
+    coalesce(bucket_id, 0)::bigint as bucket_key,
+    coalesce(bucket_name, 'Current') as bucket_name,
+    coalesce(delinquency_range_classification, 'Current') as delinquency_range_classification,
+    coalesce(min_age_days, 0) as days_past_due_lower_bound,
+    coalesce(max_age_days, 0) as days_past_due_upper_bound,
     principal_disbursed_derived,
-    principal_outstanding_derived                               as principal_outstanding,
-    total_outstanding_derived                                   as total_outstanding,
+    principal_outstanding_derived as principal_outstanding,
+    total_outstanding_derived as total_outstanding,
     is_npa,
     case
-        when coalesce(min_age_days, 0) = 0      then 'Performing'
-        when coalesce(min_age_days, 0) < 30     then 'Watch-list'
-        when coalesce(min_age_days, 0) < 60     then 'PAR 30-59'
-        when coalesce(min_age_days, 0) < 90     then 'PAR 60-89'
-        else                                         'PAR 90+'
-    end                                                         as standard_par_band,
-    coalesce(min_age_days, 0) >= 30                             as is_par_30,
-    coalesce(min_age_days, 0) >= 60                             as is_par_60,
-    coalesce(min_age_days, 0) >= 90                             as is_par_90,
+        when coalesce(min_age_days, 0) = 0 then 'Performing'
+        when coalesce(min_age_days, 0) < 30 then 'Watch-list'
+        when coalesce(min_age_days, 0) < 60 then 'PAR 30-59'
+        when coalesce(min_age_days, 0) < 90 then 'PAR 60-89'
+        else 'PAR 90+'
+    end as standard_par_band,
+    coalesce(min_age_days, 0) >= 30 as is_par_30,
+    coalesce(min_age_days, 0) >= 60 as is_par_60,
+    coalesce(min_age_days, 0) >= 90 as is_par_90,
     coalesce(min_age_days, 0) > 0
-        and coalesce(min_age_days, 0) < 30                      as is_watch_list
+    and coalesce(min_age_days, 0) < 30 as is_watch_list
 from delinquency_matches
 where rn = 1

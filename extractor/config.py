@@ -57,7 +57,7 @@ class AppConfig:
     extract_lookback_seconds: int
 
     @classmethod
-    def from_env(cls) -> "AppConfig":
+    def from_env(cls) -> AppConfig:
         return cls(
             source=DatabaseConfig(
                 host=os.getenv("SOURCE_DB_HOST", "localhost"),

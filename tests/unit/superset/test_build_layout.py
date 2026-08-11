@@ -19,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 SUPERSET_DIR = Path(__file__).resolve().parent.parent.parent.parent / "docker" / "superset"
 
 if str(SUPERSET_DIR) not in sys.path:
@@ -140,8 +142,5 @@ def test_build_layout_raises_when_chart_name_not_in_lookup():
     lookup = {"Chart A": FakeChart(1, "Chart A")}
     row_specs = [{"id": "ROW-1", "charts": ["Missing Chart"]}]
 
-    try:
+    with pytest.raises(KeyError):
         build_layout(row_specs, lookup)
-        assert False, "expected KeyError for missing chart name"
-    except KeyError:
-        pass

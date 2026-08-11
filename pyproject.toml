@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-pytest>=9.1.1,<10.0.0
-pytest-mock>=3.15.1,<4.0.0
-freezegun>=1.5.5,<2.0.0
-ruff>=0.13.0,<0.17.0
-sqlfluff>=3.0.0,<5.0.0
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

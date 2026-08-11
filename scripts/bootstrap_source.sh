@@ -24,8 +24,6 @@ ensure_docker_prerequisites
 load_environment
 
 SOURCE_DB_CONTAINER="${SOURCE_DB_CONTAINER:-fineract-db-1}"
-SOURCE_DB_HOST="${SOURCE_DB_HOST:-localhost}"
-SOURCE_DB_PORT="${SOURCE_DB_HOST_PORT:-5432}"
 
 log()  { echo "[bootstrap-source] $*"; }
 fail() { echo "[bootstrap-source] ERROR: $*" >&2; exit 1; }

@@ -33,9 +33,9 @@ select
     ) as component_sum
 from {{ ref('mart_repayment_behavior') }}
 where (
-        principal_collected
-        + interest_collected
-        + fee_collected
-        + penalty_collected
-        + overpayment_collected
-      ) > actual_collected_amount * 1.001
+    principal_collected
+    + interest_collected
+    + fee_collected
+    + penalty_collected
+    + overpayment_collected
+) > actual_collected_amount * 1.001
