@@ -17,15 +17,17 @@ with latest_snapshot as (
     select max(snapshot_date) as snapshot_date
     from analytics.fact_loan_snapshot
 ),
+
 latest_transaction_balance as (
     select distinct on (tenant_id, loan_id)
         tenant_id,
         loan_id,
         outstanding_loan_balance_derived
     from raw.raw_m_loan_transaction
-    where is_reversed = false
-      and outstanding_loan_balance_derived is not null
-    order by tenant_id, loan_id, transaction_date desc, id desc
+    where
+        is_reversed = false
+        and outstanding_loan_balance_derived is not null
+    order by tenant_id asc, loan_id asc, transaction_date desc, id desc
 )
 
 select
@@ -37,6 +39,7 @@ from analytics.fact_loan_snapshot f
 inner join latest_snapshot ls
     on f.snapshot_date = ls.snapshot_date
 inner join latest_transaction_balance t
-    on f.tenant_id = t.tenant_id
-   and f.loan_id = t.loan_id
+    on
+        f.tenant_id = t.tenant_id
+        and f.loan_id = t.loan_id
 where abs(f.principal_outstanding - t.outstanding_loan_balance_derived) > 0.01

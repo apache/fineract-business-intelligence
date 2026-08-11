@@ -17,19 +17,27 @@ with latest_snapshot as (
     select max(snapshot_date) as snapshot_date
     from analytics.fact_loan_snapshot
 ),
+
 flagged_par_30_loans as (
-    select f.tenant_id, f.loan_id, f.snapshot_date
+    select
+        f.tenant_id,
+        f.loan_id,
+        f.snapshot_date
     from analytics.fact_loan_snapshot f
     inner join latest_snapshot ls
         on f.snapshot_date = ls.snapshot_date
     where f.is_par_30 = true
 ),
+
 genuinely_overdue_30_plus as (
-    select distinct r.tenant_id, r.loan_id
+    select distinct
+        r.tenant_id,
+        r.loan_id
     from raw.raw_m_loan_repayment_schedule r
     inner join latest_snapshot ls on true
-    where r.duedate <= ls.snapshot_date - 30
-      and (r.obligations_met_on_date is null or r.obligations_met_on_date > ls.snapshot_date)
+    where
+        r.duedate <= ls.snapshot_date - 30
+        and (r.obligations_met_on_date is null or r.obligations_met_on_date > ls.snapshot_date)
 )
 
 select
@@ -38,6 +46,7 @@ select
     p.snapshot_date
 from flagged_par_30_loans p
 left join genuinely_overdue_30_plus o
-    on p.tenant_id = o.tenant_id
-   and p.loan_id = o.loan_id
+    on
+        p.tenant_id = o.tenant_id
+        and p.loan_id = o.loan_id
 where o.loan_id is null

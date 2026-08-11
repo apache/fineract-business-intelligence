@@ -93,7 +93,7 @@ def test_query_scopes_to_the_configured_cob_job_name_not_any_completed_job(app_c
     from dataclasses import replace
 
     custom_config = replace(app_config, cob_job_name="CUSTOM_LOAN_COB")
-    recent = datetime(2026, 8, 2, 6, 0, tzinfo=timezone.utc)
+    recent = datetime(2026, 8, 2, 6, 0, tzinfo=UTC)
 
     from extractor.extractor import FineractExtractor
     from tests.conftest import FakeConnection, FakeCursor
