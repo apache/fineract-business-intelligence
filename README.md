@@ -21,549 +21,365 @@ under the License.
 
 The analytics pipeline for [Apache Fineract](https://fineract.apache.org/): the open-source core banking platform for financial inclusion.
 
-This project reads data from a Fineract PostgreSQL database, transforms it through a layered dbt pipeline, and serves interactive dashboards in Apache Superset. It is designed to be **downstream and separate** from Fineract: the only connection is a read-only credential to the Fineract database. Everything else — the analytics warehouse, transformations, and dashboards — runs independently.
+This project reads data from an Apache Fineract PostgreSQL database, transforms it through a layered dbt pipeline, and serves interactive dashboards in Apache Superset. It is **downstream and operationally isolated** from Fineract: the only coupling is a read-only credential on the Fineract database. Everything else, the analytics warehouse, dbt transformations, and dashboards runs independently.
 
 ---
 
-## Dashboards
+## Documentation
 
-| Dashboard | What it shows |
+| Document | Purpose |
 |---|---|
-| **Portfolio Health** | Gross Loan Portfolio, active borrowers vs loans, PAR ratio, NPA ratio, disbursement and collection trends, portfolio composition by branch and product |
-| **Delinquency & PAR** | Portfolio At Risk by DPD bucket (PAR 30/60/90/NPA), delinquency trend over time, bucket migration |
+| [docs/architecture.md](docs/architecture.md) | System topology, data flow, warehouse schemas, security model, design decisions |
+| [docs/testing.md](docs/testing.md) | Running tests, linters, and license checks locally |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow, branch/PR conventions, coding standards |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards and reporting |
 
 ---
 
-## Key assumption: Fineract database
+## What This Project Provides
 
-This project connects to a **real Apache Fineract PostgreSQL database**. It does not manage or start the Fineract application — you run Fineract separately and point this project at its database.
-
-For local development, clone and run Fineract locally (see [Setup](#setup) below). In production, set the `SOURCE_*` environment variables to point at your existing Fineract PostgreSQL instance.
-
-The extractor connects via a **read-only** credential (`SOURCE_REPLICA_USER`) created by `bootstrap_source.sh`. It never writes to Fineract.
+| Component | Directory | Description |
+|---|---|---|
+| **Extractor** | `extractor/` | Python service that pulls changed rows from Fineract using watermark-based incremental extraction |
+| **Analytics Warehouse** | `warehouse/` | PostgreSQL 16 with `raw`, `staging`, `intermediate`, `analytics`, and `meta` schemas |
+| **dbt Transformations** | `dbt/` | Staging views, dimensional models, daily snapshot facts, and presentation marts |
+| **Apache Superset** | `docker/superset/` | Pre-bootstrapped dashboards with office-level row-level security (RLS) |
+| **Pipeline Orchestration** | `scripts/` | Shell scripts that coordinate extraction → dbt build → Superset refresh |
 
 ---
 
-## Architecture
+## Pre-Built Dashboards
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  Apache Fineract PostgreSQL  (your Fineract database)    │
-│  fineract_default → bi_connector_source (read-only views)│
-└───────────────────────────┬─────────────────────────────┘
-                            │ read-only (fineract_reader)
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│  Extractor  (Python)                                     │
-│  Incremental watermark-based CDC                        │
-│  → raw.raw_m_* tables in Analytics Warehouse            │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│  Analytics Warehouse  (PostgreSQL)                       │
-│  raw → staging (views) → facts (incremental) → marts    │
-│  Transformation engine: dbt                             │
-└───────────────────────────┬─────────────────────────────┘
-                            │ read-only (analytics_reader)
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│  Apache Superset  :8088                                  │
-│  Row-level security — branch managers see their office   │
-│  Admin sees all offices                                  │
-└─────────────────────────────────────────────────────────┘
-```
+| Dashboard | Metrics |
+|---|---|
+| **Portfolio Health** | Gross Loan Portfolio, active borrowers, PAR 30+ ratio, NPA ratio, disbursement & collection trends, office and product breakdown |
+| **Delinquency & PAR** | PAR buckets (30/60/90/NPA), delinquency trends over time, bucket migration analysis |
+| **Repayment Behavior** | Repayment schedule adherence, early/late payment patterns |
 
-**Pipeline loop** (runs automatically inside the extractor container):
+---
 
-```
-backfill once on startup
-  └─► loop every PIPELINE_INTERVAL_SECONDS (default: 1 hour):
-        1. extractor incremental  — pull changed rows from Fineract DB
-        2. dbt build              — rebuild marts (only if step 1 succeeded)
-        3. superset refresh       — sync chart metadata (only if step 2 succeeded)
-```
+## Architecture Overview
+
+![Architecture overview diagram showing Fineract, the extractor, the analytics warehouse, and Superset](docs/images/readme_architecture.png)
+
+
+> For full pipeline flow, watermark extraction diagrams, warehouse schema breakdown, and security model detail, see **[docs/architecture.md](docs/architecture.md)**.
 
 ---
 
 ## Prerequisites
 
-| Tool | Version | Notes |
+| Tool | Minimum Version | Notes |
 |---|---|---|
-| Docker Desktop | 24+ | Must be running |
-| Docker Compose | v2 (plugin) | `docker compose version` |
-| Git | any | |
-| Git Bash | any | For running `.sh` scripts on Windows |
+| Docker Engine / Docker Desktop | 24.0 | Must be running |
+| Docker Compose v2 plugin | 2.20 | Verify with `docker compose version` |
+| Git | 2.x | |
+| Bash | 3.2+ | Git Bash satisfies this on Windows |
 
-No local Python, Java, or database tools required.
+No local Python, Java, or PostgreSQL installation is required to run the stack via Paths A or B below. Path C additionally requires a local JDK 21 and PowerShell.
 
 ---
 
-## Setup
+## Quickstart
 
-### Step 1 — Start the Fineract database
+The steps below use Bash. On macOS or Linux run them in your shell directly. On Windows, run them inside Git Bash.
+
+### 1. Choose a setup path for the Fineract source database
+
+Every path below ends with a Postgres database holding Fineract-shaped `m_*` tables. Pick one:
+
+| Path | What it does | Best for | Platform |
+|---|---|---|---|
+| **[A — Full Fineract](#path-a--full-fineract-application)** | Clones `apache/fineract`, runs its own Postgres container and the real Fineract application (Flyway creates every table) | Testing against real Fineract business logic; the most realistic setup | Any (Docker) |
+| **[B — Schema only](#path-b--schema-only-fastest)** (fastest) | Uses this project's own `fineract-db` container and a hand-written schema + seed data — no Fineract application involved | Fastest way to get a working BI stack; **this is the path CI runs on every push** | Any (Docker) |
+| **[C — Local Fineract dev server](#path-c--local-fineract-dev-server-windows-only)** | Uses this project's own `fineract-db` container, but runs the real Fineract application locally via Gradle (not Docker) | Iterating on Fineract itself while developing the BI pipeline | Windows only |
+
+If you are not sure which to pick, use **Path B** — it is the fastest to set up and the one continuously verified in CI.
+
+### 2. Clone and configure this project
+
+```bash
+git clone https://github.com/apache/fineract-business-intelligence.git
+cd fineract-business-intelligence
+cp .env.example .env
+```
+
+The defaults in `.env` work for local development without any changes, **except** for Path B, which additionally requires:
+
+```bash
+echo "SOURCE_DB_HOST=fineract-db" >> .env
+echo "SOURCE_DB_HOST_PORT=5432" >> .env
+```
+
+This points the extractor at this project's own `fineract-db` service instead of the default `host.docker.internal` (used by Paths A and C, which run Fineract outside this project's Docker network).
+
+---
+
+#### Path A — Full Fineract application
 
 Clone the Fineract repository and start its PostgreSQL container:
 
-```powershell
+```bash
+cd ..
 git clone -b develop https://github.com/apache/fineract.git
 cd fineract
-$env:PWD = (Get-Location).Path.Replace('\', '/')
 docker compose -f docker-compose-postgresql.yml up -d db
 ```
 
-Wait ~10 seconds for the container to become healthy.
+Wait roughly 10 seconds for the container to become healthy, then pull and tag the Fineract application image:
 
-### Step 2 — Pull and tag the Fineract image
-
-Fineract publishes a pre-built image to Docker Hub — no local build needed:
-
-```powershell
+```bash
 docker pull apache/fineract:latest
 docker tag apache/fineract:latest fineract:latest
 ```
 
-### Step 3 — Start Fineract (runs Flyway migrations)
+Start the Fineract application so that Flyway runs and creates all `m_*` tables:
 
-```powershell
-cd "C:\Users\<you>\Desktop\fineract"
-$env:PWD = (Get-Location).Path.Replace('\', '/')
+```bash
 docker compose -f docker-compose-postgresql.yml up -d fineract
-```
-
-Watch the logs until Flyway finishes creating all `m_*` tables (2–5 minutes):
-
-```powershell
-cd "C:\Users\<you>\Desktop\fineract"
-$env:PWD = (Get-Location).Path.Replace('\', '/')
 docker compose -f docker-compose-postgresql.yml logs -f fineract
 ```
 
-Wait for this line then press `Ctrl+C`:
+Wait until you see `Started FineractApplication in X.XXX seconds`, then press `Ctrl+C`.
 
-```
-Started FineractApplication in X.XXX seconds
-```
+Verify the source tables exist:
 
-### Step 4 — Verify tables exist
-
-```powershell
-cd "C:\Users\<you>\Desktop\fineract"
-$env:PWD = (Get-Location).Path.Replace('\', '/')
-docker compose -f docker-compose-postgresql.yml exec db psql -U root -d fineract_default -c '\dt m_*'
+```bash
+docker compose -f docker-compose-postgresql.yml exec db \
+  psql -U root -d fineract_default -c '\dt m_*'
 ```
 
-You should see 100+ tables like `m_loan`, `m_client`, `m_office`, etc.
+You should see 100+ tables (`m_loan`, `m_client`, `m_office`, etc.). Return to the `fineract-business-intelligence` directory and continue at [step 3](#3-bootstrap-the-source-database). The extractor's default `SOURCE_DB_HOST=host.docker.internal` already targets this container's exposed port.
 
-### Step 5 — Seed demo data
+#### Path B — Schema only (fastest)
 
-Load demo data into the Fineract DB. This gives you:
-- **25 clients**, **71 loans** across 3 offices and 4 products
-- Staggered vintages from 1 month to 36 months ago — enough history for trend charts
-- PAR-30, PAR-60, PAR-90, and NPA loans — every delinquency bucket populated
+This project ships its own `fineract-db` service (defined in `compose.yaml`) plus a hand-written SQL schema that mirrors the real Fineract tables the extractor reads. No separate Fineract checkout, no JVM, no Flyway.
 
-Run from PowerShell (from the `fineract-business-intelligence` directory):
+Start the container:
 
-```powershell
-Get-Content "C:\Users\<you>\Desktop\fineract-business-intelligence\warehouse\seed\seed_fineract_source.sql" | docker exec -i fineract-db-1 psql -U root -d fineract_default
+```bash
+docker compose up -d fineract-db
 ```
 
-> Skip this step if pointing at a real Fineract instance that already has data.
+Wait for it to report healthy (`docker compose ps fineract-db`), then create the schema and seed demo data — 80 clients, 144 loans across 3 offices (head office + North Branch + South Branch) and 4 products, with enough history to populate every delinquency bucket:
 
-### Step 6 — Clone and configure this project
+```bash
+docker exec -i fineract-bi-fineract-db psql -U root -d fineract_default \
+  < warehouse/seed/schema_fineract_source.sql
 
-```powershell
-cd "C:\Users\<you>\Desktop"
-git clone https://github.com/apache/fineract-business-intelligence.git
-cd fineract-business-intelligence
-Copy-Item .env.example .env
+docker exec -i fineract-bi-fineract-db psql -U root -d fineract_default \
+  < warehouse/seed/seed_fineract_source.sql
 ```
 
-The defaults in `.env` work for local development without any edits.
+> Skip the seed step if you already have data loaded and only need to re-apply the schema.
 
-### Step 7 — Bootstrap the source database
+Continue at [step 3](#3-bootstrap-the-source-database). Make sure you added the `SOURCE_DB_HOST=fineract-db` override from step 2 above — without it, the extractor tries to reach `host.docker.internal`, which is not this container.
 
-One-time step. Run from Git Bash inside the `fineract-business-intelligence` directory:
+#### Path C — Local Fineract dev server (Windows only)
+
+For developing against real Fineract business logic without Docker-in-Docker overhead, `scripts/bootstrap_fineract_source.sh` starts this project's `fineract-db` container and runs the actual Fineract application as a local Gradle process (via `gradlew.bat :fineract-provider:devRun`), driven through PowerShell.
+
+Prerequisites:
+- A sibling checkout of Fineract at `../fineract` relative to this repository (override with `FINERACT_REPO_PATH` in `.env`)
+- JDK 21 installed (the script looks for it at `C:\Program Files\Java\jdk-21` or `$JAVA_HOME`)
+- PowerShell available on `PATH`
+
+```bash
+docker compose up -d fineract-db
+bash scripts/bootstrap_fineract_source.sh
+```
+
+This starts the Fineract backend (or reuses one already running), enables the business-date configuration flag, creates the `bi_connector_source` compatibility views, and grants read access — all in one script. It replaces both the "start Fineract" step of Path A and the bootstrap step below. Continue directly at [step 4](#4-start-the-bi-stack).
+
+To stop the locally-running Fineract process later:
+
+```bash
+bash scripts/stop_fineract_backend.sh
+```
+
+---
+
+### 3. Bootstrap the source database
+
+Run this during setup (and again whenever the source schema or grants need to be refreshed). It creates compatibility views in `bi_connector_source` schema on the Fineract database and grants read-only access to `fineract_reader`:
 
 ```bash
 bash scripts/bootstrap_source.sh
 ```
 
-This creates the `bi_connector_source` schema with compatibility views on the Fineract DB and grants read-only access to `fineract_reader`. Safe to re-run — all operations are idempotent.
-
 Expected output:
+
 ```
+[bootstrap-source] Checking connection to '<source container>'...
 [bootstrap-source] Connection OK
+[bootstrap-source] Creating compatibility views in schema 'bi_connector_source'...
 [bootstrap-source] Compatibility views created in schema 'bi_connector_source'
 [bootstrap-source] Creating replica user if not exists...
+[bootstrap-source] Granting read access to 'fineract_reader'...
 [bootstrap-source] Read access granted to 'fineract_reader'
-[bootstrap-source] === Source bootstrap complete. You can now run the pipeline. ===
+[bootstrap-source] === Source bootstrap complete. You can now start the BI stack. ===
+[bootstrap-source]     docker compose up -d warehouse superset dbt extractor
 ```
 
-### Step 8 — Start the BI stack
+The bootstrap is idempotent and safe to re-run. It replaces the compatibility views transactionally, preserves the schema, and reapplies the reader grants. Target resolution order: an explicit `SOURCE_DB_CONTAINER` env var always wins; otherwise, if `SOURCE_DB_HOST` names a service in this Compose project (as in Path B), the script bootstraps that same service; otherwise it falls back to the container name `fineract-db-1` (used by Path A's standalone Fineract compose file).
 
-```powershell
-cd "C:\Users\<you>\Desktop\fineract-business-intelligence"
+### 4. Start the BI stack
+
+Start the BI stack:
+
+```bash
 docker compose up -d warehouse superset dbt extractor
 ```
 
-This starts 4 services:
+The pipeline runs `dbt deps` before each dbt build, so a fresh clone does not need a separate dependency-install step. You may still run `docker compose exec dbt dbt deps` manually when developing dbt models.
 
 | Service | Role | Port |
 |---|---|---|
-| `warehouse` | Analytics PostgreSQL warehouse | 5434 |
-| `extractor` | ETL pipeline — runs automatically on schedule | — |
-| `dbt` | Transformation container | — |
-| `superset` | Dashboard UI | **8088** |
+| `warehouse` | Analytics PostgreSQL warehouse | `5434` |
+| `extractor` | Watermark-based extraction engine — runs automatically | — |
+| `dbt` | Transformation container (exec target) | — |
+| `superset` | Dashboard UI | **`8088`** |
 
-The extractor waits 30 seconds for Superset to initialise, runs a full backfill, then loops every hour. Watch it:
+The extractor waits 30 s for Superset to initialise, then runs a full backfill. Monitor it:
 
-```powershell
+```bash
 docker compose logs -f extractor
 ```
 
-Wait for:
-```
-Done. PASS=81 WARN=0 ERROR=0
-[pipeline] Pipeline run complete in Xs
-```
-
-### Step 9 — Open Superset
+A successful initial run looks like:
 
 ```
-http://localhost:8088
+[pipeline] === Starting pipeline run (mode=backfill) ===
+[pipeline] Step 1/3 — Extractor (backfill)
+[pipeline] Step 1/3 — Extractor OK
+[pipeline] Ensuring dbt package dependencies are available
+[pipeline] Step 2/3 — dbt (dbt build --full-refresh)
+[pipeline] Step 2/3 — dbt OK
+[pipeline] Step 3/3 — Superset asset refresh
+[pipeline] Step 3/3 — Superset OK
+[pipeline] === Pipeline run complete in Xs ===
 ```
 
-| Role | Username | Password (default) | Sees |
+### 5. Open Superset
+
+Navigate to `http://localhost:8088` and log in:
+
+| Role | Username | Default password | Sees |
 |---|---|---|---|
 | Admin | `admin` | `admin_dev_only` | All offices |
 | North Branch Manager | `north_manager` | `north_manager_dev_only` | North Branch only |
 | South Branch Manager | `south_manager` | `south_manager_dev_only` | South Branch only |
 
-Navigate to **Dashboards** → **Portfolio Health** and **Delinquency & PAR**.
+Go to **Dashboards** and open one of the three pre-built dashboards: **Portfolio Health**, **Delinquency & PAR**, or **Repayment Behavior**.
 
 ---
 
-## Keeping Dashboards Fresh
+## Keeping the Pipeline Current
 
 ### Automatic (default)
 
-The extractor runs the full pipeline every hour automatically. No action needed.
+The extractor loops every hour automatically (`PIPELINE_INTERVAL_SECONDS=3600`). No action needed.
 
-### After changing data in Fineract
+### Force an immediate run or run dbt manually
 
-Force an immediate update instead of waiting for the next hour:
+> **Important**: Pipeline runs are mutually exclusive, but a direct `docker compose exec dbt dbt build` bypasses that lock. To avoid conflicts, stop the extractor before running dbt manually:
 
-```powershell
-docker compose restart extractor
-```
-
-### Force full pipeline run manually
-
-```powershell
-docker compose logs --tail=30 extractor   # check current status first
-```
-
-Then from Git Bash:
 ```bash
-docker exec fineract-bi-extractor bash -c "bash /app/scripts/run_pipeline.sh backfill"
+docker compose stop extractor
+docker compose exec dbt dbt build --full-refresh
+docker compose start extractor
 ```
 
-### Check all container logs
+To trigger a single pipeline run without stopping the loop, exec into the extractor container:
 
-```powershell
-docker compose logs --tail=30 warehouse superset dbt extractor
+```bash
+docker compose exec extractor bash /app/scripts/run_pipeline.sh incremental
 ```
 
-What to look for:
+To run **only** the extraction step (no dbt build, no Superset refresh) — useful when debugging the extractor in isolation:
 
-| Container | Healthy sign |
-|---|---|
-| `warehouse` | `database system is ready to accept connections` |
-| `superset` | `Portfolio Health dashboard created` |
-| `dbt` | (idle — no output expected) |
-| `extractor` | `PASS=81 WARN=0 ERROR=0` + `Pipeline run complete` |
+```bash
+bash scripts/run_extractor_backfill.sh      # full reload from source
+bash scripts/run_extractor_incremental.sh   # changed rows only, since the last watermark
+```
 
----
+### After a machine reboot
 
-## After a Machine Reboot
+**If you used Path A:**
 
-Fineract DB and the BI stack are separate — restart both:
-
-```powershell
-# 1. Restart Fineract DB
-cd "C:\Users\<you>\Desktop\fineract"
-$env:PWD = (Get-Location).Path.Replace('\', '/')
+```bash
+# From the Fineract repository directory:
 docker compose -f docker-compose-postgresql.yml up -d db fineract
 
-# 2. Restart BI stack
-cd "C:\Users\<you>\Desktop\fineract-business-intelligence"
+# From the fineract-business-intelligence directory:
 docker compose up -d warehouse superset dbt extractor
 ```
 
-No need to re-run bootstrap or re-seed — data is persisted in Docker volumes.
+**If you used Path B:**
+
+```bash
+docker compose up -d fineract-db warehouse superset dbt extractor
+```
+
+**If you used Path C:**
+
+```bash
+bash scripts/bootstrap_fineract_source.sh   # restarts the local Fineract process if it is not already running
+docker compose up -d warehouse superset dbt extractor
+```
+
+Data is persisted in Docker volumes — no need to re-bootstrap or re-seed.
 
 ---
 
 ## Production Deployment
 
-### Connecting to a remote Fineract database
-
-Set these in `.env`:
+Set these variables in `.env` before running:
 
 ```bash
+# Extractor connects to Fineract DB via host.docker.internal by default.
+# Override with the actual hostname or IP of your Fineract PostgreSQL server:
 SOURCE_DB_HOST=<your-fineract-db-host>
 SOURCE_DB_HOST_PORT=5432
 SOURCE_DB_NAME=fineract_default
-SOURCE_BOOTSTRAP_USER=<admin-user>
-SOURCE_BOOTSTRAP_PASSWORD=<secret>
+SOURCE_DB_SCHEMA=bi_connector_source
 SOURCE_REPLICA_USER=fineract_reader
 SOURCE_REPLICA_PASSWORD=<secret>
-SOURCE_DB_SCHEMA=bi_connector_source
-```
 
-Run bootstrap once against the remote database (from Git Bash):
-
-```bash
-bash scripts/bootstrap_source.sh
-```
-
-Then start the BI stack — it connects to the remote Fineract DB directly via `SOURCE_DB_HOST`.
-
-### Recommended production settings
-
-```bash
-# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+# Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
 SUPERSET_SECRET_KEY=<64-char-hex>
 
-# Run pipeline daily after COB completes
+# Run pipeline daily after COB
 PIPELINE_INTERVAL_SECONDS=86400
 
-# All passwords via your secrets manager
+# Strong passwords for all service accounts
 WAREHOUSE_ADMIN_PASSWORD=<secret>
 WAREHOUSE_LOADER_PASSWORD=<secret>
 WAREHOUSE_READER_PASSWORD=<secret>
 SUPERSET_ADMIN_PASSWORD=<secret>
-SUPERSET_NORTH_MANAGER_PASSWORD=<secret>
-SUPERSET_SOUTH_MANAGER_PASSWORD=<secret>
 ```
 
----
-
-## Data Pipeline Details
-
-### Layer architecture
-
-```
-fineract_default.public.*          Fineract source tables
-        │
-        │  bi_connector_source.*   Compatibility views (bootstrap_source.sh)
-        │                          Normalises schema differences across Fineract versions
-        │
-        ▼
-raw.raw_m_*                        Raw layer — exact copy of source rows
-                                   + tenant_id + source_loaded_at
-        │
-        ▼
-staging.stg_m_*                    Staging views — rename columns, cast types,
-                                   drop PII (date_of_birth → age_band),
-                                   add pseudonymous client_hash
-        │
-        ▼
-analytics.fact_loan_snapshot       Daily grain: one row per (loan, date)
-analytics.fact_delinquency_event   One row per delinquency tag lifecycle event
-        │
-        ▼
-analytics.mart_portfolio_health    Grain: office × product × currency × date
-analytics.mart_delinquency_par     Grain: office × product × bucket × date
-```
-
-### PII handling
-
-- `date_of_birth` is dropped in `stg_m_client` and replaced with `age_band` (6 cohorts)
-- `client_id` is replaced downstream by `client_hash` = MD5(tenant_id || '::' || id)
-- All presentation marts are aggregated at office × product level — no individual client rows reach Superset
-- Row-level security in Superset restricts branch managers to their own office data
-
-### Watermark-based incremental extraction
-
-The extractor tracks a per-table `last_modified_on_utc` cursor in `meta.watermarks`. Each incremental run fetches only rows changed since the last successful extraction. A 10-minute lookback window (`EXTRACT_LOOKBACK_SECONDS=600`) handles clock skew and late-arriving updates.
-
----
-
-## Project Structure
-
-```
-fineract-business-intelligence/
-├── compose.yaml                    Docker Compose — 4-service BI stack
-├── .env.example                    Environment template (copy to .env)
-│
-├── scripts/
-│   ├── common.sh                   Shared helpers (docker checks, env loading)
-│   ├── bootstrap_source.sh         One-time: create views + grants on Fineract DB
-│   └── run_pipeline.sh             Full pipeline: extractor → dbt → superset
-│
-├── extractor/                      Python ETL service
-│   ├── cli.py                      Entry point: backfill | incremental
-│   ├── extractor.py                Extraction logic (11 tables, watermark-based)
-│   ├── config.py                   Config from environment variables
-│   └── watermark_manager.py        Per-table cursor tracking
-│
-├── dbt/                            dbt transformation project (fineract_bi)
-│   ├── models/
-│   │   ├── staging/                stg_* views (clean + rename)
-│   │   └── marts/
-│   │       ├── dimensions/         dim_office, dim_client, dim_product, …
-│   │       ├── facts/              fact_loan_snapshot, fact_delinquency_event
-│   │       └── presentations/      mart_portfolio_health, mart_delinquency_par
-│   └── macros/
-│       └── safe_divide.sql         NULL-safe division macro
-│
-├── warehouse/
-│   ├── schema/                     DDL for raw, staging, mart, meta schemas
-│   └── seed/
-│       └── seed_fineract_source.sql  Demo data (25 clients, 71 loans)
-│
-└── docker/
-    ├── postgres-warehouse/         Warehouse init scripts (roles, permissions)
-    ├── extractor/                  Extractor Dockerfile (includes Docker CLI)
-    ├── dbt/                        dbt Dockerfile (dbt-postgres pinned <2.0)
-    └── superset/
-        ├── Dockerfile
-        ├── init_superset.sh        First-run: DB migrate, admin user, dashboards
-        ├── refresh_superset_assets.sh
-        ├── bootstrap_superset_assets.py
-        └── superset_config.py
-```
-
----
-
-## Contributing
-
-### Running dbt manually
-
-```bash
-# Enter the dbt container
-docker compose exec dbt bash
-
-# Run all models
-dbt build
-
-# Run a specific model
-dbt run --select mart_portfolio_health
-
-# Run tests only
-dbt test
-
-# Full rebuild (drops and recreates incremental tables)
-dbt build --full-refresh
-```
-
-### Adding a new dbt model
-
-1. Add SQL in the appropriate `dbt/models/` subdirectory
-2. Add schema tests in the corresponding `_*.yml` file
-3. Add Apache license header to the SQL file
-4. Run `dbt build --select <your_model>` to verify
-
-### Code standards
-
-- All source files must carry the Apache License 2.0 header
-- SQL: snake_case identifiers, explicit column lists (no `SELECT *` in models)
-- Python: type annotations, dataclasses for config, no hardcoded credentials
-- Shell: `set -euo pipefail`, source `common.sh` for shared helpers
+> **Note**: `scripts/bootstrap_source.sh` runs via `docker exec`. If `SOURCE_DB_HOST` is a service in this Compose project, it selects that service; otherwise it uses `SOURCE_DB_CONTAINER` (default: `fineract-db-1`). It cannot bootstrap a remote Fineract database over a network. For remote bootstrap, connect to the target PostgreSQL host directly and apply the SQL from the script by hand, or adapt it to use `psql -h <host>` instead of `docker exec`.
 
 ---
 
 ## Troubleshooting
 
-### Extractor fails: `role "fineract_reader" does not exist`
+| Symptom | Cause | Fix |
+|---|---|---|
+| `role "fineract_reader" does not exist` | Bootstrap not run, or Fineract DB recreated | `bash scripts/bootstrap_source.sh`, then `docker compose restart extractor` |
+| Extractor cannot reach the source database | Source host or port is incorrect | Set `SOURCE_DB_HOST` and `SOURCE_DB_HOST_PORT` in `.env` to the source database endpoint |
+| Dashboards show "No data" | Pipeline has not completed yet | `docker compose logs -f extractor` — wait for `Pipeline run complete` |
+| `\r': command not found` | Windows Git added CRLF line endings to scripts | `sed -i 's/\r//' scripts/*.sh docker/**/*.sh` |
+| `adapter is not yet supported by dbt Fusion` | dbt 2.0 dropped PostgreSQL support | `docker compose build dbt && docker compose up -d --force-recreate dbt` |
+| Warehouse exits with code 126 | Init script has CRLF line endings | `sed -i 's/\r//' docker/postgres-warehouse/initdb/002_create_warehouse_roles.sh`, then `docker compose down -v && docker compose up -d` |
+| Full clean slate needed | Corrupt volume state | `docker compose down -v && docker compose up -d warehouse superset dbt extractor` (re-run bootstrap after) |
 
-Bootstrap has not been run, or the Fineract DB was recreated. Re-run from Git Bash:
+---
 
-```bash
-bash scripts/bootstrap_source.sh
-```
+## Testing & Quality Checks
 
-Then restart the extractor:
-
-```powershell
-docker compose restart extractor
-```
-
-### Extractor cannot reach the Fineract DB
-
-The extractor connects to the Fineract DB container by name (`fineract-db-1`) on the shared Docker network. If your Fineract DB container has a different name, update `SOURCE_DB_HOST` in `.env`:
-
-```bash
-SOURCE_DB_HOST=<your-fineract-db-container-name-or-host>
-```
-
-### Dashboards show "No data"
-
-The pipeline has not completed yet. Check:
-
-```powershell
-docker compose logs --tail=30 extractor
-```
-
-Look for `Pipeline run complete`. If it shows `ERROR`, check the specific error and consult the relevant section below.
-
-Force an immediate run:
-
-```bash
-docker exec fineract-bi-extractor bash -c "bash /app/scripts/run_pipeline.sh backfill"
-```
-
-### dbt fails: `adapter is not yet supported by dbt Fusion`
-
-dbt 2.0 dropped PostgreSQL support. The dbt image pin (`dbt-postgres<2.0.0a1`) should prevent this, but if it happens rebuild the image:
-
-```powershell
-docker compose build dbt
-docker compose up -d --force-recreate dbt
-```
-
-### dbt test fails: `unique_fact_delinquency_event_delinquency_event_key`
-
-Duplicate rows in the incremental table from a previous run. Fix with a full-refresh of that model:
-
-```bash
-docker exec fineract-bi-dbt bash -c "cd /app/dbt && dbt build --full-refresh --select fact_delinquency_event"
-```
-
-### Shell scripts fail with `\r': command not found`
-
-Windows Git added CRLF line endings. Fix with:
-
-```bash
-sed -i 's/\r//' scripts/bootstrap_source.sh scripts/common.sh scripts/run_pipeline.sh
-```
-
-### Warehouse container exits with code 126
-
-An init script has CRLF line endings. Fix and restart:
-
-```bash
-sed -i 's/\r//' docker/postgres-warehouse/initdb/002_create_warehouse_roles.sh
-```
-
-```powershell
-docker compose down -v
-docker compose up -d warehouse superset dbt extractor
-```
-
-### Full clean slate
-
-```powershell
-# Stop everything and remove volumes
-docker compose down -v
-
-# Restart from Step 8
-docker compose up -d warehouse superset dbt extractor
-```
-
-> `docker compose down -v` deletes all warehouse data and Superset metadata. The Fineract DB (managed separately) is unaffected. Re-run bootstrap (Step 7) before starting the BI stack again.
+See **[docs/testing.md](docs/testing.md)** for the full guide covering unit tests, dbt tests, linters, and license audits.
 
 ---
 
