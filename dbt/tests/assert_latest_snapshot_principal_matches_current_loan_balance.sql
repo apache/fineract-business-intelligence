@@ -15,7 +15,7 @@
 
 with latest_snapshot as (
     select max(snapshot_date) as snapshot_date
-    from analytics.fact_loan_snapshot
+    from {{ ref('fact_loan_snapshot') }}
 ),
 
 latest_transaction_balance as (
@@ -23,7 +23,7 @@ latest_transaction_balance as (
         tenant_id,
         loan_id,
         outstanding_loan_balance_derived
-    from raw.raw_m_loan_transaction
+    from {{ source('raw', 'raw_m_loan_transaction') }}
     where
         is_reversed = false
         and outstanding_loan_balance_derived is not null
@@ -35,7 +35,7 @@ select
     f.loan_id,
     f.principal_outstanding as reconstructed_principal_outstanding,
     t.outstanding_loan_balance_derived as latest_ledger_balance
-from analytics.fact_loan_snapshot f
+from {{ ref('fact_loan_snapshot') }} f
 inner join latest_snapshot ls
     on f.snapshot_date = ls.snapshot_date
 inner join latest_transaction_balance t

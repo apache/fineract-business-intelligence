@@ -23,7 +23,15 @@ source "${SCRIPT_DIR}/common.sh"
 ensure_docker_prerequisites
 load_environment
 
-SOURCE_DB_CONTAINER="${SOURCE_DB_CONTAINER:-fineract-db-1}"
+if [[ -n "${SOURCE_DB_CONTAINER:-}" ]]; then
+    SOURCE_DB_CONTAINER="${SOURCE_DB_CONTAINER}"
+else
+    SOURCE_DB_CONTAINER=""
+    if [[ -n "${SOURCE_DB_HOST:-}" ]]; then
+        SOURCE_DB_CONTAINER="$(docker compose -f "${COMPOSE_FILE}" ps -q "${SOURCE_DB_HOST}" 2>/dev/null || true)"
+    fi
+    SOURCE_DB_CONTAINER="${SOURCE_DB_CONTAINER:-fineract-db-1}"
+fi
 
 log()  { echo "[bootstrap-source] $*"; }
 fail() { echo "[bootstrap-source] ERROR: $*" >&2; exit 1; }
@@ -56,6 +64,7 @@ log "Connection OK"
 log "Creating compatibility views in schema '${SOURCE_DB_SCHEMA}'..."
 
 run_sql_stdin <<SQL
+BEGIN;
 CREATE SCHEMA IF NOT EXISTS ${SOURCE_DB_SCHEMA};
 
 -- m_office: no created_on_utc in real Fineract schema, use epoch fallback
@@ -120,7 +129,8 @@ SELECT
     created_on_utc, last_modified_on_utc
 FROM public.m_loan;
 
--- m_loan_transaction: real schema has no submitted_on_date, use transaction_date
+-- Support both Fineract schemas: some expose submitted_on_date while others
+-- require transaction_date as its compatibility value.
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_loan_transaction AS
 SELECT
     id, loan_id, office_id, is_reversed, transaction_type_enum,
@@ -128,7 +138,10 @@ SELECT
     interest_portion_derived, fee_charges_portion_derived,
     penalty_charges_portion_derived, overpayment_portion_derived,
     outstanding_loan_balance_derived,
-    transaction_date AS submitted_on_date,
+    COALESCE(
+        (to_jsonb(m_loan_transaction) ->> 'submitted_on_date')::date,
+        transaction_date
+    ) AS submitted_on_date,
     created_on_utc, last_modified_on_utc
 FROM public.m_loan_transaction;
 
@@ -159,12 +172,19 @@ SELECT id, loan_id, fromdate, duedate, installment,
     penalty_charges_amount, penalty_charges_completed_derived, penalty_charges_writtenoff_derived, penalty_charges_waived_derived,
     total_paid_in_advance_derived, total_paid_late_derived,
     completed_derived, obligations_met_on_date, is_re_aged,
-    lastmodified_date::timestamptz AS lastmodified_date
+    COALESCE(
+        (to_jsonb(m_loan_repayment_schedule) ->> 'last_modified_on_utc')::timestamptz,
+        (to_jsonb(m_loan_repayment_schedule) ->> 'lastmodified_date')::timestamptz
+    ) AS lastmodified_date
 FROM public.m_loan_repayment_schedule;
--- Note: dev seed schema uses lastmodified_date (TIMESTAMP); Fineract prod uses last_modified_on_utc (TIMESTAMPTZ).
--- Both views expose it as lastmodified_date for uniform extractor cursor_column handling.
+-- Fineract variants use either lastmodified_date or last_modified_on_utc.
+-- Both views expose a TIMESTAMPTZ lastmodified_date cursor to the extractor.
 
 -- batch_job_execution: real schema uses timestamp without time zone
+-- Drop first because CREATE OR REPLACE VIEW cannot rename or reorder an
+-- existing view's columns. Keeping this in the transaction makes a failed
+-- bootstrap leave the previous compatibility schema untouched.
+DROP VIEW IF EXISTS ${SOURCE_DB_SCHEMA}.batch_job_execution;
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
 SELECT
     bje.job_execution_id,
@@ -179,6 +199,7 @@ SELECT
 FROM public.batch_job_execution bje
 INNER JOIN public.batch_job_instance bji
     ON bje.job_instance_id = bji.job_instance_id;
+COMMIT;
 SQL
 
 log "Compatibility views created in schema '${SOURCE_DB_SCHEMA}'"
@@ -206,5 +227,5 @@ GRANT SELECT ON ALL TABLES IN SCHEMA ${SOURCE_DB_SCHEMA} TO ${SOURCE_REPLICA_USE
 SQL
 
 log "Read access granted to '${SOURCE_REPLICA_USER}'"
-log "=== Source bootstrap complete. You can now run the pipeline. ==="
-log "    bash scripts/run_pipeline.sh backfill"
+log "=== Source bootstrap complete. You can now start the BI stack. ==="
+log "    docker compose up -d warehouse superset dbt extractor"
