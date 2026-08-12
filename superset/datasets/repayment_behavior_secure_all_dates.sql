@@ -13,10 +13,11 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-{% set username = current_username() or 'admin' %}
+{% set username = (current_username() or '') | replace("'", "''") %}
 select *
 from analytics.mart_repayment_behavior
 where reporting_date <= current_date
+  and '{{ username }}' != ''
   and (
     exists (
         select 1

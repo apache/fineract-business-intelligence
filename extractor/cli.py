@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("backfill", help="Run a full historical backfill")
     subparsers.add_parser("incremental", help="Run an incremental extraction")
+    subparsers.add_parser(
+        "reconcile",
+        help="Delete raw rows whose primary key no longer exists in the source "
+        "(upsert-only extraction never propagates source deletes on its own)",
+    )
     return parser
 
 

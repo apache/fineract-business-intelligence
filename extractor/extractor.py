@@ -301,6 +301,7 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         primary_key="job_execution_id",
         columns=(
             "job_execution_id",
+            "job_name",
             "status",
             "start_time",
             "end_time",
@@ -324,7 +325,7 @@ class FineractExtractor:
         return pg8000.dbapi.connect(**self.config.warehouse.connect_kwargs)
 
     def run(self, mode: str) -> dict[str, int | str]:
-        if mode not in {"backfill", "incremental"}:
+        if mode not in {"backfill", "incremental", "reconcile"}:
             raise ValueError(f"Unsupported mode: {mode}")
 
         run_id = uuid.uuid4()
@@ -344,21 +345,29 @@ class FineractExtractor:
             try:
                 if mode == "backfill":
                     self._reset_backfill_state(warehouse_conn, watermark_manager)
+
                 lag_seconds = ensure_replica_safe(source_conn, self.config.replica_lag_threshold_seconds)
                 logger.info("Replica safety check passed with lag=%ss.", lag_seconds)
-                self._ensure_cob_completed(source_conn)
 
-                for spec in TABLE_SPECS:
-                    logger.info("Extracting source table '%s' into raw.%s.", spec.source_table, spec.raw_table)
-                    extracted_rows = self._extract_table(source_conn, warehouse_conn, watermark_manager, spec, mode)
-                    rows_extracted += extracted_rows
-                    rows_loaded += extracted_rows
-                    logger.info(
-                        "Completed table '%s': rows_extracted=%s rows_loaded=%s.",
-                        spec.source_table,
-                        extracted_rows,
-                        extracted_rows,
-                    )
+                if mode == "reconcile":
+                    deleted_counts = self._reconcile_deletes(source_conn, warehouse_conn)
+                    rows_loaded = sum(deleted_counts.values())
+                    for table_name, deleted in deleted_counts.items():
+                        logger.info("Reconciled table '%s': rows_deleted=%s.", table_name, deleted)
+                else:
+                    self._ensure_cob_completed(source_conn)
+
+                    for spec in TABLE_SPECS:
+                        logger.info("Extracting source table '%s' into raw.%s.", spec.source_table, spec.raw_table)
+                        extracted_rows = self._extract_table(source_conn, warehouse_conn, watermark_manager, spec, mode)
+                        rows_extracted += extracted_rows
+                        rows_loaded += extracted_rows
+                        logger.info(
+                            "Completed table '%s': rows_extracted=%s rows_loaded=%s.",
+                            spec.source_table,
+                            extracted_rows,
+                            extracted_rows,
+                        )
 
                 self._update_pipeline_state(
                     warehouse_conn,
@@ -397,6 +406,58 @@ class FineractExtractor:
         finally:
             source_conn.close()
             warehouse_conn.close()
+
+    def _reconcile_deletes(self, source_conn, warehouse_conn) -> dict[str, int]:
+        deleted_counts: dict[str, int] = {}
+        for spec in TABLE_SPECS:
+            source_pks = self._fetch_source_primary_keys(source_conn, spec)
+            deleted_counts[spec.source_table] = self._delete_orphaned_rows(warehouse_conn, spec, source_pks)
+        return deleted_counts
+
+    def _fetch_source_primary_keys(self, source_conn, spec: TableSpec) -> set:
+        schema = _quote_identifier(self.config.source.schema)
+        table = _quote_identifier(spec.source_table)
+        pk = _quote_identifier(spec.primary_key)
+
+        cursor = source_conn.cursor()
+        cursor.execute(f"SELECT {pk} FROM {schema}.{table}")
+
+        primary_keys: set = set()
+        while True:
+            batch = cursor.fetchmany(self.config.extract_batch_size)
+            if not batch:
+                break
+            primary_keys.update(row[0] for row in batch)
+        return primary_keys
+
+    def _delete_orphaned_rows(self, warehouse_conn, spec: TableSpec, source_pks: set) -> int:
+        raw_table = _quote_identifier(spec.raw_table)
+        pk = _quote_identifier(spec.primary_key)
+
+        cursor = warehouse_conn.cursor()
+        cursor.execute(
+            f"SELECT {pk} FROM raw.{raw_table} WHERE tenant_id = %s",
+            (self.config.tenant_id,),
+        )
+        orphaned: list = []
+        while True:
+            batch = cursor.fetchmany(self.config.extract_batch_size)
+            if not batch:
+                break
+            orphaned.extend(row[0] for row in batch if row[0] not in source_pks)
+
+        if not orphaned:
+            return 0
+
+        max_pks_per_statement = max(1, self._POSTGRES_MAX_BIND_PARAMETERS - 1)
+        for offset in range(0, len(orphaned), max_pks_per_statement):
+            chunk = orphaned[offset : offset + max_pks_per_statement]
+            placeholders = ", ".join("%s" for _ in chunk)
+            cursor.execute(
+                f"DELETE FROM raw.{raw_table} WHERE tenant_id = %s AND {pk} IN ({placeholders})",
+                (self.config.tenant_id, *chunk),
+            )
+        return len(orphaned)
 
     def _reset_backfill_state(self, warehouse_conn, watermark_manager: WatermarkManager) -> None:
         cursor = warehouse_conn.cursor()
@@ -465,21 +526,28 @@ class FineractExtractor:
             SELECT MAX(end_time)
             FROM {schema}.batch_job_execution
             WHERE status = %s
+              AND job_name = %s
             """,
-            ("COMPLETED",),
+            ("COMPLETED", self.config.cob_job_name),
         )
         last_completed = as_utc_datetime(cursor.fetchone()[0])
 
         if last_completed is None:
-            raise RuntimeError("No completed COB execution found in batch_job_execution.")
+            raise RuntimeError(
+                f"No completed '{self.config.cob_job_name}' execution found in batch_job_execution."
+            )
 
         cutoff = datetime.now(UTC) - timedelta(hours=self.config.cob_lookback_hours)
         if last_completed < cutoff:
             raise RuntimeError(
-                f"Latest COB completion {last_completed.isoformat()} is older than "
-                f"{self.config.cob_lookback_hours} hours."
+                f"Latest '{self.config.cob_job_name}' completion {last_completed.isoformat()} "
+                f"is older than {self.config.cob_lookback_hours} hours."
             )
-        logger.info("COB completion gate passed with latest completion at %s.", last_completed.isoformat())
+        logger.info(
+            "COB completion gate passed for job '%s' with latest completion at %s.",
+            self.config.cob_job_name,
+            last_completed.isoformat(),
+        )
 
     def _extract_table(
         self,
@@ -525,7 +593,15 @@ class FineractExtractor:
         return total_rows
 
     def _build_source_query(self, spec: TableSpec, watermark: datetime | None) -> tuple[str, tuple]:
-        columns_sql = ", ".join(_quote_identifier(col) for col in spec.columns)
+        cursor_epoch = "TIMESTAMP '1970-01-01 00:00:00+00'"
+        select_columns = []
+        for col in spec.columns:
+            quoted = _quote_identifier(col)
+            if col == spec.cursor_column:
+                select_columns.append(f"COALESCE({quoted}, {cursor_epoch}) AS {quoted}")
+            else:
+                select_columns.append(quoted)
+        columns_sql = ", ".join(select_columns)
         schema = _quote_identifier(self.config.source.schema)
         table = _quote_identifier(spec.source_table)
         cursor = _quote_identifier(spec.cursor_column)
@@ -539,7 +615,12 @@ class FineractExtractor:
 
         return f"{base} WHERE {cursor} >= %s {order}", (watermark,)
 
+    _POSTGRES_MAX_BIND_PARAMETERS = 65535
+
     def _upsert_rows(self, warehouse_conn, spec: TableSpec, rows: list[tuple]) -> None:
+        if not rows:
+            return
+
         raw_columns = ("tenant_id", *spec.columns)
         insert_columns_sql = ", ".join(_quote_identifier(column) for column in raw_columns)
         update_columns = [
@@ -555,22 +636,27 @@ class FineractExtractor:
         raw_table = _quote_identifier(spec.raw_table)
         pk = _quote_identifier(spec.primary_key)
 
-        placeholders = []
-        values = []
-        for row in rows:
-            row_values = (self.config.tenant_id, *row)
-            ph = "(" + ", ".join("%s" for _ in row_values) + ")"
-            placeholders.append(ph)
-            values.extend(row_values)
-
-        values_sql = ", ".join(placeholders)
-
-        upsert_query = f"""
-            INSERT INTO raw.{raw_table} ({insert_columns_sql})
-            VALUES {values_sql}
-            ON CONFLICT ({_quote_identifier("tenant_id")}, {pk})
-            DO UPDATE SET {update_assignments_sql}
-        """
+        max_rows_per_statement = max(1, self._POSTGRES_MAX_BIND_PARAMETERS // len(raw_columns))
 
         cursor = warehouse_conn.cursor()
-        cursor.execute(upsert_query, values)
+        for offset in range(0, len(rows), max_rows_per_statement):
+            chunk = rows[offset : offset + max_rows_per_statement]
+
+            placeholders = []
+            values = []
+            for row in chunk:
+                row_values = (self.config.tenant_id, *row)
+                ph = "(" + ", ".join("%s" for _ in row_values) + ")"
+                placeholders.append(ph)
+                values.extend(row_values)
+
+            values_sql = ", ".join(placeholders)
+
+            upsert_query = f"""
+                INSERT INTO raw.{raw_table} ({insert_columns_sql})
+                VALUES {values_sql}
+                ON CONFLICT ({_quote_identifier("tenant_id")}, {pk})
+                DO UPDATE SET {update_assignments_sql}
+            """
+
+            cursor.execute(upsert_query, values)

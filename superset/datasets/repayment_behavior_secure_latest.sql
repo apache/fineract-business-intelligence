@@ -13,23 +13,26 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-{% set username = current_username() or 'admin' %}
+{% set username = (current_username() or '') | replace("'", "''") %}
 select *
 from analytics.mart_repayment_behavior
 where reporting_date = (
     select max(reporting_date) from analytics.mart_repayment_behavior
 )
 and (
-    exists (
-        select 1
-        from meta.user_office_mapping uom
-        where uom.username = '{{ username }}'
-          and uom.role_name = 'ADMIN'
-    )
-    or office_id in (
-        select office_id
-        from meta.user_office_mapping
-        where username = '{{ username }}'
-          and office_id is not null
+    '{{ username }}' != ''
+    and (
+        exists (
+            select 1
+            from meta.user_office_mapping uom
+            where uom.username = '{{ username }}'
+              and uom.role_name = 'ADMIN'
+        )
+        or office_id in (
+            select office_id
+            from meta.user_office_mapping
+            where username = '{{ username }}'
+              and office_id is not null
+        )
     )
 )

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import ssl
 from dataclasses import dataclass
 
 
@@ -34,16 +35,20 @@ class DatabaseConfig:
     user: str
     password: str
     schema: str | None = None
+    ssl_mode: str = "disable"
 
     @property
     def connect_kwargs(self) -> dict:
-        return {
+        kwargs = {
             "host": self.host,
             "port": self.port,
             "database": self.dbname,
             "user": self.user,
             "password": self.password,
         }
+        if self.ssl_mode == "require":
+            kwargs["ssl_context"] = ssl.create_default_context()
+        return kwargs
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,7 @@ class AppConfig:
     tenant_id: str
     replica_lag_threshold_seconds: int
     cob_lookback_hours: int
+    cob_job_name: str
     extract_batch_size: int
     extract_lookback_seconds: int
 
@@ -66,6 +72,7 @@ class AppConfig:
                 user=require_env("SOURCE_DB_USER"),
                 password=require_env("SOURCE_DB_PASSWORD"),
                 schema=os.getenv("SOURCE_DB_SCHEMA", "bi_connector_source"),
+                ssl_mode=os.getenv("SOURCE_DB_SSL_MODE", "disable"),
             ),
             warehouse=DatabaseConfig(
                 host=os.getenv("WAREHOUSE_DB_HOST", "localhost"),
@@ -74,10 +81,12 @@ class AppConfig:
                 user=require_env("WAREHOUSE_DB_USER"),
                 password=require_env("WAREHOUSE_DB_PASSWORD"),
                 schema=os.getenv("WAREHOUSE_DB_SCHEMA", "raw"),
+                ssl_mode=os.getenv("WAREHOUSE_DB_SSL_MODE", "disable"),
             ),
             tenant_id=os.getenv("TENANT_ID", "default"),
             replica_lag_threshold_seconds=int(os.getenv("REPLICA_LAG_THRESHOLD_SECONDS", "300")),
             cob_lookback_hours=int(os.getenv("COB_LOOKBACK_HOURS", "48")),
+            cob_job_name=os.getenv("COB_JOB_NAME", "LOAN_COB"),
             extract_batch_size=int(os.getenv("EXTRACT_BATCH_SIZE", "1000")),
             extract_lookback_seconds=int(os.getenv("EXTRACT_LOOKBACK_SECONDS", "600")),
         )

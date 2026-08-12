@@ -16,9 +16,9 @@
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
+import jinja2
 import pg8000.native
 import pytest
 
@@ -38,10 +38,11 @@ DATASET_FILES_WITH_GUARANTEED_MULTI_OFFICE_DATA = [
 ]
 
 
-def _render(dataset_file: str, username: str) -> str:
-    text = (DATASET_DIR / dataset_file).read_text(encoding="utf-8")
-    text = re.sub(r"\{%\s*set\s+username\s*=.*?%\}\n?", "", text)
-    return text.replace("{{ username }}", username)
+def _render(dataset_file: str, username: str | None) -> str:
+    template_source = (DATASET_DIR / dataset_file).read_text(encoding="utf-8")
+    env = jinja2.Environment()
+    env.globals["current_username"] = lambda: username
+    return env.from_string(template_source).render()
 
 
 def _connect():
@@ -65,7 +66,7 @@ def _office_ids(rows: list[list], office_id_index: int) -> set:
     return {row[office_id_index] for row in rows}
 
 
-def _run(conn, dataset_file: str, username: str) -> tuple[list[str], list[list]]:
+def _run(conn, dataset_file: str, username: str | None) -> tuple[list[str], list[list]]:
     sql = _render(dataset_file, username)
     rows = conn.run(sql)
     columns = [col["name"] for col in conn.columns]
@@ -116,5 +117,28 @@ def test_north_and_south_results_are_disjoint(conn, dataset_file):
 @pytest.mark.parametrize("dataset_file", DATASET_FILES)
 def test_unknown_username_gets_zero_rows(conn, dataset_file):
     _, rows = _run(conn, dataset_file, "nonexistent_user_xyz")
+
+    assert len(rows) == 0
+
+
+@pytest.mark.parametrize("dataset_file", DATASET_FILES)
+def test_empty_current_username_fails_closed_not_open_to_admin(conn, dataset_file):
+    _, rows = _run(conn, dataset_file, "")
+
+    assert len(rows) == 0
+
+
+@pytest.mark.parametrize("dataset_file", DATASET_FILES)
+def test_none_current_username_fails_closed_not_open_to_admin(conn, dataset_file):
+    _, rows = _run(conn, dataset_file, None)
+
+    assert len(rows) == 0
+
+
+@pytest.mark.parametrize("dataset_file", DATASET_FILES)
+def test_username_with_embedded_quote_does_not_break_out_of_the_predicate(conn, dataset_file):
+    malicious_username = "x' OR '1'='1"
+
+    _, rows = _run(conn, dataset_file, malicious_username)
 
     assert len(rows) == 0

@@ -115,3 +115,9 @@ def test_all_tables_required_by_the_marts_are_extracted():
 def test_table_specs_are_immutable():
     with pytest.raises(dataclasses.FrozenInstanceError):
         TABLE_SPECS[0].source_table = "hacked"
+
+
+def test_batch_job_execution_extracts_job_name_for_cob_gate_scoping():
+    spec = next(s for s in TABLE_SPECS if s.source_table == "batch_job_execution")
+
+    assert "job_name" in spec.columns

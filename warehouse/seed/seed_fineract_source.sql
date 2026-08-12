@@ -259,14 +259,9 @@ FROM (VALUES
 (144, 36, 101, 1, 10000, '2026-06-10',  0, 12, 0.18)
 ) AS t(loan_id, client_id, office_id, product_id, principal, disburse_date, overdue_days, term_months, annual_rate);
 
-ALTER TABLE tmp_loan ADD COLUMN vintage_months       int;
-ALTER TABLE tmp_loan ADD COLUMN mature_date           date;
-ALTER TABLE tmp_loan ADD COLUMN principal_repaid      numeric(19,6);
-ALTER TABLE tmp_loan ADD COLUMN principal_outstanding numeric(19,6);
-ALTER TABLE tmp_loan ADD COLUMN interest_charged      numeric(19,6);
-ALTER TABLE tmp_loan ADD COLUMN interest_repaid       numeric(19,6);
-ALTER TABLE tmp_loan ADD COLUMN interest_outstanding  numeric(19,6);
-ALTER TABLE tmp_loan ADD COLUMN total_outstanding     numeric(19,6);
+ALTER TABLE tmp_loan ADD COLUMN vintage_months  int;
+ALTER TABLE tmp_loan ADD COLUMN mature_date      date;
+ALTER TABLE tmp_loan ADD COLUMN interest_charged numeric(19,6);
 
 UPDATE tmp_loan SET
     vintage_months = GREATEST(
@@ -279,123 +274,45 @@ UPDATE tmp_loan SET
 UPDATE tmp_loan SET
     interest_charged = ROUND(principal_amount * annual_rate, 6);
 
-UPDATE tmp_loan SET
-    principal_repaid = CASE
-        WHEN overdue_days = 0
-            THEN ROUND(principal_amount * LEAST(vintage_months::numeric / term_months, 1.0) * 0.90, 6)
-        ELSE
-            ROUND(principal_amount * LEAST(vintage_months::numeric / term_months, 1.0) * 0.35, 6)
-    END,
-    interest_repaid = CASE
-        WHEN overdue_days = 0
-            THEN ROUND(interest_charged * LEAST(vintage_months::numeric / term_months, 1.0) * 0.90, 6)
-        ELSE
-            ROUND(interest_charged * LEAST(vintage_months::numeric / term_months, 1.0) * 0.35, 6)
-    END;
+CREATE TEMP TABLE tmp_loan_transaction (
+    loan_id bigint,
+    office_id bigint,
+    is_reversed boolean,
+    transaction_type_enum smallint,
+    transaction_date date,
+    amount numeric(19,6),
+    principal_portion_derived numeric(19,6),
+    interest_portion_derived numeric(19,6),
+    fee_charges_portion_derived numeric(19,6),
+    penalty_charges_portion_derived numeric(19,6),
+    overpayment_portion_derived numeric(19,6),
+    outstanding_loan_balance_derived numeric(19,6),
+    submitted_on_date date
+) ON COMMIT DROP;
 
-UPDATE tmp_loan SET
-    principal_outstanding = ROUND(principal_amount - principal_repaid, 6),
-    interest_outstanding = ROUND(interest_charged - interest_repaid, 6);
-
-UPDATE tmp_loan SET total_outstanding = principal_outstanding + interest_outstanding;
-
-INSERT INTO public.m_loan (
-    id, account_no, client_id, product_id,
-    loan_status_id, loan_type_enum,
-    currency_code, currency_digits, currency_multiplesof,
-    principal_amount_proposed, principal_amount,
-    approved_principal, net_disbursal_amount,
-    annual_nominal_interest_rate, nominal_interest_rate_per_period,
-    interest_method_enum, interest_calculated_in_period_enum,
-    term_frequency, term_period_frequency_enum,
-    repay_every, repayment_period_frequency_enum, number_of_repayments,
-    amortization_method_enum,
-    submittedon_date, approvedon_date,
-    expected_disbursedon_date, disbursedon_date,
-    expected_firstrepaymenton_date, expected_maturedon_date,
-    principal_disbursed_derived, principal_repaid_derived,
-    principal_writtenoff_derived, principal_outstanding_derived,
-    interest_charged_derived, interest_repaid_derived,
-    interest_waived_derived, interest_writtenoff_derived,
-    interest_outstanding_derived,
-    fee_charges_charged_derived, fee_charges_repaid_derived,
-    fee_charges_waived_derived, fee_charges_writtenoff_derived,
-    fee_charges_outstanding_derived,
-    penalty_charges_charged_derived, penalty_charges_repaid_derived,
-    penalty_charges_waived_derived, penalty_charges_writtenoff_derived,
-    penalty_charges_outstanding_derived,
-    total_expected_repayment_derived, total_repayment_derived,
-    total_expected_costofloan_derived, total_costofloan_derived,
-    total_waived_derived, total_writtenoff_derived, total_outstanding_derived,
-    loan_counter, is_npa,
-    loan_transaction_strategy_code, loan_transaction_strategy_name,
-    loan_schedule_type, loan_schedule_processing_type,
-    created_on_utc, created_by, last_modified_by, last_modified_on_utc
-)
-SELECT
-    l.loan_id,
-    'LN' || LPAD(l.loan_id::text, 7, '0'),
-    l.client_id, l.product_id,
-    300, 1,
-    'USD', 2, 0,
-    l.principal_amount, l.principal_amount,
-    l.principal_amount, l.principal_amount,
-    ROUND(l.annual_rate * 100, 4),
-    ROUND(l.annual_rate * 100 / 12, 4),
-    0, 1,
-    l.term_months, 2,
-    1, 2, l.term_months,
-    1,
-    l.disburse_date - 5, l.disburse_date - 3,
-    l.disburse_date,     l.disburse_date,
-    l.disburse_date + 30, l.mature_date,
-    l.principal_amount,
-    l.principal_repaid,
-    0,
-    l.principal_outstanding,
-    l.interest_charged,
-    l.interest_repaid,
-    0, 0,
-    l.interest_outstanding,
-    0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0,
-    ROUND(l.principal_amount + l.interest_charged, 6),
-    ROUND(l.principal_repaid + l.interest_repaid, 6),
-    ROUND(l.interest_charged, 6),
-    ROUND(l.interest_repaid, 6),
-    0, 0,
-    l.total_outstanding,
-    1,
-    l.overdue_days >= 90,
-    'mifos-standard-strategy',
-    'Penalties, Fees, Interest, Principal order',
-    'CUMULATIVE', 'HORIZONTAL',
-    NOW(), 1, 1, NOW()
-FROM tmp_loan l;
-
-INSERT INTO public.m_loan_transaction (
+INSERT INTO tmp_loan_transaction (
     loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount,
     principal_portion_derived, interest_portion_derived,
     fee_charges_portion_derived, penalty_charges_portion_derived,
     overpayment_portion_derived,
     outstanding_loan_balance_derived,
-    submitted_on_date, created_on_utc, created_by, last_modified_by, last_modified_on_utc
+    submitted_on_date
 )
 SELECT
     l.loan_id, l.office_id, FALSE,
     1, l.disburse_date, l.principal_amount,
     l.principal_amount, 0, 0, 0, 0,
     l.principal_amount,
-    l.disburse_date, NOW(), 1, 1, NOW()
+    l.disburse_date
 FROM tmp_loan l;
 
-INSERT INTO public.m_loan_transaction (
+INSERT INTO tmp_loan_transaction (
     loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount,
     principal_portion_derived, interest_portion_derived,
     fee_charges_portion_derived, penalty_charges_portion_derived,
     overpayment_portion_derived,
     outstanding_loan_balance_derived,
-    submitted_on_date, created_on_utc, created_by, last_modified_by, last_modified_on_utc
+    submitted_on_date
 )
 SELECT
     l.loan_id, l.office_id, FALSE,
@@ -459,8 +376,7 @@ SELECT
     END,
     0, 0,
     GREATEST(l.principal_amount - ROUND(l.principal_amount / l.term_months, 6) * m.mn, 0),
-    l.disburse_date + (m.mn * 30),
-    NOW(), 1, 1, NOW()
+    l.disburse_date + (m.mn * 30)
 FROM tmp_loan l
 CROSS JOIN generate_series(1,
     CASE
@@ -473,6 +389,131 @@ CROSS JOIN generate_series(1,
 CROSS JOIN (SELECT 1 AS split_part UNION SELECT 2) AS sp
 WHERE (l.disburse_date + (m.mn * 30) <= current_date)
   AND (l.loan_id % 5 = 0 OR sp.split_part = 1);
+
+INSERT INTO tmp_loan_transaction (
+    loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount,
+    principal_portion_derived, interest_portion_derived,
+    fee_charges_portion_derived, penalty_charges_portion_derived,
+    overpayment_portion_derived,
+    outstanding_loan_balance_derived,
+    submitted_on_date
+)
+SELECT
+    l.loan_id, l.office_id, FALSE,
+    8,
+    current_date - l.overdue_days + 30,
+    ROUND(l.principal_amount * 0.20, 6),
+    ROUND(l.principal_amount * 0.20, 6),
+    0, 0, 0,
+    0,
+    GREATEST(l.principal_amount - ROUND(l.principal_amount * 0.20, 6), 0),
+    current_date - l.overdue_days + 30
+FROM tmp_loan l
+WHERE l.overdue_days >= 45;
+
+INSERT INTO public.m_loan (
+    id, account_no, client_id, product_id,
+    loan_status_id, loan_type_enum,
+    currency_code, currency_digits, currency_multiplesof,
+    principal_amount_proposed, principal_amount,
+    approved_principal, net_disbursal_amount,
+    annual_nominal_interest_rate, nominal_interest_rate_per_period,
+    interest_method_enum, interest_calculated_in_period_enum,
+    term_frequency, term_period_frequency_enum,
+    repay_every, repayment_period_frequency_enum, number_of_repayments,
+    amortization_method_enum,
+    submittedon_date, approvedon_date,
+    expected_disbursedon_date, disbursedon_date,
+    expected_firstrepaymenton_date, expected_maturedon_date,
+    principal_disbursed_derived, principal_repaid_derived,
+    principal_writtenoff_derived, principal_outstanding_derived,
+    interest_charged_derived, interest_repaid_derived,
+    interest_waived_derived, interest_writtenoff_derived,
+    interest_outstanding_derived,
+    fee_charges_charged_derived, fee_charges_repaid_derived,
+    fee_charges_waived_derived, fee_charges_writtenoff_derived,
+    fee_charges_outstanding_derived,
+    penalty_charges_charged_derived, penalty_charges_repaid_derived,
+    penalty_charges_waived_derived, penalty_charges_writtenoff_derived,
+    penalty_charges_outstanding_derived,
+    total_expected_repayment_derived, total_repayment_derived,
+    total_expected_costofloan_derived, total_costofloan_derived,
+    total_waived_derived, total_writtenoff_derived, total_outstanding_derived,
+    loan_counter, is_npa,
+    loan_transaction_strategy_code, loan_transaction_strategy_name,
+    loan_schedule_type, loan_schedule_processing_type,
+    created_on_utc, created_by, last_modified_by, last_modified_on_utc
+)
+SELECT
+    l.loan_id,
+    'LN' || LPAD(l.loan_id::text, 7, '0'),
+    l.client_id, l.product_id,
+    300, 1,
+    'USD', 2, 0,
+    l.principal_amount, l.principal_amount,
+    l.principal_amount, l.principal_amount,
+    ROUND(l.annual_rate * 100, 4),
+    ROUND(l.annual_rate * 100 / 12, 4),
+    0, 1,
+    l.term_months, 2,
+    1, 2, l.term_months,
+    1,
+    l.disburse_date - 5, l.disburse_date - 3,
+    l.disburse_date,     l.disburse_date,
+    l.disburse_date + 30, l.mature_date,
+    l.principal_amount,
+    l.principal_amount - lb.outstanding_loan_balance_derived,
+    0,
+    lb.outstanding_loan_balance_derived,
+    l.interest_charged,
+    COALESCE(it.interest_repaid, 0),
+    0, 0,
+    GREATEST(l.interest_charged - COALESCE(it.interest_repaid, 0), 0),
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    ROUND(l.principal_amount + l.interest_charged, 6),
+    ROUND((l.principal_amount - lb.outstanding_loan_balance_derived) + COALESCE(it.interest_repaid, 0), 6),
+    ROUND(l.interest_charged, 6),
+    ROUND(COALESCE(it.interest_repaid, 0), 6),
+    0, 0,
+    lb.outstanding_loan_balance_derived
+        + GREATEST(l.interest_charged - COALESCE(it.interest_repaid, 0), 0),
+    1,
+    l.overdue_days >= 90,
+    'mifos-standard-strategy',
+    'Penalties, Fees, Interest, Principal order',
+    'CUMULATIVE', 'HORIZONTAL',
+    NOW(), 1, 1, NOW()
+FROM tmp_loan l
+INNER JOIN (
+    SELECT DISTINCT ON (loan_id)
+        loan_id, outstanding_loan_balance_derived
+    FROM tmp_loan_transaction
+    ORDER BY loan_id, transaction_date DESC
+) AS lb ON lb.loan_id = l.loan_id
+LEFT JOIN (
+    SELECT loan_id, SUM(interest_portion_derived) AS interest_repaid
+    FROM tmp_loan_transaction
+    WHERE transaction_type_enum IN (2, 8)
+    GROUP BY loan_id
+) AS it ON it.loan_id = l.loan_id;
+
+INSERT INTO public.m_loan_transaction (
+    loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount,
+    principal_portion_derived, interest_portion_derived,
+    fee_charges_portion_derived, penalty_charges_portion_derived,
+    overpayment_portion_derived,
+    outstanding_loan_balance_derived,
+    submitted_on_date, created_on_utc, created_by, last_modified_by, last_modified_on_utc
+)
+SELECT
+    t.loan_id, t.office_id, t.is_reversed, t.transaction_type_enum, t.transaction_date, t.amount,
+    t.principal_portion_derived, t.interest_portion_derived,
+    t.fee_charges_portion_derived, t.penalty_charges_portion_derived,
+    t.overpayment_portion_derived,
+    t.outstanding_loan_balance_derived,
+    t.submitted_on_date, NOW(), 1, 1, NOW()
+FROM tmp_loan_transaction t;
 
 INSERT INTO public.m_loan_repayment_schedule (
     loan_id, fromdate, duedate, installment,
@@ -585,28 +626,6 @@ SELECT
     NOW()
 FROM tmp_loan l
 CROSS JOIN generate_series(1, l.term_months) AS m(mn);
-
-INSERT INTO public.m_loan_transaction (
-    loan_id, office_id, is_reversed, transaction_type_enum, transaction_date, amount,
-    principal_portion_derived, interest_portion_derived,
-    fee_charges_portion_derived, penalty_charges_portion_derived,
-    overpayment_portion_derived,
-    outstanding_loan_balance_derived,
-    submitted_on_date, created_on_utc, created_by, last_modified_by, last_modified_on_utc
-)
-SELECT
-    l.loan_id, l.office_id, FALSE,
-    8,
-    current_date - l.overdue_days + 30,
-    ROUND(l.principal_amount * 0.20, 6),
-    ROUND(l.principal_amount * 0.20, 6),
-    0, 0, 0,
-    0,
-    GREATEST(l.principal_amount - ROUND(l.principal_amount * 0.20, 6), 0),
-    current_date - l.overdue_days + 30,
-    NOW(), 1, 1, NOW()
-FROM tmp_loan l
-WHERE l.overdue_days >= 45;
 
 INSERT INTO public.m_loan_delinquency_tag_history (
     delinquency_range_id, loan_id, addedon_date, liftedon_date,
