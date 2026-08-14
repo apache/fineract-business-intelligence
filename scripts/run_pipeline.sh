@@ -22,10 +22,14 @@ source "${SCRIPT_DIR}/common.sh"
 ensure_docker_prerequisites
 load_environment
 
-PIPELINE_MODE="${PIPELINE_MODE:-${1:-incremental}}"
+DEFAULT_PIPELINE_MODE="${PIPELINE_MODE_DEFAULT:-incremental}"
+if [[ "${PIPELINE_MODE:-}" != "--loop" && -n "${PIPELINE_MODE:-}" ]]; then
+    DEFAULT_PIPELINE_MODE="${PIPELINE_MODE}"
+fi
+PIPELINE_MODE="${1:-${PIPELINE_MODE:-${DEFAULT_PIPELINE_MODE}}}"
 LOOP_MODE="false"
 if [[ "${PIPELINE_MODE}" == "--loop" ]]; then
-    PIPELINE_MODE="${PIPELINE_MODE_ENV:-${PIPELINE_MODE_DEFAULT:-incremental}}"
+    PIPELINE_MODE="${PIPELINE_MODE_ENV:-${DEFAULT_PIPELINE_MODE}}"
     LOOP_MODE="true"
 fi
 
@@ -34,6 +38,10 @@ DBT_FULL_REFRESH="${DBT_FULL_REFRESH:-false}"
 
 log()  { echo "[pipeline] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"; }
 fail() { echo "[pipeline] ERROR: $*" >&2; exit 1; }
+
+PIPELINE_LOCK_FILE="${PIPELINE_LOCK_FILE:-/tmp/fineract-bi-pipeline.lock}"
+exec 9>"${PIPELINE_LOCK_FILE}"
+flock -n 9 || fail "Another pipeline run is already active."
 
 run_once() {
     local mode="$1"
@@ -48,6 +56,11 @@ run_once() {
         fail "Extractor failed. dbt and Superset refresh skipped."
     fi
     log "Step 1/3 — Extractor OK"
+
+    log "Ensuring dbt package dependencies are available"
+    if ! docker compose -f "${COMPOSE_FILE}" exec -T dbt dbt deps; then
+        fail "dbt dependencies could not be installed. dbt build skipped."
+    fi
 
     local dbt_args=(dbt build)
     if [[ "${DBT_FULL_REFRESH}" == "true" || "${mode}" == "backfill" ]]; then

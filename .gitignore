@@ -18,6 +18,7 @@ docker/superset/__pycache__/
 .env
 .env.local
 .runtime/
+.venv/
 *.pyc
 __pycache__/
 bom.json

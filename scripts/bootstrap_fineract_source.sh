@@ -89,6 +89,7 @@ create_source_compatibility_views() {
   local sql_file="${RUNTIME_DIR}/create_views.sql"
 
   cat > "${sql_file}" <<EOF
+BEGIN;
 CREATE SCHEMA IF NOT EXISTS ${SOURCE_DB_SCHEMA};
 
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.m_office AS
@@ -148,16 +149,20 @@ SELECT id, loan_id, fromdate, duedate, installment,
     last_modified_on_utc AS lastmodified_date
 FROM public.m_loan_repayment_schedule;
 
+-- CREATE OR REPLACE VIEW cannot rename or reorder an existing view's
+-- columns, so replace this compatibility view transactionally.
+DROP VIEW IF EXISTS ${SOURCE_DB_SCHEMA}.batch_job_execution;
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
 SELECT bje.job_execution_id, bji.job_name, bje.status, bje.start_time AT TIME ZONE 'UTC' AS start_time, bje.end_time AT TIME ZONE 'UTC' AS end_time, bje.exit_code, bje.exit_message, bje.create_time AT TIME ZONE 'UTC' AS created_on_utc, bje.last_updated AT TIME ZONE 'UTC' AS last_modified_on_utc
 FROM public.batch_job_execution bje
 INNER JOIN public.batch_job_instance bji ON bje.job_instance_id = bji.job_instance_id;
+COMMIT;
 EOF
 
   docker compose -f "${COMPOSE_FILE}" cp "${sql_file}" fineract-db:/tmp/create_views.sql
   docker compose -f "${COMPOSE_FILE}" exec -T fineract-db \
     env PGPASSWORD="${SOURCE_BOOTSTRAP_PASSWORD}" \
-    psql -h localhost -U "${SOURCE_BOOTSTRAP_USER}" -d "${SOURCE_DB_NAME}" -f /tmp/create_views.sql >/dev/null
+    psql -v ON_ERROR_STOP=1 -h localhost -U "${SOURCE_BOOTSTRAP_USER}" -d "${SOURCE_DB_NAME}" -f /tmp/create_views.sql >/dev/null
 }
 
 grant_reader_access() {
