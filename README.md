@@ -60,8 +60,59 @@ This project reads data from an Apache Fineract PostgreSQL database, transforms 
 
 ## Architecture Overview
 
-![Architecture overview diagram showing Fineract, the extractor, the analytics warehouse, and Superset](docs/images/readme_architecture.png)
+```
+Apache Fineract PostgreSQL                                       SOURCE
 
+┌──────────────────────┐   ┌────────────────────────┐
+│ fineract_default     │   │ bi_connector_source    │
+│ (schema: public)     │   │ (read-only views)      │
+│ Operational database │   │ Read-only views for BI │
+└──────────────────────┘   └────────────────────────┘
+
+                          │
+               Read-only access (fineract_reader)
+                          │
+                          ▼
+
+Extractor (Python)                                              EXTRACTION
+
+┌────────────────────────────┐   ┌───────────────────────┐
+│ Python (watermark-based)   │   │ Incremental delta     │
+│ change data capture (CDC)  │   │ loads per table       │
+│ using per-table watermarks │   │ Only new/changed rows │
+└────────────────────────────┘   └───────────────────────┘
+
+                          │
+                          ▼
+
+Analytics Warehouse (PostgreSQL 16)                WAREHOUSE & TRANSFORMATION
+
+  raw ──▶ staging ──▶ intermediate ──▶ analytics (dims, facts, marts)
+                   via dbt — Transformation Engine
+
+                          │
+               Read-only access (analytics_reader)
+                          │
+                          ▼
+
+Apache Superset :8088                                 BI & VISUALIZATION
+
+┌───────────────────────────┐   ┌───────────────────────┐
+│ Row-level security via    │   │ Virtual datasets      │
+│ Jinja2 templates          │   │ Secure semantic layer │
+│ Enforces access by office │   │ for dashboards        │
+└───────────────────────────┘   └───────────────────────┘
+
+   meta.user_office_mapping controls per-user office scope and visibility
+
+                          │
+                          ▼
+
+                       USERS
+        Per-office scoped access to dashboards and reports
+```
+
+Governance and access, enforced at every layer above: least-privilege database users, row-level security, audit and monitoring, scheduled extracts, and data quality/lineage tracking.
 
 > For full pipeline flow, watermark extraction diagrams, warehouse schema breakdown, and security model detail, see **[docs/architecture.md](docs/architecture.md)**.
 

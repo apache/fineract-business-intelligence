@@ -31,14 +31,165 @@ Apache Fineract Business Intelligence is an **independent, downstream analytics 
 
 `bootstrap_source.sh` connects to the source container via `docker exec` and grants the `fineract_reader` role `SELECT` on both the `public` schema and the `bi_connector_source` compatibility schema.
 
-![Architecture overview diagram showing Fineract, the extractor, the analytics warehouse, and Superset](images/system_topology.png)
+```
+Apache Fineract — PostgreSQL: fineract_default
+┌───────────────────────────────┐   ┌─────────────────────────────┐
+│ schema: public                │   │ schema: bi_connector_source │
+│ (Fineract operational tables) │   │ (read-only views — added by │
+│                               │   │  bootstrap_source.sh)       │
+└───────────────────────────────┘   └─────────────────────────────┘
+
+                     TCP — role: fineract_reader (SELECT only)
+                                    │
+                                    ▼
+
+① STEP 1 — EXTRACT & LOAD — Extractor (Python)
+┌────────────────────────────────────────────────────────────────┐
+│ Container: fineract-bi-extractor (Python 3.11)                 │
+│                                                                │
+│ • Watermark-based polling, per-table cursor in meta.watermarks │
+│ • Incremental + backfill modes                                 │
+│ • Replica lag check before each extraction run                 │
+│                                                                │
+│ ACTION: queries bi_connector_source views, loads raw rows      │
+│ into the warehouse raw schema                                  │
+└────────────────────────────────────────────────────────────────┘
+                    │
+     LOAD (INSERT / ON CONFLICT UPDATE)
+                    │
+                    ▼
+
+② STEP 2 — TRANSFORM — dbt (ELT inside the Warehouse)
+┌──────────────────────────────────────────────────────────┐
+│ Container: fineract-bi-dbt (dbt-postgres <2.0)           │
+│ (long-running, exec target)                              │
+│                                                          │
+│ raw ──▶ staging ──▶ intermediate ──▶ analytics           │
+│ (land)  (cleaned,   (joins/pivots)   (dims/facts/marts)  │
+│          type cast)                                      │
+│                                                          │
+│ ACTION: dbt builds and materializes models across schema │
+│ layers inside the Analytics Warehouse                    │
+└──────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+
+Analytics Warehouse (PostgreSQL 16-alpine)
+Container: fineract-bi-warehouse · Port: 5434
+┌────────┬──────────┬──────────────┬───────────┬───────────────────┐
+│ raw    │ staging  │ intermediate │ analytics │ meta              │
+├────────┼──────────┼──────────────┼───────────┼───────────────────┤
+│ (land) │ (cleaned │ (joins /     │ (dims,    │ (watermarks,      │
+│        │  views)  │  pivots)     │  facts,   │  pipeline_state,  │
+│        │          │              │  marts)   │  user_office_map) │
+└────────┴──────────┴──────────────┴───────────┴───────────────────┘
+                    │
+       TCP — role: analytics_reader (SELECT only)
+                    │
+                    ▼
+
+③ STEP 3 — VISUALIZE — Apache Superset
+┌─────────────────────────────────────────────────────────────┐
+│ Container: fineract-bi-superset (Superset 4.x) · Port: 8088 │
+│                                                             │
+│ • Virtual datasets with Jinja2 RLS templates                │
+│ • Reads office scope from meta.user_office_mapping          │
+│                                                             │
+│ ACTION: connects using analytics_reader, queries the        │
+│ pre-aggregated analytics schema to render dashboards        │
+└─────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+                 USERS
+   Per-office scoped access to dashboards and reports
+
+Access control matrix
+┌───────────────────────┬────────────────────┬─────────────┬────────────────────────────┐
+│ Component             │ Role / Connection  │ Access Type │ Purpose                    │
+├───────────────────────┼────────────────────┼─────────────┼────────────────────────────┤
+│ fineract-bi-extractor │ fineract_reader    │ SELECT only │ Read views from Fineract   │
+│ fineract-bi-dbt       │ local to warehouse │ DML / DDL   │ Transform inside warehouse │
+│ fineract-bi-superset  │ analytics_reader   │ SELECT only │ Query analytics schema     │
+└───────────────────────┴────────────────────┴─────────────┴────────────────────────────┘
+```
+
 ---
 
 ## 2. Pipeline Execution Loop
 
 The extractor container runs `scripts/run_pipeline.sh` in a loop. The shell script coordinates all three stages and enforces strict ordering. At the start of the dbt stage it runs `dbt deps`, so the declared packages are present even on a fresh checkout.
 
-![Pipeline execution loop diagram showing Fineract, the extractor, the analytics warehouse, and Superset](images/pipeline_execution_loop.png)
+```
+Container Start
+All containers start: fineract-bi-extractor, fineract-bi-dbt,
+fineract-bi-superset, fineract-bi-warehouse
+       │
+       ▼
+sleep 30s — wait for Superset to finish initialising
+       │
+       ▼
+run_pipeline.sh backfill — kick off initial backfill pipeline
+       │
+       ▼
+══════════════════ INITIAL BACKFILL RUN (ONE-TIME) ═══════════════════
+
+  1/3  Extractor (backfill)
+       $ python -m extractor.cli backfill
+       Upserts all rows from bi_connector_source into raw.*
+       ✗ If this fails → ABORT (dbt and Superset are skipped)
+         │
+         ▼
+  2/3  dbt deps, then dbt build --full-refresh
+       Installs declared packages, then rebuilds all models
+       ✗ If this fails → ABORT (Superset refresh is skipped)
+         │
+         ▼
+  3/3  Superset refresh
+       $ refresh_superset_assets.sh
+       Updates dataset schemas and chart metadata
+       ⚠ Non-fatal — failure is logged but pipeline continues
+
+════════════════════════════════════════════════════════════════════
+       │
+       ▼
+loop every PIPELINE_INTERVAL_SECONDS (default: 3600)
+       │
+       ▼
+═════════════════ RECURRING PIPELINE (EVERY INTERVAL) ════════════════
+
+  1/3  Extractor (incremental)
+       $ python -m extractor.cli incremental
+       Fetches only rows changed since the last watermark
+         │
+         ▼
+  2/3  dbt deps, then dbt build (no --full-refresh)
+       Installs declared packages, builds models incrementally
+         │
+         ▼
+  3/3  Superset refresh
+       Updates dataset schemas and chart metadata
+       ⚠ Non-fatal — failure is logged but pipeline continues
+
+════════════════════════════════════════════════════════════════════
+       │
+       ▼
+Pipeline continues... next run after PIPELINE_INTERVAL_SECONDS  ──┐
+       ▲                                                          │
+       └──────────────────────── loop ───────────────────────────┘
+
+Notes:
+ • Backfill run happens once at startup after a 30s delay.
+ • If Extractor fails → pipeline aborts (no dbt or Superset).
+ • If dbt fails → pipeline aborts (no Superset refresh).
+ • Superset refresh failures are logged but ignored.
+ • Thereafter, the pipeline loops every PIPELINE_INTERVAL_SECONDS.
+
+Components: Extractor (Python 3.11) · dbt (dbt-postgres <2.0) ·
+Superset (Apache Superset 4.x) · Analytics Warehouse (PostgreSQL 16)
+
+Warehouse schema flow: raw (landing) → staging (cleaned views) →
+intermediate (joins/pivots) → analytics (dims/facts/marts) → meta (metadata)
+```
 
 The pipeline log prefix is `[pipeline]` with a UTC timestamp:
 
