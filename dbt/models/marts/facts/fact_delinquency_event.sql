@@ -22,6 +22,7 @@
 
 with ordered_events as (
     select
+        source_id,
         tenant_id,
         delinquency_event_id,
         loan_id,
@@ -34,19 +35,20 @@ with ordered_events as (
         addedon_date as event_start_date,
         liftedon_date as event_end_date,
         lag(bucket_id) over (
-            partition by tenant_id, loan_id
+            partition by source_id, tenant_id, loan_id
             order by addedon_date, delinquency_event_id
         ) as previous_bucket_key,
         lag(min_age_days) over (
-            partition by tenant_id, loan_id
+            partition by source_id, tenant_id, loan_id
             order by addedon_date, delinquency_event_id
         ) as previous_min_age_days
     from {{ ref('stg_m_delinquency') }}
 )
 
 select
-    md5(tenant_id || '::' || delinquency_event_id::text)
+    md5(source_id || '::' || tenant_id || '::' || delinquency_event_id::text)
         as delinquency_event_key,
+    source_id,
     tenant_id,
     delinquency_event_id,
     loan_id,

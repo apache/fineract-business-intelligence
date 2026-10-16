@@ -1,0 +1,13 @@
+metric_name,label,definition,dbt_macro,unit,grain,owner,certified,version
+gross_loan_portfolio,Gross Loan Portfolio (GLP),Principal outstanding of active loans,metric_gross_loan_portfolio,currency,loan x day,risk-analytics,true,1
+par_30_amount,PAR 30 amount,"Principal outstanding of loans 30+ days past due (cumulative, CGAP)",metric_par_amount(30),currency,loan x day,risk-analytics,true,1
+par_60_amount,PAR 60 amount,Principal outstanding of loans 60+ days past due,metric_par_amount(60),currency,loan x day,risk-analytics,true,1
+par_90_amount,PAR 90 amount,Principal outstanding of loans 90+ days past due,metric_par_amount(90),currency,loan x day,risk-analytics,true,1
+par_30_ratio,PAR 30 ratio,PAR 30 amount / GLP; null when GLP is zero,"metric_ratio(par_30_amount, gross_loan_portfolio)",ratio,office x product x day,risk-analytics,true,1
+npa_amount,NPA amount,Principal outstanding of loans flagged non-performing by Fineract,metric_npa_amount,currency,loan x day,risk-analytics,true,1
+npa_ratio,NPA ratio,NPA amount / GLP,"metric_ratio(npa_amount, gross_loan_portfolio)",ratio,office x product x day,risk-analytics,true,1
+watch_list_amount,Watch-list amount,Principal outstanding of loans 1-29 days past due,metric_watch_list_amount,currency,loan x day,risk-analytics,true,1
+performing_amount,Performing amount,Principal outstanding of loans neither PAR 30 nor watch-list,metric_performing_amount,currency,loan x day,risk-analytics,true,1
+active_loan_count,Active loans,Distinct active loans,metric_active_loan_count,count,loan x day,risk-analytics,true,1
+active_borrower_count,Active borrowers,Distinct borrowers with an active loan,metric_active_borrower_count,count,loan x day,risk-analytics,true,1
+collection_efficiency_ratio,Collection efficiency,Collected / contractually due on the same date,metric_collection_efficiency,ratio,office x product x client x day,collections,true,1

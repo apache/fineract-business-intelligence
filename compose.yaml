@@ -15,10 +15,88 @@
 
 name: fineract-business-intelligence
 
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: fineract-bi-airflow:latest
+  profiles: ["airflow"]
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW_EXECUTOR:-LocalExecutor}
+    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW_PARALLELISM:-8}
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW_MAX_ACTIVE_TASKS_PER_DAG:-8}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USERNAME:-admin}:admin"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/passwords/simple_auth_manager_passwords.json
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-dev-only-change-me-airflow-jwt-secret}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_JWT_SECRET:-dev-only-change-me-airflow-jwt-secret}
+    AIRFLOW__API__WORKERS: ${AIRFLOW_API_WORKERS:-1}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${WAREHOUSE_ADMIN_USER}:${WAREHOUSE_ADMIN_PASSWORD}@warehouse:5432/airflow_metadata
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "60"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    WAREHOUSE_DB_HOST: warehouse
+    WAREHOUSE_DB_PORT: "5432"
+    WAREHOUSE_DB_NAME: ${WAREHOUSE_DB_NAME}
+    WAREHOUSE_DB_USER: ${WAREHOUSE_LOADER_USER}
+    WAREHOUSE_DB_PASSWORD: ${WAREHOUSE_LOADER_PASSWORD}
+    PGHOST: warehouse
+    PGPORT: "5432"
+    PGDATABASE: ${WAREHOUSE_DB_NAME}
+    PGUSER: ${WAREHOUSE_LOADER_USER}
+    PGPASSWORD: ${WAREHOUSE_LOADER_PASSWORD}
+    INGESTION_ENGINE_DEFAULT: ${INGESTION_ENGINE_DEFAULT:-PYTHON}
+    SOURCE_DB_HOST: ${SOURCE_DB_HOST:-host.docker.internal}
+    SOURCE_DB_PORT: ${SOURCE_DB_HOST_PORT:-5432}
+    SOURCE_DB_NAME: ${SOURCE_DB_NAME}
+    SOURCE_DB_USER: ${SOURCE_REPLICA_USER}
+    SOURCE_DB_PASSWORD: ${SOURCE_REPLICA_PASSWORD}
+    SOURCE_DB_SCHEMA: ${SOURCE_DB_SCHEMA:-bi_connector_source}
+    SOURCE_DB_SECRET_REF: ${SOURCE_DB_SECRET_REF:-env:SOURCE_DB_PASSWORD}
+    TENANT_ID: ${TENANT_ID:-default}
+    FINERACT_CDC_PASSWORD: ${FINERACT_CDC_PASSWORD:-}
+    COB_LOOKBACK_HOURS: ${COB_LOOKBACK_HOURS:-9999}
+    COB_GATE_ENABLED: ${COB_GATE_ENABLED:-true}
+    EXTRACT_PARALLELISM: ${EXTRACT_PARALLELISM:-4}
+    EXTRACT_PAGE_SIZE: ${EXTRACT_PAGE_SIZE:-5000}
+    FBI_CONNECT_CLUSTERS: ${FBI_CONNECT_CLUSTERS:-}
+    FBI_KAFKA_BOOTSTRAP: kafka:9092
+    FBI_RECONCILER_MAX_CREATES: ${FBI_RECONCILER_MAX_CREATES:-5}
+    FBI_RECONCILER_MAX_DELETES: ${FBI_RECONCILER_MAX_DELETES:-10}
+    FBI_DEBEZIUM_PUBLICATION_MODE: ${FBI_DEBEZIUM_PUBLICATION_MODE:-filtered}
+    FBI_SHARD_SIZE: ${FBI_SHARD_SIZE:-200}
+    FBI_MAX_SHARDS: ${FBI_MAX_SHARDS:-32}
+    FBI_PYTHON_INGESTION_CRON: ${FBI_PYTHON_INGESTION_CRON:-0 * * * *}
+    FBI_DBT_CRON: ${FBI_DBT_CRON:-*/15 * * * *}
+    FBI_FRESHNESS_SLO_SECONDS: ${FBI_FRESHNESS_SLO_SECONDS:-900}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - .:/opt/fbi
+    - airflow_auth:/opt/airflow/passwords
+  depends_on:
+    warehouse:
+      condition: service_healthy
+  networks:
+    - default
+    - fineract_network
+
 services:
   fineract-db:
     image: postgres:18.3
     container_name: fineract-bi-fineract-db
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=${SOURCE_MAX_REPLICATION_SLOTS:-32}
+      - -c
+      - max_wal_senders=${SOURCE_MAX_WAL_SENDERS:-32}
+      - -c
+      - max_slot_wal_keep_size=${SOURCE_MAX_SLOT_WAL_KEEP_SIZE:-2GB}
     environment:
       POSTGRES_DB: postgres
       POSTGRES_USER: ${SOURCE_BOOTSTRAP_USER:?SOURCE_BOOTSTRAP_USER must be set}
@@ -34,6 +112,7 @@ services:
     volumes:
       - fineract_db_data:/var/lib/postgresql
       - ./docker/fineract-postgresql/initdb:/docker-entrypoint-initdb.d:ro
+    mem_limit: ${SOURCE_DB_MEM_LIMIT:-768m}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${SOURCE_BOOTSTRAP_USER:?SOURCE_BOOTSTRAP_USER must be set} -d postgres"]
       interval: 10s
@@ -41,8 +120,36 @@ services:
       retries: 10
 
   warehouse:
-    image: postgres:16-alpine
+    image: postgres:18.3
     container_name: fineract-bi-warehouse
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${WAREHOUSE_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${WAREHOUSE_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=${WAREHOUSE_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${WAREHOUSE_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - max_connections=${WAREHOUSE_MAX_CONNECTIONS:-200}
+      - -c
+      - max_locks_per_transaction=${WAREHOUSE_MAX_LOCKS_PER_TRANSACTION:-256}
+      - -c
+      - max_wal_size=${WAREHOUSE_MAX_WAL_SIZE:-2GB}
+      - -c
+      - checkpoint_timeout=${WAREHOUSE_CHECKPOINT_TIMEOUT:-10min}
+      - -c
+      - wal_compression=on
+      - -c
+      - synchronous_commit=${WAREHOUSE_SYNCHRONOUS_COMMIT:-on}
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
+      - -c
+      - jit=off
     environment:
       POSTGRES_DB: ${WAREHOUSE_DB_NAME:?WAREHOUSE_DB_NAME must be set}
       POSTGRES_USER: ${WAREHOUSE_ADMIN_USER:?WAREHOUSE_ADMIN_USER must be set}
@@ -54,9 +161,12 @@ services:
     ports:
       - "5434:5432"
     volumes:
-      - warehouse_data:/var/lib/postgresql/data
+      - warehouse_data_pg18:/var/lib/postgresql
       - ./docker/postgres-warehouse/initdb:/docker-entrypoint-initdb.d:ro
       - ./warehouse/schema:/warehouse-schema:ro
+      - ./contracts:/contracts:ro
+    mem_limit: ${WAREHOUSE_MEM_LIMIT:-1536m}
+    shm_size: 256m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${WAREHOUSE_ADMIN_USER:?WAREHOUSE_ADMIN_USER must be set} -d ${WAREHOUSE_DB_NAME:?WAREHOUSE_DB_NAME must be set}"]
       interval: 10s
@@ -68,6 +178,7 @@ services:
       context: .
       dockerfile: docker/extractor/Dockerfile
     container_name: fineract-bi-extractor
+    profiles: ["python"]
     depends_on:
       warehouse:
         condition: service_healthy
@@ -85,9 +196,12 @@ services:
       WAREHOUSE_DB_PASSWORD: ${WAREHOUSE_LOADER_PASSWORD:?WAREHOUSE_LOADER_PASSWORD must be set}
       WAREHOUSE_DB_SCHEMA: ${WAREHOUSE_DB_SCHEMA:-raw}
       TENANT_ID: ${TENANT_ID:-default}
+      INGESTION_ENGINE_DEFAULT: ${INGESTION_ENGINE_DEFAULT:-PYTHON}
       REPLICA_LAG_THRESHOLD_SECONDS: "300"
       COB_LOOKBACK_HOURS: "9999"
       EXTRACT_LOOKBACK_SECONDS: "600"
+      EXTRACT_PAGE_SIZE: ${EXTRACT_PAGE_SIZE:-5000}
+      EXTRACT_PARALLELISM: ${EXTRACT_PARALLELISM:-4}
       PIPELINE_MODE: ${PIPELINE_MODE:-incremental}
       PIPELINE_INTERVAL_SECONDS: ${PIPELINE_INTERVAL_SECONDS:-3600}
       PYTHONPATH: /app
@@ -127,6 +241,7 @@ services:
       PGPASSWORD: ${WAREHOUSE_LOADER_PASSWORD:?WAREHOUSE_LOADER_PASSWORD must be set}
       TENANT_ID: ${TENANT_ID:-default}
       DBT_PROFILES_DIR: /app/dbt
+      DBT_THREADS: ${DBT_THREADS:-4}
     volumes:
       - .:/app
     working_dir: /app/dbt
@@ -153,7 +268,11 @@ services:
       SUPERSET_NORTH_MANAGER_PASSWORD: ${SUPERSET_NORTH_MANAGER_PASSWORD:?SUPERSET_NORTH_MANAGER_PASSWORD must be set}
       SUPERSET_SOUTH_MANAGER_PASSWORD: ${SUPERSET_SOUTH_MANAGER_PASSWORD:?SUPERSET_SOUTH_MANAGER_PASSWORD must be set}
       SUPERSET_METADATA_URI: postgresql+psycopg2://${WAREHOUSE_ADMIN_USER:?WAREHOUSE_ADMIN_USER must be set}:${WAREHOUSE_ADMIN_PASSWORD:?WAREHOUSE_ADMIN_PASSWORD must be set}@warehouse:5432/superset_metadata
-      SUPERSET_WAREHOUSE_URI: postgresql+psycopg2://${WAREHOUSE_READER_USER:?WAREHOUSE_READER_USER must be set}:${WAREHOUSE_READER_PASSWORD:?WAREHOUSE_READER_PASSWORD must be set}@warehouse:5432/${WAREHOUSE_DB_NAME:?WAREHOUSE_DB_NAME must be set}
+      SUPERSET_WAREHOUSE_URI: ${SUPERSET_WAREHOUSE_URI:-postgresql+psycopg2://${WAREHOUSE_READER_USER}:${WAREHOUSE_READER_PASSWORD}@warehouse:5432/${WAREHOUSE_DB_NAME}}
+      SUPERSET_CACHE_REDIS_URL: ${SUPERSET_CACHE_REDIS_URL:-}
+      SUPERSET_CACHE_DEFAULT_TIMEOUT: ${SUPERSET_CACHE_DEFAULT_TIMEOUT:-300}
+      SUPERSET_ROW_LIMIT: ${SUPERSET_ROW_LIMIT:-5000}
+      SUPERSET_WEBSERVER_WORKERS: ${SUPERSET_WEBSERVER_WORKERS:-2}
     volumes:
       - .:/workspace
       - superset_home:/app/superset_home
@@ -165,10 +284,212 @@ services:
       retries: 10
       start_period: 60s
 
+  kafka:
+    image: apache/kafka:4.1.1
+    profiles: ["cdc"]
+    hostname: kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-1}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: ${KAFKA_MIN_INSYNC_REPLICAS:-1}
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_NETWORK_THREADS: ${KAFKA_NUM_NETWORK_THREADS:-3}
+      KAFKA_NUM_IO_THREADS: ${KAFKA_NUM_IO_THREADS:-4}
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-72}
+      KAFKA_LOG_SEGMENT_BYTES: ${KAFKA_LOG_SEGMENT_BYTES:-268435456}
+      KAFKA_HEAP_OPTS: "-Xms${KAFKA_HEAP:-512m} -Xmx${KAFKA_HEAP:-512m}"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    mem_limit: ${KAFKA_MEM_LIMIT:-1g}
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    build:
+      context: .
+      dockerfile: docker/ingestion/Dockerfile
+    image: fineract-bi-ingestion:latest
+    profiles: ["cdc"]
+    command: ["provision-topics"]
+    environment:
+      SINK_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      TOPIC_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-1}
+      TOPIC_PARTITION_SCALE: ${TOPIC_PARTITION_SCALE:-0.25}
+      TOPIC_MAX_PARTITIONS: ${TOPIC_MAX_PARTITIONS:-6}
+      TOPIC_RETENTION_MS: ${TOPIC_RETENTION_MS:-259200000}
+      TOPIC_ALLOW_PARTITION_INCREASE: ${TOPIC_ALLOW_PARTITION_INCREASE:-false}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+
+  connect:
+    image: quay.io/debezium/connect:3.4
+    profiles: ["cdc"]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: ${CONNECT_GROUP_ID:-fbi-connect-default}
+      CONFIG_STORAGE_TOPIC: fbi_connect_configs
+      OFFSET_STORAGE_TOPIC: fbi_connect_offsets
+      STATUS_STORAGE_TOPIC: fbi_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      OFFSET_STORAGE_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      STATUS_STORAGE_REPLICATION_FACTOR: ${KAFKA_DEFAULT_REPLICATION_FACTOR:-1}
+      OFFSET_FLUSH_INTERVAL_MS: "5000"
+      HEAP_OPTS: "-Xms${CONNECT_HEAP:-512m} -Xmx${CONNECT_HEAP:-512m}"
+      CONNECT_CONFIG_PROVIDERS: env,file
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CONNECT_CONFIG_PROVIDERS_FILE_CLASS: org.apache.kafka.common.config.provider.FileConfigProvider
+      CONNECT_TOPIC_CREATION_ENABLE: "false"
+      CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY: All
+      CONNECT_REST_ADVERTISED_HOST_NAME: ${CONNECT_ADVERTISED_HOST:-connect}
+      FINERACT_CDC_PASSWORD: ${FINERACT_CDC_PASSWORD:-}
+    ports:
+      - "${CONNECT_HOST_PORT:-8083}:8083"
+    deploy:
+      replicas: ${CONNECT_REPLICAS:-1}
+    mem_limit: ${CONNECT_MEM_LIMIT:-1g}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - fineract_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  sink:
+    image: fineract-bi-ingestion:latest
+    profiles: ["cdc"]
+    command: ["run"]
+    environment:
+      SINK_BOOTSTRAP_SERVERS: kafka:9092
+      SINK_GROUP_ID: ${SINK_GROUP_ID:-fbi-warehouse-sink}
+      SINK_THREADS: ${SINK_THREADS:-2}
+      SINK_MAX_BATCH_EVENTS: ${SINK_MAX_BATCH_EVENTS:-5000}
+      SINK_MAX_BATCH_WAIT_MS: ${SINK_MAX_BATCH_WAIT_MS:-500}
+      SINK_MAX_POLL_RECORDS: ${SINK_MAX_POLL_RECORDS:-5000}
+      SINK_DB_URL: jdbc:postgresql://warehouse:5432/${WAREHOUSE_DB_NAME}
+      SINK_DB_USER: ${WAREHOUSE_LOADER_USER}
+      SINK_DB_PASSWORD: ${WAREHOUSE_LOADER_PASSWORD}
+      SINK_OWNERSHIP_REFRESH_MS: ${SINK_OWNERSHIP_REFRESH_MS:-5000}
+      SINK_UNKNOWN_SOURCE_POLICY: ${SINK_UNKNOWN_SOURCE_POLICY:-dlt}
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+    deploy:
+      replicas: ${SINK_REPLICAS:-1}
+    mem_limit: ${SINK_MEM_LIMIT:-768m}
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      warehouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9404' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  loadgen:
+    image: fineract-bi-ingestion:latest
+    profiles: ["loadtest"]
+    entrypoint: ["sh", "-c", "exec java -Xmx${LOADGEN_HEAP:-512m} -jar /opt/fbi/loadgen.jar \"$@\"", "--"]
+    environment:
+      LOADGEN_BOOTSTRAP: kafka:9092
+      LOADGEN_DB_URL: jdbc:postgresql://warehouse:5432/${WAREHOUSE_DB_NAME}
+      LOADGEN_DB_USER: ${WAREHOUSE_LOADER_USER}
+      LOADGEN_DB_PASSWORD: ${WAREHOUSE_LOADER_PASSWORD}
+    volumes:
+      - ./loadtest/results:/results
+    working_dir: /results
+    mem_limit: ${LOADGEN_MEM_LIMIT:-768m}
+    networks:
+      - default
+      - fineract_network
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -p /opt/airflow/passwords
+        printf '{"%s": "%s"}' "$${AIRFLOW_ADMIN_USERNAME:-admin}" "$${AIRFLOW_ADMIN_PASSWORD}" > /opt/airflow/passwords/simple_auth_manager_passwords.json
+        airflow db migrate
+        airflow pools set fbi_source_extract "$${FBI_POOL_SOURCE_EXTRACT:-4}" "Concurrent Python-engine shards hitting source replicas"
+        airflow pools set fbi_source_reconcile "$${FBI_POOL_SOURCE_RECONCILE:-2}" "Concurrent source-vs-warehouse checksum scans"
+        airflow pools set fbi_dbt "1" "Single dbt build at a time"
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USERNAME: ${AIRFLOW_ADMIN_USERNAME:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin_dev_only}
+      FBI_POOL_SOURCE_EXTRACT: ${FBI_POOL_SOURCE_EXTRACT:-4}
+      FBI_POOL_SOURCE_RECONCILE: ${FBI_POOL_SOURCE_RECONCILE:-2}
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    mem_limit: ${AIRFLOW_API_MEM_LIMIT:-768m}
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/version >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    mem_limit: ${AIRFLOW_SCHEDULER_MEM_LIMIT:-1g}
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    mem_limit: ${AIRFLOW_DAG_PROCESSOR_MEM_LIMIT:-512m}
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+
 volumes:
   fineract_db_data:
-  warehouse_data:
+  warehouse_data_pg18:
   superset_home:
+  kafka_data:
+  airflow_auth:
 
 networks:
   default:

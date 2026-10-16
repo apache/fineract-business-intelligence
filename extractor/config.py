@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import annotations
 
 import os
-import ssl
+import socket
 from dataclasses import dataclass
+
+from controlplane.db import PgConfig, warehouse_config_from_env
 
 
 def require_env(name: str) -> str:
@@ -27,66 +30,72 @@ def require_env(name: str) -> str:
     return value
 
 
+def _bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
-class DatabaseConfig:
+class ExtractSettings:
+
+    page_size: int = 5000
+    lookback_seconds: int = 600
+    replica_lag_threshold_seconds: int = 300
+    cob_gate_enabled: bool = True
+    cob_lookback_hours: int = 48
+    reconcile_bucket_size: int = 100_000
+    parallelism: int = 4
+    default_engine: str = "PYTHON"
+    writer_id: str = "python"
+
+    @classmethod
+    def from_env(cls) -> ExtractSettings:
+        engine = os.getenv("INGESTION_ENGINE_DEFAULT", "PYTHON").strip().upper()
+        if engine not in ("PYTHON", "KAFKA", "NONE"):
+            raise ValueError(f"INGESTION_ENGINE_DEFAULT must be PYTHON, KAFKA or NONE, got {engine}")
+        return cls(
+            page_size=int(os.getenv("EXTRACT_PAGE_SIZE", os.getenv("EXTRACT_BATCH_SIZE", "5000"))),
+            lookback_seconds=int(os.getenv("EXTRACT_LOOKBACK_SECONDS", "600")),
+            replica_lag_threshold_seconds=int(os.getenv("REPLICA_LAG_THRESHOLD_SECONDS", "300")),
+            cob_gate_enabled=_bool("COB_GATE_ENABLED", True),
+            cob_lookback_hours=int(os.getenv("COB_LOOKBACK_HOURS", "48")),
+            reconcile_bucket_size=int(os.getenv("RECONCILE_BUCKET_SIZE", "100000")),
+            parallelism=int(os.getenv("EXTRACT_PARALLELISM", "4")),
+            default_engine=engine,
+            writer_id=os.getenv("EXTRACT_WRITER_ID", f"python-{socket.gethostname()}"),
+        )
+
+
+@dataclass(frozen=True)
+class EnvSourceBootstrap:
+
+    source_id: str
+    tenant_id: str
     host: str
     port: int
     dbname: str
     user: str
-    password: str
-    schema: str | None = None
-    ssl_mode: str = "disable"
-
-    @property
-    def connect_kwargs(self) -> dict:
-        kwargs = {
-            "host": self.host,
-            "port": self.port,
-            "database": self.dbname,
-            "user": self.user,
-            "password": self.password,
-        }
-        if self.ssl_mode == "require":
-            kwargs["ssl_context"] = ssl.create_default_context()
-        return kwargs
-
-
-@dataclass(frozen=True)
-class AppConfig:
-    source: DatabaseConfig
-    warehouse: DatabaseConfig
-    tenant_id: str
-    replica_lag_threshold_seconds: int
-    cob_lookback_hours: int
+    compat_schema: str
+    ssl_mode: str
     cob_job_name: str
-    extract_batch_size: int
-    extract_lookback_seconds: int
+    secret_ref: str = "env:SOURCE_DB_PASSWORD"
 
     @classmethod
-    def from_env(cls) -> AppConfig:
+    def from_env(cls) -> EnvSourceBootstrap | None:
+        if not os.getenv("SOURCE_DB_USER"):
+            return None
         return cls(
-            source=DatabaseConfig(
-                host=os.getenv("SOURCE_DB_HOST", "localhost"),
-                port=int(os.getenv("SOURCE_DB_PORT", "5433")),
-                dbname=os.getenv("SOURCE_DB_NAME", "fineract_default"),
-                user=require_env("SOURCE_DB_USER"),
-                password=require_env("SOURCE_DB_PASSWORD"),
-                schema=os.getenv("SOURCE_DB_SCHEMA", "bi_connector_source"),
-                ssl_mode=os.getenv("SOURCE_DB_SSL_MODE", "disable"),
-            ),
-            warehouse=DatabaseConfig(
-                host=os.getenv("WAREHOUSE_DB_HOST", "localhost"),
-                port=int(os.getenv("WAREHOUSE_DB_PORT", "5434")),
-                dbname=os.getenv("WAREHOUSE_DB_NAME", "analytics"),
-                user=require_env("WAREHOUSE_DB_USER"),
-                password=require_env("WAREHOUSE_DB_PASSWORD"),
-                schema=os.getenv("WAREHOUSE_DB_SCHEMA", "raw"),
-                ssl_mode=os.getenv("WAREHOUSE_DB_SSL_MODE", "disable"),
-            ),
+            source_id=os.getenv("SOURCE_ID", "default"),
             tenant_id=os.getenv("TENANT_ID", "default"),
-            replica_lag_threshold_seconds=int(os.getenv("REPLICA_LAG_THRESHOLD_SECONDS", "300")),
-            cob_lookback_hours=int(os.getenv("COB_LOOKBACK_HOURS", "48")),
+            host=os.getenv("SOURCE_DB_HOST", "localhost"),
+            port=int(os.getenv("SOURCE_DB_PORT", "5433")),
+            dbname=os.getenv("SOURCE_DB_NAME", "fineract_default"),
+            user=os.getenv("SOURCE_DB_USER", ""),
+            compat_schema=os.getenv("SOURCE_DB_SCHEMA", "bi_connector_source"),
+            ssl_mode=os.getenv("SOURCE_DB_SSL_MODE", "disable"),
             cob_job_name=os.getenv("COB_JOB_NAME", "LOAN_COB"),
-            extract_batch_size=int(os.getenv("EXTRACT_BATCH_SIZE", "1000")),
-            extract_lookback_seconds=int(os.getenv("EXTRACT_LOOKBACK_SECONDS", "600")),
+            secret_ref=os.getenv("SOURCE_DB_SECRET_REF", "env:SOURCE_DB_PASSWORD"),
         )
+
+
+def warehouse_config() -> PgConfig:
+    return warehouse_config_from_env(application_name="fbi-python-engine")

@@ -13,20 +13,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import annotations
 
+import io
 import logging
 import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import pg8000.dbapi
 
-from extractor.config import AppConfig
+from controlplane import secrets
+from controlplane.contract import Contract, TableContract, load_contract
+from controlplane.db import PgConfig, connect, quote_ident
+from controlplane.ownership import Action, CutoverState, Engine, Ownership, TransitionRequest
+from controlplane.ownership_repo import OwnershipRepository
+from controlplane.reconcile import source_vs_warehouse
+from controlplane.registry import SourceRecord, SourceRegistry
+from extractor.config import EnvSourceBootstrap, ExtractSettings, warehouse_config
 from extractor.replica_lag_check import ensure_replica_safe
-from extractor.watermark_manager import WatermarkManager
+from extractor.watermark_manager import Watermark, WatermarkManager
 
 logger = logging.getLogger(__name__)
+
+FENCED_SQLSTATE = "FBI01"
+MODES = ("backfill", "incremental", "reconcile")
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+STAGE_META_COLUMNS = (
+    "_source_generation",
+    "_source_lsn",
+    "_source_ts",
+    "_op",
+    "_unavailable",
+    "_owner_epoch",
+    "_target",
+)
+
+
+class FencedError(RuntimeError):
+    pass
 
 
 def as_utc_datetime(value: datetime | None) -> datetime | None:
@@ -37,626 +66,470 @@ def as_utc_datetime(value: datetime | None) -> datetime | None:
     return value.astimezone(UTC)
 
 
-def _quote_identifier(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
+def sqlstate(exc: BaseException) -> str | None:
+    payload = exc.args[0] if exc.args else None
+    return payload.get("C") if isinstance(payload, dict) else None
+
+
+def csv_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "t" if value else "f"
+    if isinstance(value, datetime):
+        text = as_utc_datetime(value).isoformat()
+    elif isinstance(value, (date, Decimal, int, float)):
+        text = str(value)
+    else:
+        text = str(value)
+    return '"' + text.replace('"', '""') + '"'
+
+
+def build_copy_payload(rows: Iterable[Sequence]) -> io.StringIO:
+    buf = io.StringIO()
+    for row in rows:
+        buf.write(",".join(csv_field(v) for v in row))
+        buf.write("\n")
+    buf.seek(0)
+    return buf
 
 
 @dataclass(frozen=True)
-class TableSpec:
-    source_table: str
-    raw_table: str
-    columns: tuple[str, ...]
-    primary_key: str
-    cursor_column: str = "last_modified_on_utc"
+class Assignment:
+    table: TableContract
+    target: str
+    epoch: int
 
 
-TABLE_SPECS: tuple[TableSpec, ...] = (
-    TableSpec(
-        source_table="m_office",
-        raw_table="raw_m_office",
-        primary_key="id",
-        columns=(
-            "id",
-            "parent_id",
-            "hierarchy",
-            "external_id",
-            "name",
-            "opening_date",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_currency",
-        raw_table="raw_m_currency",
-        primary_key="id",
-        columns=(
-            "id",
-            "code",
-            "decimal_places",
-            "currency_multiplesof",
-            "display_symbol",
-            "name",
-            "internationalized_name_code",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_client",
-        raw_table="raw_m_client",
-        primary_key="id",
-        columns=(
-            "id",
-            "account_no",
-            "external_id",
-            "status_enum",
-            "activation_date",
-            "office_joining_date",
-            "office_id",
-            "staff_id",
-            "gender_cv_id",
-            "date_of_birth",
-            "legal_form_enum",
-            "submittedon_date",
-            "updated_on",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_product_loan",
-        raw_table="raw_m_product_loan",
-        primary_key="id",
-        columns=(
-            "id",
-            "short_name",
-            "currency_code",
-            "currency_digits",
-            "currency_multiplesof",
-            "principal_amount",
-            "min_principal_amount",
-            "max_principal_amount",
-            "arrearstolerance_amount",
-            "name",
-            "description",
-            "nominal_interest_rate_per_period",
-            "annual_nominal_interest_rate",
-            "repay_every",
-            "repayment_period_frequency_enum",
-            "number_of_repayments",
-            "overdue_days_for_npa",
-            "start_date",
-            "close_date",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_loan",
-        raw_table="raw_m_loan",
-        primary_key="id",
-        columns=(
-            "id",
-            "account_no",
-            "external_id",
-            "client_id",
-            "product_id",
-            "loan_status_id",
-            "loan_type_enum",
-            "currency_code",
-            "currency_digits",
-            "currency_multiplesof",
-            "principal_amount_proposed",
-            "principal_amount",
-            "approved_principal",
-            "net_disbursal_amount",
-            "annual_nominal_interest_rate",
-            "nominal_interest_rate_per_period",
-            "interest_method_enum",
-            "interest_calculated_in_period_enum",
-            "term_frequency",
-            "term_period_frequency_enum",
-            "repay_every",
-            "repayment_period_frequency_enum",
-            "number_of_repayments",
-            "amortization_method_enum",
-            "submittedon_date",
-            "approvedon_date",
-            "expected_disbursedon_date",
-            "expected_firstrepaymenton_date",
-            "disbursedon_date",
-            "expected_maturedon_date",
-            "maturedon_date",
-            "principal_disbursed_derived",
-            "principal_repaid_derived",
-            "principal_writtenoff_derived",
-            "principal_outstanding_derived",
-            "interest_charged_derived",
-            "interest_repaid_derived",
-            "interest_writtenoff_derived",
-            "interest_outstanding_derived",
-            "fee_charges_outstanding_derived",
-            "penalty_charges_outstanding_derived",
-            "total_expected_repayment_derived",
-            "total_repayment_derived",
-            "total_writtenoff_derived",
-            "total_outstanding_derived",
-            "loan_counter",
-            "is_npa",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_loan_transaction",
-        raw_table="raw_m_loan_transaction",
-        primary_key="id",
-        columns=(
-            "id",
-            "loan_id",
-            "office_id",
-            "is_reversed",
-            "transaction_type_enum",
-            "transaction_date",
-            "amount",
-            "principal_portion_derived",
-            "interest_portion_derived",
-            "fee_charges_portion_derived",
-            "penalty_charges_portion_derived",
-            "overpayment_portion_derived",
-            "outstanding_loan_balance_derived",
-            "submitted_on_date",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_delinquency_range",
-        raw_table="raw_m_delinquency_range",
-        primary_key="id",
-        columns=(
-            "id",
-            "classification",
-            "min_age_days",
-            "max_age_days",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_delinquency_bucket",
-        raw_table="raw_m_delinquency_bucket",
-        primary_key="id",
-        columns=(
-            "id",
-            "name",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_delinquency_bucket_mappings",
-        raw_table="raw_m_delinquency_bucket_mappings",
-        primary_key="id",
-        columns=(
-            "id",
-            "delinquency_range_id",
-            "delinquency_bucket_id",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_loan_delinquency_tag_history",
-        raw_table="raw_m_loan_delinquency_tag_history",
-        primary_key="id",
-        columns=(
-            "id",
-            "delinquency_range_id",
-            "loan_id",
-            "addedon_date",
-            "liftedon_date",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-    TableSpec(
-        source_table="m_loan_repayment_schedule",
-        raw_table="raw_m_loan_repayment_schedule",
-        primary_key="id",
-        cursor_column="lastmodified_date",
-        columns=(
-            "id",
-            "loan_id",
-            "fromdate",
-            "duedate",
-            "installment",
-            "principal_amount",
-            "principal_completed_derived",
-            "principal_writtenoff_derived",
-            "interest_amount",
-            "interest_completed_derived",
-            "interest_writtenoff_derived",
-            "interest_waived_derived",
-            "fee_charges_amount",
-            "fee_charges_completed_derived",
-            "fee_charges_writtenoff_derived",
-            "fee_charges_waived_derived",
-            "penalty_charges_amount",
-            "penalty_charges_completed_derived",
-            "penalty_charges_writtenoff_derived",
-            "penalty_charges_waived_derived",
-            "total_paid_in_advance_derived",
-            "total_paid_late_derived",
-            "completed_derived",
-            "obligations_met_on_date",
-            "is_re_aged",
-            "lastmodified_date",
-        ),
-    ),
-    TableSpec(
-        source_table="batch_job_execution",
-        raw_table="raw_batch_job_execution",
-        primary_key="job_execution_id",
-        columns=(
-            "job_execution_id",
-            "job_name",
-            "status",
-            "start_time",
-            "end_time",
-            "exit_code",
-            "exit_message",
-            "created_on_utc",
-            "last_modified_on_utc",
-        ),
-    ),
-)
+def plan_assignments(
+    ownerships: Iterable[Ownership], contract: Contract, tables: set[str] | None = None
+) -> list[Assignment]:
+    plan = []
+    for o in ownerships:
+        if o.cutover_state is CutoverState.PAUSED or (tables and o.table_name not in tables):
+            continue
+        if o.table_name not in contract.table_names:
+            continue
+        t = contract.table(o.table_name)
+        if o.engine is Engine.PYTHON:
+            plan.append(Assignment(t, "prod", o.epoch))
+        if o.shadow_engine is Engine.PYTHON:
+            plan.append(Assignment(t, "shadow", o.epoch))
+    return sorted(plan, key=lambda a: (a.table.table_name, a.target))
 
 
-class FineractExtractor:
-    def __init__(self, config: AppConfig) -> None:
-        self.config = config
+def build_page_query(
+    compat_schema: str, table: TableContract, start: Watermark | None, page_size: int
+) -> tuple[str, tuple]:
+    pk = quote_ident(table.primary_key)
+    select = []
+    for c in table.columns:
+        if c.synthetic:
+            select.append(f"CAST(NULL AS {c.type}) AS {quote_ident(c.name)}")
+        elif table.cursor_is_usable and c.name == table.python_cursor:
+            select.append(
+                f"COALESCE({quote_ident(c.name)}, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS {quote_ident(c.name)}"
+            )
+        else:
+            select.append(quote_ident(c.name))
+    base = f"SELECT {', '.join(select)} FROM {quote_ident(compat_schema)}.{quote_ident(table.table_name)}"
+    if table.cursor_is_usable:
+        cur = f"COALESCE({quote_ident(table.python_cursor)}, TIMESTAMPTZ '1970-01-01 00:00:00+00')"
+        cursor_value = start.cursor_value if start and start.cursor_value else _EPOCH
+        last_pk = start.last_pk if start and start.last_pk is not None else -(2**63)
+        return (
+            f"{base} WHERE ({cur}, {pk}) > (%s, %s) ORDER BY {cur}, {pk} LIMIT %s",
+            (cursor_value, last_pk, page_size),
+        )
+    last_pk = start.last_pk if start and start.last_pk is not None else -(2**63)
+    return f"{base} WHERE {pk} > %s ORDER BY {pk} LIMIT %s", (last_pk, page_size)
+
+
+@dataclass
+class TableOutcome:
+    table: str
+    target: str
+    rows_read: int = 0
+    rows_applied: int = 0
+    rows_deleted: int = 0
+    status: str = "ok"
+    detail: str | None = None
+
+
+@dataclass
+class SourceOutcome:
+    source_id: str
+    mode: str
+    status: str = "success"
+    tables: list[TableOutcome] = field(default_factory=list)
+    error: str | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "source_id": self.source_id,
+            "mode": self.mode,
+            "status": self.status,
+            "error": self.error,
+            "rows_read": sum(t.rows_read for t in self.tables),
+            "rows_applied": sum(t.rows_applied for t in self.tables),
+            "rows_deleted": sum(t.rows_deleted for t in self.tables),
+            "tables": [t.__dict__ for t in self.tables],
+        }
+
+
+class SourceExtractor:
+    def __init__(
+        self,
+        source: SourceRecord,
+        warehouse: PgConfig,
+        settings: ExtractSettings,
+        contract: Contract | None = None,
+        tables: set[str] | None = None,
+    ) -> None:
+        self.source = source
+        self.warehouse = warehouse
+        self.settings = settings
+        self.contract = contract or load_contract()
+        self.tables = tables
 
     def _source_conn(self):
-        return pg8000.dbapi.connect(**self.config.source.connect_kwargs)
+        s = self.source
+        cfg = PgConfig(
+            host=s.db_host or "localhost",
+            port=s.db_port,
+            database=s.db_name or "",
+            user=s.db_user or "",
+            password=secrets.resolve(s.secret_ref),
+            ssl_mode=s.labels.get("sslmode", "disable"),
+            application_name="fbi-python-engine",
+        )
+        conn = pg8000.dbapi.connect(**cfg.connect_kwargs())
+        conn.autocommit = True
+        return conn
 
-    def _warehouse_conn(self):
-        return pg8000.dbapi.connect(**self.config.warehouse.connect_kwargs)
-
-    def run(self, mode: str) -> dict[str, int | str]:
-        if mode not in {"backfill", "incremental", "reconcile"}:
+    def run(self, mode: str) -> SourceOutcome:
+        if mode not in MODES:
             raise ValueError(f"Unsupported mode: {mode}")
-
+        outcome = SourceOutcome(self.source.source_id, mode)
+        wh = connect(self.warehouse)
         run_id = uuid.uuid4()
-        rows_extracted = 0
-        rows_loaded = 0
-
-        source_conn = self._source_conn()
-        warehouse_conn = self._warehouse_conn()
         try:
-            source_conn.autocommit = True
-            warehouse_conn.autocommit = False
-
-            logger.info("Starting %s extraction for tenant '%s'.", mode, self.config.tenant_id)
-            self._insert_pipeline_state(warehouse_conn, run_id, mode, "running")
-            watermark_manager = WatermarkManager(warehouse_conn, self.config.tenant_id)
-
+            assignments = plan_assignments(
+                OwnershipRepository(wh).list(source_id=self.source.source_id, engine=Engine.PYTHON),
+                self.contract,
+                self.tables,
+            )
+            wh.commit()
+            if not assignments:
+                outcome.status = "skipped"
+                outcome.error = "no tables owned by the PYTHON engine"
+                return outcome
+            self._pipeline_state(wh, run_id, mode, "running")
+            src = self._source_conn()
             try:
-                if mode == "backfill":
-                    self._reset_backfill_state(warehouse_conn, watermark_manager)
-
-                lag_seconds = ensure_replica_safe(source_conn, self.config.replica_lag_threshold_seconds)
-                logger.info("Replica safety check passed with lag=%ss.", lag_seconds)
-
-                if mode == "reconcile":
-                    deleted_counts = self._reconcile_deletes(source_conn, warehouse_conn)
-                    rows_loaded = sum(deleted_counts.values())
-                    for table_name, deleted in deleted_counts.items():
-                        logger.info("Reconciled table '%s': rows_deleted=%s.", table_name, deleted)
-                else:
-                    self._ensure_cob_completed(source_conn)
-
-                    for spec in TABLE_SPECS:
-                        logger.info("Extracting source table '%s' into raw.%s.", spec.source_table, spec.raw_table)
-                        extracted_rows = self._extract_table(source_conn, warehouse_conn, watermark_manager, spec, mode)
-                        rows_extracted += extracted_rows
-                        rows_loaded += extracted_rows
-                        logger.info(
-                            "Completed table '%s': rows_extracted=%s rows_loaded=%s.",
-                            spec.source_table,
-                            extracted_rows,
-                            extracted_rows,
-                        )
-
-                self._update_pipeline_state(
-                    warehouse_conn,
-                    run_id,
-                    status="success",
-                    rows_extracted=rows_extracted,
-                    rows_loaded=rows_loaded,
-                )
-                warehouse_conn.commit()
-                logger.info(
-                    "Extraction run %s completed successfully: rows_extracted=%s rows_loaded=%s.",
-                    run_id,
-                    rows_extracted,
-                    rows_loaded,
-                )
-                return {
-                    "run_id": str(run_id),
-                    "status": "success",
-                    "rows_extracted": rows_extracted,
-                    "rows_loaded": rows_loaded,
-                    "replica_lag_seconds": lag_seconds,
-                }
-            except Exception as exc:
-                warehouse_conn.rollback()
-                logger.exception("Extraction run %s failed.", run_id)
-                self._update_pipeline_state(
-                    warehouse_conn,
-                    run_id,
-                    status="failed",
-                    rows_extracted=rows_extracted,
-                    rows_loaded=rows_loaded,
-                    error_message=str(exc),
-                )
-                warehouse_conn.commit()
-                raise
+                lag = ensure_replica_safe(src, self.settings.replica_lag_threshold_seconds)
+                logger.info("[%s] replica lag %ss within threshold", self.source.source_id, lag)
+                if mode != "reconcile" and self.settings.cob_gate_enabled:
+                    self._ensure_cob_completed(src)
+                watermarks = WatermarkManager(wh, self.source.source_id)
+                for a in assignments:
+                    outcome.tables.append(self._process(src, wh, watermarks, a, mode))
+            finally:
+                src.close()
+            if any(t.status == "fenced" for t in outcome.tables):
+                outcome.status = "partial"
+            self._pipeline_state(wh, run_id, mode, outcome.status, outcome)
+            return outcome
+        except Exception as exc:
+            wh.rollback()
+            outcome.status = "failed"
+            outcome.error = str(exc)
+            logger.exception("[%s] %s run failed", self.source.source_id, mode)
+            try:
+                self._pipeline_state(wh, run_id, mode, "failed", outcome)
+            except Exception:  # noqa: BLE001
+                wh.rollback()
+            raise
         finally:
-            source_conn.close()
-            warehouse_conn.close()
+            wh.close()
 
-    def _reconcile_deletes(self, source_conn, warehouse_conn) -> dict[str, int]:
-        deleted_counts: dict[str, int] = {}
-        for spec in TABLE_SPECS:
-            source_pks = self._fetch_source_primary_keys(source_conn, spec)
-            deleted_counts[spec.source_table] = self._delete_orphaned_rows(warehouse_conn, spec, source_pks)
-        return deleted_counts
+    def _process(self, src, wh, watermarks: WatermarkManager, a: Assignment, mode: str) -> TableOutcome:
+        out = TableOutcome(a.table.table_name, a.target)
+        try:
+            if mode == "backfill":
+                watermarks.reset(a.table.table_name, a.target)
+                wh.commit()
+            if mode in ("backfill", "incremental"):
+                self._extract(src, wh, watermarks, a, out)
+            if mode in ("backfill", "reconcile") or not a.table.cursor_is_usable:
+                self._reconcile_deletes(src, wh, a, out)
+            self._record_progress(wh, a, out)
+        except FencedError as exc:
+            wh.rollback()
+            out.status = "fenced"
+            out.detail = str(exc)
+            logger.warning("[%s] %s/%s fenced: %s", self.source.source_id, a.table.table_name, a.target, exc)
+        return out
 
-    def _fetch_source_primary_keys(self, source_conn, spec: TableSpec) -> set:
-        schema = _quote_identifier(self.config.source.schema)
-        table = _quote_identifier(spec.source_table)
-        pk = _quote_identifier(spec.primary_key)
-
-        cursor = source_conn.cursor()
-        cursor.execute(f"SELECT {pk} FROM {schema}.{table}")
-
-        primary_keys: set = set()
+    def _extract(self, src, wh, watermarks: WatermarkManager, a: Assignment, out: TableOutcome) -> None:
+        t = a.table
+        stored = watermarks.get(t.table_name, a.target)
+        start = stored
+        if stored and stored.cursor_value and t.cursor_is_usable and self.settings.lookback_seconds > 0:
+            start = Watermark(stored.cursor_value - timedelta(seconds=self.settings.lookback_seconds), None)
+        if not t.cursor_is_usable:
+            start = None
+        cursor_idx = t.column_names.index(t.python_cursor) if t.cursor_is_usable else None
+        pk_idx = t.column_names.index(t.primary_key)
         while True:
-            batch = cursor.fetchmany(self.config.extract_batch_size)
-            if not batch:
+            sql, params = build_page_query(self.source.compat_schema, t, start, self.settings.page_size)
+            cur = src.cursor()
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            if not rows:
                 break
-            primary_keys.update(row[0] for row in batch)
-        return primary_keys
-
-    def _delete_orphaned_rows(self, warehouse_conn, spec: TableSpec, source_pks: set) -> int:
-        raw_table = _quote_identifier(spec.raw_table)
-        pk = _quote_identifier(spec.primary_key)
-
-        cursor = warehouse_conn.cursor()
-        cursor.execute(
-            f"SELECT {pk} FROM raw.{raw_table} WHERE tenant_id = %s",
-            (self.config.tenant_id,),
-        )
-        orphaned: list = []
-        while True:
-            batch = cursor.fetchmany(self.config.extract_batch_size)
-            if not batch:
+            last = rows[-1]
+            next_wm = Watermark(as_utc_datetime(last[cursor_idx]) if cursor_idx is not None else None, last[pk_idx])
+            applied, _ = self._write_page(wh, a, rows, cursor_idx, op="u")
+            if t.cursor_is_usable:
+                watermarks.update(t.table_name, a.target, next_wm.cursor_value, next_wm.last_pk)
+            wh.commit()
+            out.rows_read += len(rows)
+            out.rows_applied += applied
+            start = next_wm
+            if len(rows) < self.settings.page_size:
                 break
-            orphaned.extend(row[0] for row in batch if row[0] not in source_pks)
-
-        if not orphaned:
-            return 0
-
-        max_pks_per_statement = max(1, self._POSTGRES_MAX_BIND_PARAMETERS - 1)
-        for offset in range(0, len(orphaned), max_pks_per_statement):
-            chunk = orphaned[offset : offset + max_pks_per_statement]
-            placeholders = ", ".join("%s" for _ in chunk)
-            cursor.execute(
-                f"DELETE FROM raw.{raw_table} WHERE tenant_id = %s AND {pk} IN ({placeholders})",
-                (self.config.tenant_id, *chunk),
-            )
-        return len(orphaned)
-
-    def _reset_backfill_state(self, warehouse_conn, watermark_manager: WatermarkManager) -> None:
-        cursor = warehouse_conn.cursor()
-        for spec in TABLE_SPECS:
-            cursor.execute(
-                f"DELETE FROM raw.{_quote_identifier(spec.raw_table)} WHERE tenant_id = %s",
-                (self.config.tenant_id,),
-            )
-        watermark_manager.reset_all()
-        logger.info("Backfill reset completed for raw layer and watermarks.")
-
-    def _insert_pipeline_state(self, warehouse_conn, run_id: uuid.UUID, mode: str, status: str) -> None:
-        cursor = warehouse_conn.cursor()
-        cursor.execute(
-            """
-            INSERT INTO meta.pipeline_state (
-                run_id,
-                tenant_id,
-                run_mode,
-                started_at,
-                status,
-                rows_extracted,
-                rows_loaded
-            )
-            VALUES (%s, %s, %s, %s, %s, 0, 0)
-            """,
-            (str(run_id), self.config.tenant_id, mode, datetime.now(UTC), status),
-        )
-        warehouse_conn.commit()
-
-    def _update_pipeline_state(
-        self,
-        warehouse_conn,
-        run_id: uuid.UUID,
-        status: str,
-        rows_extracted: int,
-        rows_loaded: int,
-        error_message: str | None = None,
-    ) -> None:
-        cursor = warehouse_conn.cursor()
-        cursor.execute(
-            """
-            UPDATE meta.pipeline_state
-            SET completed_at = %s,
-                status = %s,
-                rows_extracted = %s,
-                rows_loaded = %s,
-                error_message = %s
-            WHERE run_id = %s
-            """,
-            (
-                datetime.now(UTC),
-                status,
-                rows_extracted,
-                rows_loaded,
-                error_message,
-                str(run_id),
-            ),
+        logger.info(
+            "[%s] %s -> %s: read=%s applied=%s",
+            self.source.source_id,
+            t.table_name,
+            a.target,
+            out.rows_read,
+            out.rows_applied,
         )
 
-    def _ensure_cob_completed(self, source_conn) -> None:
-        schema = _quote_identifier(self.config.source.schema)
-        cursor = source_conn.cursor()
+    def _write_page(
+        self, wh, a: Assignment, rows: Sequence[Sequence], cursor_idx: int | None, op: str
+    ) -> tuple[int, int]:
+        t = a.table
+        now = datetime.now(UTC)
+        staged = []
+        for row in rows:
+            source_ts = as_utc_datetime(row[cursor_idx]) if cursor_idx is not None and row[cursor_idx] else now
+            staged.append(
+                (
+                    self.source.source_id,
+                    self.source.tenant_id,
+                    *row,
+                    self.source.capture_generation,
+                    None,
+                    source_ts,
+                    op,
+                    None,
+                    a.epoch,
+                    a.target,
+                )
+            )
+        cursor = wh.cursor()
+        try:
+            cursor.execute("SELECT meta.create_stage_table(%s)", (t.table_name,))
+            stage = cursor.fetchone()[0]
+            columns = ", ".join(
+                quote_ident(c) for c in ("source_id", "tenant_id", *t.column_names, *STAGE_META_COLUMNS)
+            )
+            cursor.execute(
+                f"COPY pg_temp.{quote_ident(stage)} ({columns}) FROM STDIN WITH (FORMAT csv)",
+                stream=build_copy_payload(staged),
+            )
+            cursor.execute(
+                "SELECT target, rows_applied, rows_deleted FROM meta.apply_staged_batch(%s, 'PYTHON')", (t.table_name,)
+            )
+            results = cursor.fetchall()
+        except pg8000.dbapi.DatabaseError as exc:
+            wh.rollback()
+            if sqlstate(exc) == FENCED_SQLSTATE:
+                raise FencedError(str(exc.args[0].get("M", exc))) from exc
+            raise
+        applied = sum(int(r[1]) for r in results)
+        deleted = sum(int(r[2]) for r in results)
+        return applied, deleted
+
+    def _reconcile_deletes(self, src, wh, a: Assignment, out: TableOutcome) -> None:
+        t = a.table
+        result = source_vs_warehouse(
+            src,
+            wh,
+            self.source.source_id,
+            self.source.compat_schema,
+            t,
+            bucket_size=self.settings.reconcile_bucket_size,
+            max_drilldown_buckets=10_000,
+            keys_only=True,
+            warehouse_schema="raw" if a.target == "prod" else "raw_shadow",
+        )
+        missing = result.details.get("missing_in_source_keys", [])
+        if not missing:
+            return
+        pk_idx = t.column_names.index(t.primary_key)
+        for i in range(0, len(missing), self.settings.page_size):
+            chunk = missing[i : i + self.settings.page_size]
+            rows = []
+            for key in chunk:
+                row = [None] * len(t.column_names)
+                row[pk_idx] = key
+                rows.append(row)
+            _, deleted = self._write_page(wh, a, rows, None, op="d")
+            wh.commit()
+            out.rows_deleted += deleted
+        logger.info(
+            "[%s] %s -> %s: soft-deleted %s rows missing at source",
+            self.source.source_id,
+            t.table_name,
+            a.target,
+            out.rows_deleted,
+        )
+
+    def _ensure_cob_completed(self, src) -> None:
+        cursor = src.cursor()
         cursor.execute(
-            f"""
-            SELECT MAX(end_time)
-            FROM {schema}.batch_job_execution
-            WHERE status = %s
-              AND job_name = %s
-            """,
-            ("COMPLETED", self.config.cob_job_name),
+            f"SELECT MAX(end_time) FROM {quote_ident(self.source.compat_schema)}.batch_job_execution "
+            "WHERE status = %s AND job_name = %s",
+            ("COMPLETED", self.source.cob_job_name),
         )
         last_completed = as_utc_datetime(cursor.fetchone()[0])
-
         if last_completed is None:
-            raise RuntimeError(
-                f"No completed '{self.config.cob_job_name}' execution found in batch_job_execution."
-            )
-
-        cutoff = datetime.now(UTC) - timedelta(hours=self.config.cob_lookback_hours)
+            raise RuntimeError(f"No completed '{self.source.cob_job_name}' execution found in batch_job_execution.")
+        cutoff = datetime.now(UTC) - timedelta(hours=self.settings.cob_lookback_hours)
         if last_completed < cutoff:
             raise RuntimeError(
-                f"Latest '{self.config.cob_job_name}' completion {last_completed.isoformat()} "
-                f"is older than {self.config.cob_lookback_hours} hours."
+                f"Latest '{self.source.cob_job_name}' completion {last_completed.isoformat()} "
+                f"is older than {self.settings.cob_lookback_hours} hours."
             )
-        logger.info(
-            "COB completion gate passed for job '%s' with latest completion at %s.",
-            self.config.cob_job_name,
-            last_completed.isoformat(),
+
+    def _record_progress(self, wh, a: Assignment, out: TableOutcome) -> None:
+        cursor = wh.cursor()
+        cursor.execute(
+            "INSERT INTO meta.ingestion_progress (source_id, table_name, target, writer_id, engine, rows_applied, "
+            "last_source_ts, last_applied_at) VALUES (%s, %s, %s, %s, 'PYTHON', %s, "
+            "(SELECT cursor_value FROM meta.extract_watermarks "
+            "WHERE source_id = %s AND table_name = %s AND target = %s), "
+            "NOW()) ON CONFLICT (source_id, table_name, target, writer_id) DO UPDATE SET "
+            "rows_applied = meta.ingestion_progress.rows_applied + EXCLUDED.rows_applied, "
+            "last_source_ts = COALESCE(EXCLUDED.last_source_ts, meta.ingestion_progress.last_source_ts), "
+            "last_applied_at = NOW()",
+            (
+                self.source.source_id,
+                a.table.table_name,
+                a.target,
+                self.settings.writer_id,
+                out.rows_applied + out.rows_deleted,
+                self.source.source_id,
+                a.table.table_name,
+                a.target,
+            ),
         )
+        wh.commit()
 
-    def _extract_table(
-        self,
-        source_conn,
-        warehouse_conn,
-        watermark_manager: WatermarkManager,
-        spec: TableSpec,
-        mode: str,
-    ) -> int:
-        previous_watermark = None if mode == "backfill" else watermark_manager.get(spec.source_table)
-
-        effective_watermark = previous_watermark
-        if effective_watermark is not None and self.config.extract_lookback_seconds > 0:
-            effective_watermark = effective_watermark - timedelta(seconds=self.config.extract_lookback_seconds)
-            logger.info(
-                "Applied lookback window of %ss for '%s': effective_watermark=%s.",
-                self.config.extract_lookback_seconds,
-                spec.source_table,
-                effective_watermark.isoformat(),
+    def _pipeline_state(self, wh, run_id, mode: str, status: str, outcome: SourceOutcome | None = None) -> None:
+        cursor = wh.cursor()
+        if outcome is None:
+            cursor.execute(
+                "INSERT INTO meta.pipeline_state (run_id, source_id, tenant_id, run_mode, started_at, status) "
+                "VALUES (%s, %s, %s, %s, NOW(), %s)",
+                (str(run_id), self.source.source_id, self.source.tenant_id, mode, status),
             )
-
-        total_rows = 0
-        query, params = self._build_source_query(spec, effective_watermark)
-
-        cursor = source_conn.cursor()
-        cursor.execute(query, params)
-        while True:
-            batch = cursor.fetchmany(self.config.extract_batch_size)
-            if not batch:
-                break
-            total_rows += len(batch)
-            cursor_col_index = spec.columns.index(spec.cursor_column)
-            latest_watermark = max(row[cursor_col_index] for row in batch)
-            self._upsert_rows(warehouse_conn, spec, batch)
-            watermark_manager.update(spec.source_table, spec.cursor_column, latest_watermark)
-            logger.info(
-                "Loaded batch for '%s': batch_size=%s latest_watermark=%s.",
-                spec.source_table,
-                len(batch),
-                latest_watermark.isoformat() if latest_watermark else None,
+        else:
+            d = outcome.as_dict()
+            cursor.execute(
+                "UPDATE meta.pipeline_state SET completed_at = NOW(), status = %s, rows_extracted = %s, "
+                "rows_loaded = %s, error_message = %s WHERE run_id = %s",
+                (status, d["rows_read"], d["rows_applied"], outcome.error, str(run_id)),
             )
+        wh.commit()
 
-        return total_rows
 
-    def _build_source_query(self, spec: TableSpec, watermark: datetime | None) -> tuple[str, tuple]:
-        cursor_epoch = "TIMESTAMP '1970-01-01 00:00:00+00'"
-        select_columns = []
-        for col in spec.columns:
-            quoted = _quote_identifier(col)
-            if col == spec.cursor_column:
-                select_columns.append(f"COALESCE({quoted}, {cursor_epoch}) AS {quoted}")
-            else:
-                select_columns.append(quoted)
-        columns_sql = ", ".join(select_columns)
-        schema = _quote_identifier(self.config.source.schema)
-        table = _quote_identifier(spec.source_table)
-        cursor = _quote_identifier(spec.cursor_column)
-        pk = _quote_identifier(spec.primary_key)
 
-        base = f"SELECT {columns_sql} FROM {schema}.{table}"
-        order = f"ORDER BY {cursor}, {pk}"
 
-        if watermark is None:
-            return f"{base} {order}", ()
+def ensure_env_source(conn, boot: EnvSourceBootstrap, settings: ExtractSettings, contract: Contract) -> SourceRecord:
+    registry = SourceRegistry(conn)
+    try:
+        existing = registry.get(boot.source_id)
+        lifecycle, generation, labels = existing.lifecycle_state, existing.capture_generation, existing.labels
+    except Exception:  # noqa: BLE001
+        conn.rollback()
+        lifecycle, generation, labels = "ACTIVE", 0, {}
+    record = SourceRecord(
+        source_id=boot.source_id,
+        tenant_id=boot.tenant_id,
+        display_name=f"{boot.dbname}@{boot.host}",
+        db_host=boot.host,
+        db_port=boot.port,
+        db_name=boot.dbname,
+        db_user=boot.user,
+        compat_schema=boot.compat_schema,
+        secret_ref=boot.secret_ref,
+        lifecycle_state=lifecycle,
+        capture_generation=generation,
+        cob_job_name=boot.cob_job_name,
+        labels={**labels, "sslmode": boot.ssl_mode},
+    )
+    registry.upsert([record])
+    repo = OwnershipRepository(conn)
+    repo.ensure_rows(boot.source_id, contract.table_names)
+    conn.commit()
+    if settings.default_engine != "NONE":
+        unowned = [o.table_name for o in repo.list(source_id=boot.source_id) if o.engine is Engine.NONE]
+        conn.commit()
+        if unowned:
+            repo.apply(
+                boot.source_id,
+                unowned,
+                TransitionRequest(
+                    Action.ASSIGN,
+                    "bootstrap",
+                    "initial engine from INGESTION_ENGINE_DEFAULT",
+                    engine=Engine(settings.default_engine),
+                ),
+            )
+    return registry.get(boot.source_id)
 
-        return f"{base} WHERE {cursor} >= %s {order}", (watermark,)
 
-    _POSTGRES_MAX_BIND_PARAMETERS = 65535
+def run_sources(
+    mode: str,
+    source_ids: list[str] | None = None,
+    shard: tuple[int, int] | None = None,
+    tables: set[str] | None = None,
+    settings: ExtractSettings | None = None,
+) -> list[dict]:
+    settings = settings or ExtractSettings.from_env()
+    contract = load_contract()
+    wh_cfg = warehouse_config()
+    conn = connect(wh_cfg)
+    try:
+        boot = EnvSourceBootstrap.from_env()
+        if boot and (not source_ids or boot.source_id in source_ids) and (shard is None or shard[0] == 0):
+            ensure_env_source(conn, boot, settings, contract)
+        registry = SourceRegistry(conn)
+        if source_ids:
+            sources = [registry.get(s) for s in source_ids]
+        else:
+            sources = registry.list(
+                states=("ACTIVE", "DEGRADED", "PROVISIONING"),
+                shard_index=shard[0] if shard else None,
+                shard_count=shard[1] if shard else None,
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
-    def _upsert_rows(self, warehouse_conn, spec: TableSpec, rows: list[tuple]) -> None:
-        if not rows:
-            return
-
-        raw_columns = ("tenant_id", *spec.columns)
-        insert_columns_sql = ", ".join(_quote_identifier(column) for column in raw_columns)
-        update_columns = [
-            column
-            for column in raw_columns
-            if column not in {"tenant_id", spec.primary_key}
-        ]
-        update_assignments_sql = ", ".join(
-            f"{_quote_identifier(column)} = EXCLUDED.{_quote_identifier(column)}"
-            for column in update_columns
-        )
-
-        raw_table = _quote_identifier(spec.raw_table)
-        pk = _quote_identifier(spec.primary_key)
-
-        max_rows_per_statement = max(1, self._POSTGRES_MAX_BIND_PARAMETERS // len(raw_columns))
-
-        cursor = warehouse_conn.cursor()
-        for offset in range(0, len(rows), max_rows_per_statement):
-            chunk = rows[offset : offset + max_rows_per_statement]
-
-            placeholders = []
-            values = []
-            for row in chunk:
-                row_values = (self.config.tenant_id, *row)
-                ph = "(" + ", ".join("%s" for _ in row_values) + ")"
-                placeholders.append(ph)
-                values.extend(row_values)
-
-            values_sql = ", ".join(placeholders)
-
-            upsert_query = f"""
-                INSERT INTO raw.{raw_table} ({insert_columns_sql})
-                VALUES {values_sql}
-                ON CONFLICT ({_quote_identifier("tenant_id")}, {pk})
-                DO UPDATE SET {update_assignments_sql}
-            """
-
-            cursor.execute(upsert_query, values)
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, settings.parallelism)) as pool:
+        futures = {
+            pool.submit(SourceExtractor(s, wh_cfg, settings, contract, tables).run, mode): s.source_id for s in sources
+        }
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result().as_dict())
+            except Exception as exc:  # noqa: BLE001
+                results.append({"source_id": futures[fut], "mode": mode, "status": "failed", "error": str(exc)})
+    return sorted(results, key=lambda r: r["source_id"])

@@ -19,22 +19,27 @@ import argparse
 import json
 import logging
 import os
+import sys
 
-from extractor.config import AppConfig
-from extractor.extractor import FineractExtractor
+from extractor.extractor import MODES, run_sources
+
+
+def parse_shard(value: str) -> tuple[int, int]:
+    try:
+        index, count = (int(p) for p in value.split("/", 1))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("shard must look like INDEX/COUNT, e.g. 0/8") from exc
+    if count < 1 or not 0 <= index < count:
+        raise argparse.ArgumentTypeError("shard index must be in [0, COUNT)")
+    return index, count
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fineract BI Extractor")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    subparsers.add_parser("backfill", help="Run a full historical backfill")
-    subparsers.add_parser("incremental", help="Run an incremental extraction")
-    subparsers.add_parser(
-        "reconcile",
-        help="Delete raw rows whose primary key no longer exists in the source "
-        "(upsert-only extraction never propagates source deletes on its own)",
-    )
+    parser = argparse.ArgumentParser(description="Fineract BI Python ingestion engine")
+    parser.add_argument("command", choices=MODES, help="backfill | incremental | reconcile (delete detection)")
+    parser.add_argument("--source-id", action="append", dest="source_ids", help="Limit to source(s); repeatable")
+    parser.add_argument("--shard", type=parse_shard, help="Process only registry shard INDEX/COUNT")
+    parser.add_argument("--table", action="append", dest="tables", help="Limit to table(s); repeatable")
     return parser
 
 
@@ -45,17 +50,18 @@ def configure_logging() -> None:
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     configure_logging()
-    parser = build_parser()
-    args = parser.parse_args()
-
-    config = AppConfig.from_env()
-    extractor = FineractExtractor(config)
-
-    result = extractor.run(mode=args.command)
-    print(json.dumps(result, indent=2, default=str))
+    args = build_parser().parse_args(argv)
+    results = run_sources(
+        args.command,
+        source_ids=args.source_ids,
+        shard=args.shard,
+        tables=set(args.tables) if args.tables else None,
+    )
+    print(json.dumps(results, indent=2, default=str))
+    return 1 if any(r["status"] == "failed" for r in results) else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

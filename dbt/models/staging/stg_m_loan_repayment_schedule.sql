@@ -15,9 +15,11 @@
 
 with source as (
     select * from {{ source('raw', 'raw_m_loan_repayment_schedule') }}
+    where not _is_deleted
 )
 
 select
+    source_id,
     tenant_id,
     id as loan_repayment_schedule_id,
     loan_id,

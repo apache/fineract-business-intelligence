@@ -15,9 +15,12 @@
 
 {% set username = (current_username() or '') | replace("'", "''") %}
 select *
-from analytics.mart_repayment_behavior
-where reporting_date = (
-    select max(reporting_date) from analytics.mart_repayment_behavior
+from analytics.mart_repayment_behavior m
+where (m.source_id, m.reporting_date) in (
+    select source_id, max(reporting_date)
+    from analytics.mart_repayment_behavior
+    where reporting_date <= current_date
+    group by source_id
 )
 and (
     '{{ username }}' != ''
@@ -28,11 +31,12 @@ and (
             where uom.username = '{{ username }}'
               and uom.role_name = 'ADMIN'
         )
-        or office_id in (
-            select office_id
-            from meta.user_office_mapping
-            where username = '{{ username }}'
-              and office_id is not null
+        or exists (
+            select 1
+            from meta.v_user_access_scope scope
+            where scope.username = '{{ username }}'
+              and scope.source_id = m.source_id
+              and (scope.office_id is null or scope.office_id = m.office_id)
         )
     )
 )

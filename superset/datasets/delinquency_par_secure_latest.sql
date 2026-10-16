@@ -15,21 +15,17 @@
 
 {% set username = (current_username() or '') | replace("'", "''") %}
 select *
-from analytics.mart_delinquency_par
-where snapshot_date = (
-    select coalesce(
-        (
-            select max(snapshot_date)
-            from analytics.mart_delinquency_par
-            where snapshot_date in (
-                select snapshot_date
-                from analytics.mart_delinquency_par
-                group by snapshot_date
-                having sum(par_30_amount) > 0
-            )
-        ),
-        (select max(snapshot_date) from analytics.mart_delinquency_par)
-    )
+from analytics.mart_delinquency_par m
+where (m.source_id, m.snapshot_date) in (
+    select
+        d.source_id,
+        coalesce(max(d.snapshot_date) filter (where d.has_par), max(d.snapshot_date))
+    from (
+        select source_id, snapshot_date, sum(par_30_amount) > 0 as has_par
+        from analytics.mart_delinquency_par
+        group by source_id, snapshot_date
+    ) d
+    group by d.source_id
 )
 and (
     '{{ username }}' != ''
@@ -40,11 +36,12 @@ and (
             where uom.username = '{{ username }}'
               and uom.role_name = 'ADMIN'
         )
-        or office_id in (
-            select office_id
-            from meta.user_office_mapping
-            where username = '{{ username }}'
-              and office_id is not null
+        or exists (
+            select 1
+            from meta.v_user_access_scope scope
+            where scope.username = '{{ username }}'
+              and scope.source_id = m.source_id
+              and (scope.office_id is null or scope.office_id = m.office_id)
         )
     )
 )

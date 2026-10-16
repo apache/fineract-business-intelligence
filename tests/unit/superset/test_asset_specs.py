@@ -18,6 +18,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 SUPERSET_DIR = Path(__file__).resolve().parent.parent.parent.parent / "docker" / "superset"
 
 if str(SUPERSET_DIR) not in sys.path:
@@ -92,3 +94,10 @@ def test_delinquency_metrics_reference_declared_columns():
 def test_delinquency_metrics_guard_against_division_by_zero():
     for metric in DELINQUENCY_METRICS:
         assert "NULLIF" in metric["expression"]
+
+
+@pytest.mark.parametrize("columns", [DELINQUENCY_COLUMNS, PORTFOLIO_COLUMNS, REPAYMENT_COLUMNS])
+def test_every_dataset_exposes_the_source_identity(columns):
+    names = [col["name"] for col in columns]
+    assert "source_id" in names and "tenant_id" in names
+    assert names.index("source_id") < names.index("office_id")

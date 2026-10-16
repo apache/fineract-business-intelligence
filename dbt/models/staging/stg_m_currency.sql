@@ -15,9 +15,12 @@
 
 with source as (
     select * from {{ source('raw', 'raw_m_currency') }}
+    where not _is_deleted
 )
 
 select
+    source_id,
+    tenant_id,
     id as currency_id,
     code as currency_code,
     name as currency_name,

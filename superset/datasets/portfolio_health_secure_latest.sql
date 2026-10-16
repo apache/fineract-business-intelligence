@@ -15,9 +15,11 @@
 
 {% set username = (current_username() or '') | replace("'", "''") %}
 select *
-from analytics.mart_portfolio_health
-where snapshot_date = (
-    select max(snapshot_date) from analytics.mart_portfolio_health
+from analytics.mart_portfolio_health m
+where (m.source_id, m.snapshot_date) in (
+    select source_id, max(snapshot_date)
+    from analytics.mart_portfolio_health
+    group by source_id
 )
 and (
     '{{ username }}' != ''
@@ -28,11 +30,12 @@ and (
             where uom.username = '{{ username }}'
               and uom.role_name = 'ADMIN'
         )
-        or office_id in (
-            select office_id
-            from meta.user_office_mapping
-            where username = '{{ username }}'
-              and office_id is not null
+        or exists (
+            select 1
+            from meta.v_user_access_scope scope
+            where scope.username = '{{ username }}'
+              and scope.source_id = m.source_id
+              and (scope.office_id is null or scope.office_id = m.office_id)
         )
     )
 )

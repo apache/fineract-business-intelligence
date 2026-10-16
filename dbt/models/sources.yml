@@ -21,10 +21,13 @@ sources:
   - name: raw
     schema: raw
     description: >
-      Raw tables loaded by the Fineract extractor from the operational
-      Apache Fineract database.  One row per source record; no
-      transformations applied beyond column-name normalisation.
-    loaded_at_field: source_loaded_at
+      Source-qualified current-state copies of Fineract tables, written by
+      either ingestion engine (Python extractor or Kafka/Debezium CDC sink)
+      through meta.apply_staged_batch().  Primary key is
+      (source_id, tenant_id, <pk>); deletes are soft (_is_deleted) so the
+      CDC ordering guard can reject late events.  Generated from
+      contracts/fineract_tables.json.
+    loaded_at_field: _ingested_at
     freshness:
       warn_after: {count: 24, period: hour}
       error_after: {count: 72, period: hour}
@@ -55,7 +58,7 @@ sources:
 
       - name: raw_m_loan
         description: >
-          Core loan ledger — one row per loan account.  Carries lifecycle
+          Core loan ledger â€” one row per loan account.  Carries lifecycle
           status (loan_status_id), disbursement details, and all
           pre-computed derived balance columns updated by Fineract batch
           jobs.
@@ -69,7 +72,7 @@ sources:
 
       - name: raw_m_loan_repayment_schedule
         description: >
-          Contractual repayment schedule for each loan — one row per
+          Contractual repayment schedule for each loan â€” one row per
           installment.  Stores the principal, interest, fee, and penalty
           amounts due on each duedate alongside the corresponding
           completed_derived, waived, and paid_in_advance / paid_late
@@ -79,7 +82,7 @@ sources:
 
       - name: raw_m_delinquency_range
         description: >
-          Configurable delinquency age bands (e.g. 1–29 days, 30–59 days)
+          Configurable delinquency age bands (e.g. 1â€“29 days, 30â€“59 days)
           that classify overdue loans.  min_age_days and max_age_days define
           the inclusive day range for the band.
 
@@ -105,3 +108,19 @@ sources:
           Spring Batch job execution log produced by Fineract's scheduled
           batch processor.  Used to monitor pipeline health and detect
           missed or failed batch runs.
+
+      - name: raw_batch_job_instance
+        description: >
+          Spring Batch job instances; supplies job_name for executions
+          (CDC captures base tables, so the join happens in staging).
+
+  - name: meta
+    schema: meta
+    description: Ingestion platform state (change log, cursors) used for incremental builds.
+    tables:
+      - name: entity_change_log
+        description: Business entities touched by each applied batch (loan, client, global, source).
+      - name: source_registry
+        description: Registered source databases and their lifecycle state.
+      - name: dbt_change_cursor
+        description: Last change_id fully processed by a successful dbt run.

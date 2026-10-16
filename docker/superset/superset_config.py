@@ -32,6 +32,21 @@ FEATURE_FLAGS = {
     "ENABLE_TEMPLATE_PROCESSING": True,
 }
 
-ROW_LIMIT = 5000
+ROW_LIMIT = int(os.getenv("SUPERSET_ROW_LIMIT", "5000"))
+
+_CACHE_TIMEOUT = int(os.getenv("SUPERSET_CACHE_DEFAULT_TIMEOUT", "300"))
+_REDIS_URL = os.getenv("SUPERSET_CACHE_REDIS_URL", "")
+if _REDIS_URL:
+    _cache = {
+        "CACHE_TYPE": "RedisCache",
+        "CACHE_DEFAULT_TIMEOUT": _CACHE_TIMEOUT,
+        "CACHE_REDIS_URL": _REDIS_URL,
+    }
+else:
+    _cache = {"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": _CACHE_TIMEOUT}
+CACHE_CONFIG = {**_cache, "CACHE_KEY_PREFIX": "fbi_cache_"}
+DATA_CACHE_CONFIG = {**_cache, "CACHE_KEY_PREFIX": "fbi_data_"}
+FILTER_STATE_CACHE_CONFIG = {**_cache, "CACHE_KEY_PREFIX": "fbi_filter_"}
+EXPLORE_FORM_DATA_CACHE_CONFIG = {**_cache, "CACHE_KEY_PREFIX": "fbi_explore_"}
 SUPERSET_WEBSERVER_ADDRESS = "0.0.0.0"
 SUPERSET_WEBSERVER_PORT = 8088

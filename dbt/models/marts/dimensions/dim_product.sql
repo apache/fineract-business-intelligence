@@ -14,6 +14,7 @@
 -- limitations under the License.
 
 select
+    source_id,
     tenant_id,
     product_id,
     short_name,

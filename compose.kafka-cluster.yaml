@@ -1,0 +1,95 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+
+x-broker: &broker
+  image: apache/kafka:4.1.1
+  profiles: ["cdc"]
+  mem_limit: ${KAFKA_MEM_LIMIT:-2g}
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 20s
+
+x-broker-env: &broker-env
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093,2@kafka-2:9093,3@kafka-3:9093
+  KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: "false"
+  KAFKA_NUM_NETWORK_THREADS: ${KAFKA_NUM_NETWORK_THREADS:-8}
+  KAFKA_NUM_IO_THREADS: ${KAFKA_NUM_IO_THREADS:-16}
+  KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-72}
+  KAFKA_HEAP_OPTS: "-Xms${KAFKA_HEAP:-1g} -Xmx${KAFKA_HEAP:-1g}"
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  CLUSTER_ID: ${KAFKA_CLUSTER_ID:-4L6g3nShT-eMCtK--X86sw}
+
+services:
+  kafka:
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+    ports: !reset []
+
+  kafka-2:
+    <<: *broker
+    hostname: kafka-2
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+    volumes:
+      - kafka_data_2:/var/lib/kafka/data
+
+  kafka-3:
+    <<: *broker
+    hostname: kafka-3
+    environment:
+      <<: *broker-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+    volumes:
+      - kafka_data_3:/var/lib/kafka/data
+
+  kafka-init:
+    environment:
+      SINK_BOOTSTRAP_SERVERS: kafka:9092,kafka-2:9092,kafka-3:9092
+      TOPIC_REPLICATION_FACTOR: 3
+      TOPIC_MIN_INSYNC_REPLICAS: 2
+    depends_on:
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+
+  connect:
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092,kafka-2:9092,kafka-3:9092
+    ports: !reset []
+
+  sink:
+    environment:
+      SINK_BOOTSTRAP_SERVERS: kafka:9092,kafka-2:9092,kafka-3:9092
+
+volumes:
+  kafka_data_2:
+  kafka_data_3:

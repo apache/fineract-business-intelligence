@@ -15,6 +15,7 @@
 
 select
     client_hash,
+    source_id,
     tenant_id,
     office_id,
     status_enum,

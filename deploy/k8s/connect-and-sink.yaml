@@ -1,0 +1,124 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: fbi-connect-west
+  annotations:
+    strimzi.io/use-connector-resources: "false"
+spec:
+  version: 4.1.1
+  replicas: 6
+  bootstrapServers: fbi-region-west-kafka-bootstrap:9093
+  tls:
+    trustedCertificates:
+      - secretName: fbi-region-west-cluster-ca-cert
+        pattern: "*.crt"
+  authentication:
+    type: scram-sha-512
+    username: fbi-connect
+    passwordSecret: {secretName: fbi-connect, password: password}
+  config:
+    group.id: fbi-connect-west
+    config.storage.topic: fbi_connect_west_configs
+    offset.storage.topic: fbi_connect_west_offsets
+    status.storage.topic: fbi_connect_west_status
+    config.storage.replication.factor: 3
+    offset.storage.replication.factor: 3
+    status.storage.replication.factor: 3
+    topic.creation.enable: false
+    connector.client.config.override.policy: All
+    config.providers: env,file
+    config.providers.env.class: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+    config.providers.file.class: org.apache.kafka.common.config.provider.FileConfigProvider
+  externalConfiguration:
+    env:
+      - name: FINERACT_CDC_PASSWORD
+        valueFrom: {secretKeyRef: {name: fineract-cdc-credentials, key: password}}
+  resources:
+    requests: {cpu: "2", memory: 4Gi}
+    limits: {cpu: "4", memory: 8Gi}
+  build:
+    output:
+      type: docker
+      image: registry.example.internal/fbi/connect-debezium:3.4
+    plugins:
+      - name: debezium-postgres
+        artifacts:
+          - type: maven
+            group: io.debezium
+            artifact: debezium-connector-postgres
+            version: 3.4.0.Final
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fbi-warehouse-sink
+spec:
+  replicas: 4
+  selector:
+    matchLabels: {app: fbi-warehouse-sink}
+  template:
+    metadata:
+      labels: {app: fbi-warehouse-sink}
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: sink
+          image: registry.example.internal/fbi/ingestion:1.0.0
+          args: ["run"]
+          ports: [{containerPort: 9404, name: metrics}]
+          env:
+            - {name: SINK_BOOTSTRAP_SERVERS, value: "fbi-region-west-kafka-bootstrap:9093"}
+            - {name: SINK_THREADS, value: "4"}
+            - {name: SINK_MAX_BATCH_EVENTS, value: "10000"}
+            - {name: SINK_DB_URL, value: "jdbc:postgresql://warehouse-primary:5432/analytics?sslmode=verify-full"}
+            - {name: SINK_DB_USER, value: analytics_loader}
+            - name: SINK_DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: warehouse-loader, key: password}}
+            - {name: SINK_KAFKA_SECURITY_PROTOCOL, value: SASL_SSL}
+            - {name: SINK_KAFKA_SASL_MECHANISM, value: SCRAM-SHA-512}
+            - name: SINK_KAFKA_SASL_JAAS_CONFIG
+              valueFrom: {secretKeyRef: {name: fbi-warehouse-sink-jaas, key: jaas}}
+            - {name: SINK_PRODUCER_SECURITY_PROTOCOL, value: SASL_SSL}
+            - {name: SINK_PRODUCER_SASL_MECHANISM, value: SCRAM-SHA-512}
+            - name: SINK_PRODUCER_SASL_JAAS_CONFIG
+              valueFrom: {secretKeyRef: {name: fbi-warehouse-sink-jaas, key: jaas}}
+          readinessProbe:
+            httpGet: {path: /health, port: 9404}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: 9404}
+            initialDelaySeconds: 60
+            periodSeconds: 20
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {cpu: "4", memory: 3Gi}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fbi-warehouse-sink
+spec:
+  scaleTargetRef:
+    name: fbi-warehouse-sink
+  minReplicaCount: 2
+  maxReplicaCount: 24
+  cooldownPeriod: 600
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: fbi-region-west-kafka-bootstrap:9093
+        consumerGroup: fbi-warehouse-sink
+        lagThreshold: "50000"
+        allowIdleConsumers: "false"

@@ -31,13 +31,29 @@ class FakeCursor:
         self,
         fetchone_results: list | None = None,
         fetchmany_batches: list[list[tuple]] | None = None,
+        fetchall_results: list[list[tuple]] | None = None,
     ) -> None:
         self.executed: list[tuple[str, tuple | None]] = []
+        self.streams: list[str] = []
+        self.rowcount = 1
+        self.description = None
         self._fetchone_results = list(fetchone_results or [])
         self._fetchmany_batches = list(fetchmany_batches or [])
+        self._fetchall_results = list(fetchall_results or [])
 
-    def execute(self, sql: str, params: tuple | None = None) -> None:
+    def execute(self, sql: str, params: tuple | None = None, stream=None) -> None:
         self.executed.append((sql, params))
+        if stream is not None:
+            self.streams.append(stream.read())
+
+    def executemany(self, sql: str, rows) -> None:
+        for row in rows:
+            self.executed.append((sql, tuple(row)))
+
+    def fetchall(self):
+        if not self._fetchall_results:
+            return []
+        return self._fetchall_results.pop(0)
 
     def fetchone(self):
         if not self._fetchone_results:
@@ -90,30 +106,32 @@ def fake_connection(fake_cursor: FakeCursor) -> FakeConnection:
 
 
 @pytest.fixture
-def app_config():
-    from extractor.config import AppConfig, DatabaseConfig
+def source_record():
+    from controlplane.registry import SourceRecord
 
-    return AppConfig(
-        source=DatabaseConfig(
-            host="source-host",
-            port=5432,
-            dbname="fineract_default",
-            user="reader",
-            password="secret",
-            schema="bi_connector_source",
-        ),
-        warehouse=DatabaseConfig(
-            host="warehouse-host",
-            port=5432,
-            dbname="analytics",
-            user="analytics_admin",
-            password="secret",
-            schema="raw",
-        ),
+    return SourceRecord(
+        source_id="branch-001",
         tenant_id="default",
-        replica_lag_threshold_seconds=300,
-        cob_lookback_hours=48,
-        cob_job_name="LOAN_COB",
-        extract_batch_size=1000,
-        extract_lookback_seconds=600,
+        db_host="source-host",
+        db_port=5432,
+        db_name="fineract_default",
+        db_user="reader",
+        secret_ref="env:TEST_SOURCE_PASSWORD",
+        compat_schema="bi_connector_source",
+        lifecycle_state="ACTIVE",
+        capture_generation=3,
     )
+
+
+@pytest.fixture
+def extract_settings():
+    from extractor.config import ExtractSettings
+
+    return ExtractSettings(page_size=2, lookback_seconds=600, cob_lookback_hours=48, writer_id="python-test")
+
+
+@pytest.fixture
+def contract():
+    from controlplane.contract import load_contract
+
+    return load_contract(PROJECT_ROOT / "contracts" / "fineract_tables.json")

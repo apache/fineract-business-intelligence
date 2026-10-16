@@ -43,7 +43,5 @@ def ensure_replica_safe(source_conn: Connection, threshold_seconds: int) -> int:
     check_replica_connectivity(source_conn)
     lag_seconds = fetch_replica_lag_seconds(source_conn)
     if lag_seconds > threshold_seconds:
-        raise RuntimeError(
-            f"Replica lag {lag_seconds}s exceeds configured threshold {threshold_seconds}s."
-        )
+        raise RuntimeError(f"Replica lag {lag_seconds}s exceeds configured threshold {threshold_seconds}s.")
     return lag_seconds

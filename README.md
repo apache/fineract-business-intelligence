@@ -118,6 +118,47 @@ Governance and access, enforced at every layer above: least-privilege database u
 
 ---
 
+## Scalable ingestion: Python or Kafka CDC
+
+The platform ingests from any number of Fineract databases through **either** of two engines,
+chosen per source and table:
+
+| Engine | When to use | Needs |
+|---|---|---|
+| **Python** (`extractor/`) | small/medium deployments, minutes-to-hourly freshness | PostgreSQL only |
+| **Kafka CDC** (Debezium + Java sink, `ingestion/`) | large banks, sub-minute freshness, millions to billions of rows | Kafka, Kafka Connect |
+
+Both write through the same fenced warehouse function, so they produce identical raw rows, and
+switching a source between them is an audited, reversible migration: start a shadow, reconcile,
+then a second person approves the cutover. The **Airflow** control plane runs onboarding,
+connector reconciliation, Python ingestion, dbt and the engine-switch workflow. Setup guide:
+[`docs/getting-started.md`](docs/getting-started.md), PowerShell walkthrough:
+[`docs/walkthrough-powershell.md`](docs/walkthrough-powershell.md), load testing: [`loadtest/README.md`](loadtest/README.md).
+
+```bash
+# Python only (no Kafka)
+docker compose --profile python up -d warehouse dbt superset extractor
+
+# Kafka CDC data plane and the Airflow control plane
+docker compose --profile cdc up -d
+docker compose --profile airflow up -d          # UI: http://localhost:8080 (admin / AIRFLOW_ADMIN_PASSWORD)
+
+# Switch a source to CDC (or use the fbi_ingestion_feature_flag DAG)
+python -m controlplane.cli ownership-apply --source-id default --action start_shadow --engine KAFKA --reason "migrate"
+python -m controlplane.cli cutover-gate   --source-id default --settle-seconds 900
+python -m controlplane.cli --actor alice ownership-apply --source-id default --action cutover     --approved-by bob --reason "go live"
+```
+
+Scaling is configuration: `SINK_REPLICAS`/`SINK_THREADS`, `CONNECT_REPLICAS`, per-table topic
+partitions (`TOPIC_PARTITION_SCALE`), `compose.kafka-cluster.yaml` for a 3-broker cluster, and
+`deploy/k8s/` (Strimzi + KEDA) for Kubernetes. All options are listed in `.env.example`.
+
+> **Upgrading an existing installation:** the warehouse now runs PostgreSQL 18 on a new volume
+> (`warehouse_data_pg18`) with a source-qualified raw schema. The old PostgreSQL 16 volume is left
+> untouched; run a Python backfill (`python -m extractor.cli backfill`) and `dbt build` to repopulate.
+
+---
+
 ## Prerequisites
 
 | Tool | Minimum Version | Notes |

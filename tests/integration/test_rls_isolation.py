@@ -142,3 +142,64 @@ def test_username_with_embedded_quote_does_not_break_out_of_the_predicate(conn, 
     _, rows = _run(conn, dataset_file, malicious_username)
 
     assert len(rows) == 0
+
+
+OTHER_SOURCE = "it-other-bank"
+MART_FOR_DATASET = {
+    "delinquency_par": ("analytics.mart_delinquency_par", "snapshot_date"),
+    "portfolio_health": ("analytics.mart_portfolio_health", "snapshot_date"),
+    "repayment_behavior": ("analytics.mart_repayment_behavior", "reporting_date"),
+}
+
+
+def _admin():
+    return pg8000.native.Connection(
+        host=os.getenv("WAREHOUSE_DB_HOST", "localhost"),
+        port=int(os.getenv("WAREHOUSE_DB_PORT", "5434")),
+        database=os.getenv("WAREHOUSE_DB_NAME", "analytics"),
+        user=os.getenv("WAREHOUSE_ADMIN_USER", "analytics_admin"),
+        password=os.getenv("WAREHOUSE_ADMIN_PASSWORD", "analytics_admin_dev_only"),
+    )
+
+
+@pytest.fixture(scope="module")
+def second_bank():
+    admin = _admin()
+    admin.run("INSERT INTO meta.source_registry (source_id, tenant_id, region, lifecycle_state) "
+              "VALUES (:s, 'other-tenant', 'it-region-west', 'ACTIVE') ON CONFLICT (source_id) DO NOTHING",
+              s=OTHER_SOURCE)
+    for table, _ in MART_FOR_DATASET.values():
+        admin.run(f"CREATE TEMP TABLE clone AS SELECT * FROM {table} WHERE source_id = 'default'")
+        admin.run("UPDATE clone SET source_id = :s, tenant_id = 'other-tenant'", s=OTHER_SOURCE)
+        admin.run(f"INSERT INTO {table} SELECT * FROM clone")
+        admin.run("DROP TABLE clone")
+    admin.run("INSERT INTO meta.user_office_mapping (username, role_name, region) "
+              "VALUES ('west_region', 'REGION_MANAGER', 'it-region-west') ON CONFLICT DO NOTHING")
+    yield OTHER_SOURCE
+    for table, _ in MART_FOR_DATASET.values():
+        admin.run(f"DELETE FROM {table} WHERE source_id = :s", s=OTHER_SOURCE)
+    admin.run("DELETE FROM meta.user_office_mapping WHERE username = 'west_region'")
+    admin.run("DELETE FROM meta.source_registry WHERE source_id = :s", s=OTHER_SOURCE)
+    admin.close()
+
+
+@pytest.mark.parametrize("dataset_file", DATASET_FILES)
+def test_same_office_id_in_another_bank_never_leaks(conn, second_bank, dataset_file):
+    columns, rows = _run(conn, dataset_file, "north_manager")
+    sources = {row[columns.index("source_id")] for row in rows}
+    assert second_bank not in sources
+    assert sources <= {"default"}
+
+
+@pytest.mark.parametrize("dataset_file", DATASET_FILES_WITH_GUARANTEED_MULTI_OFFICE_DATA)
+def test_region_scope_sees_only_its_region(conn, second_bank, dataset_file):
+    columns, rows = _run(conn, dataset_file, "west_region")
+    sources = {row[columns.index("source_id")] for row in rows}
+    assert sources == {second_bank}
+
+
+@pytest.mark.parametrize("dataset_file", DATASET_FILES_WITH_GUARANTEED_MULTI_OFFICE_DATA)
+def test_admin_sees_every_bank(conn, second_bank, dataset_file):
+    columns, rows = _run(conn, dataset_file, "admin")
+    sources = {row[columns.index("source_id")] for row in rows}
+    assert {"default", second_bank} <= sources

@@ -214,7 +214,7 @@ This document covers the **fineract-business-intelligence data pipeline and BI l
 
 ### Concurrency and state
 
-- The watermark manager (`meta.watermarks`) serialises extraction windows per tenant and
+- The watermark manager (`meta.extract_watermarks`) serialises extraction windows per tenant and
   source table. Concurrent extractor runs for the same tenant would cause undefined
   watermark state. The pipeline is designed for one run at a time per tenant.
 
@@ -296,7 +296,7 @@ This document covers the **fineract-business-intelligence data pipeline and BI l
 - **Replica lag check** — aborts extraction if the source replica is too far behind the
   primary, preventing stale data from entering the warehouse silently.
 - **Watermark-based incremental extraction** — extraction windows are bounded by
-  `last_modified_on_utc` cursors stored in `meta.watermarks`, preventing unbounded
+  `last_modified_on_utc` cursors stored in `meta.extract_watermarks`, preventing unbounded
   full-table scans after initial backfill.
 - **Pinned GitHub Actions** — all workflow action references are pinned to full commit
   SHAs to prevent supply-chain attacks via mutable version tags.
@@ -416,7 +416,7 @@ This document covers the **fineract-business-intelligence data pipeline and BI l
    is not restricted by role.
 
 6. **Running multiple extractor instances for the same tenant simultaneously.** The
-   watermark manager uses per-table, per-tenant rows in `meta.watermarks` but does not
+   watermark manager uses per-table, per-tenant rows in `meta.extract_watermarks` but does not
    hold a distributed lock. Concurrent runs will produce undefined watermark state and
    may load duplicate or missing rows.
 

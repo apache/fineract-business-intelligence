@@ -15,13 +15,20 @@
 
 select
     'mart_delinquency_par' as model_name,
+    p.source_id,
     p.office_id,
     p.product_id
 from {{ ref('mart_delinquency_par') }} p
 left join {{ ref('dim_office') }} o
-    on p.office_id = o.office_id
+    on
+        p.source_id = o.source_id
+        and p.tenant_id = o.tenant_id
+        and p.office_id = o.office_id
 left join {{ ref('dim_product') }} pr
-    on p.product_id = pr.product_id
+    on
+        p.source_id = pr.source_id
+        and p.tenant_id = pr.tenant_id
+        and p.product_id = pr.product_id
 where
     o.office_id is null
     or pr.product_id is null
@@ -30,13 +37,20 @@ union all
 
 select
     'mart_repayment_behavior' as model_name,
+    r.source_id,
     r.office_id,
     r.product_id
 from {{ ref('mart_repayment_behavior') }} r
 left join {{ ref('dim_office') }} o
-    on r.office_id = o.office_id
+    on
+        r.source_id = o.source_id
+        and r.tenant_id = o.tenant_id
+        and r.office_id = o.office_id
 left join {{ ref('dim_product') }} pr
-    on r.product_id = pr.product_id
+    on
+        r.source_id = pr.source_id
+        and r.tenant_id = pr.tenant_id
+        and r.product_id = pr.product_id
 where
     o.office_id is null
     or pr.product_id is null

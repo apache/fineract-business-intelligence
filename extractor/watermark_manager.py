@@ -13,59 +13,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
-from pg8000.dbapi import Connection
+
+@dataclass(frozen=True)
+class Watermark:
+    cursor_value: datetime | None
+    last_pk: int | None
 
 
 class WatermarkManager:
-    def __init__(self, warehouse_conn: Connection, tenant_id: str) -> None:
+    def __init__(self, warehouse_conn, source_id: str) -> None:
         self._conn = warehouse_conn
-        self._tenant_id = tenant_id
+        self._source_id = source_id
 
-    def get(self, table_name: str) -> datetime | None:
+    def get(self, table_name: str, target: str) -> Watermark | None:
         cursor = self._conn.cursor()
         cursor.execute(
-            """
-            SELECT last_cursor_value
-            FROM meta.watermarks
-            WHERE tenant_id = %s
-              AND table_name = %s
-            """,
-            (self._tenant_id, table_name),
+            "SELECT cursor_value, last_pk FROM meta.extract_watermarks "
+            "WHERE source_id = %s AND table_name = %s AND target = %s",
+            (self._source_id, table_name, target),
         )
         row = cursor.fetchone()
-        return row[0] if row else None
+        return Watermark(row[0], row[1]) if row else None
 
-    def update(self, table_name: str, cursor_column: str, last_cursor_value: datetime | None) -> None:
+    def update(self, table_name: str, target: str, cursor_value: datetime | None, last_pk: int | None) -> None:
         cursor = self._conn.cursor()
         cursor.execute(
-            """
-            INSERT INTO meta.watermarks (
-                tenant_id,
-                table_name,
-                cursor_column,
-                last_cursor_value,
-                updated_at
-            )
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (tenant_id, table_name)
-            DO UPDATE SET
-                cursor_column = EXCLUDED.cursor_column,
-                last_cursor_value = EXCLUDED.last_cursor_value,
-                updated_at = NOW()
-            """,
-            (self._tenant_id, table_name, cursor_column, last_cursor_value),
+            "INSERT INTO meta.extract_watermarks (source_id, table_name, target, cursor_value, last_pk, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, NOW()) "
+            "ON CONFLICT (source_id, table_name, target) DO UPDATE "
+            "SET cursor_value = EXCLUDED.cursor_value, last_pk = EXCLUDED.last_pk, updated_at = NOW()",
+            (self._source_id, table_name, target, cursor_value, last_pk),
         )
 
-    def reset_all(self) -> None:
+    def reset(self, table_name: str, target: str) -> None:
         cursor = self._conn.cursor()
         cursor.execute(
-            """
-            DELETE FROM meta.watermarks
-            WHERE tenant_id = %s
-            """,
-            (self._tenant_id,),
+            "DELETE FROM meta.extract_watermarks WHERE source_id = %s AND table_name = %s AND target = %s",
+            (self._source_id, table_name, target),
         )
