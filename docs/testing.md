@@ -29,11 +29,13 @@ All commands target the repository root unless stated otherwise. Run them in a s
 
 | Check | Command | Needs stack? |
 |---|---|---|
-| Python unit tests — extractor | `pytest tests/unit/extractor -v` | No |
+| Python unit tests — extractor and control plane | `pytest tests/unit -v` | No |
 | Python unit tests — superset | `pytest tests/unit/superset -v` | No |
 | dbt model parse | `cd dbt && dbt deps && dbt parse --profiles-dir . --target local` | No |
 | dbt schema/data tests | `docker compose exec dbt dbt test` | Yes |
-| Integration tests (RLS) | `pytest tests/integration -v` | Yes |
+| Integration tests (write path, feature flag, fencing, RLS) | `pytest tests/integration -v` | Yes (warehouse) |
+| Java tests (including Kafka + PostgreSQL container tests) and ASF license gate | `mvn -f ingestion/pom.xml verify` | Docker for the container tests (skipped without it) |
+| Airflow DAG integrity | see section 9 | No (runs in the Airflow image) |
 | Python linter | `ruff check .` | No |
 | SQL linter | `sqlfluff lint dbt/models dbt/tests --exclude-rules structure.column_order,structure.join_condition_order,references.qualification` | No |
 | Shell linter | see full command below | No |
@@ -187,7 +189,10 @@ shellcheck --severity=warning \
   scripts/run_extractor_incremental.sh \
   scripts/run_pipeline.sh \
   scripts/stop_fineract_backend.sh \
-  scripts/verify_extraction.sh
+  scripts/verify_extraction.sh \
+  scripts/bootstrap_cdc_sources.sh \
+  loadtest/run_stages.sh \
+  loadtest/verify_incremental_equivalence.sh
 ```
 
 Install ShellCheck if needed:
@@ -281,3 +286,26 @@ bash scripts/verify_extraction.sh
 ```
 
 This script checks service health, confirms all five warehouse schemas exist, prints row counts for every raw table, and verifies at least one successful pipeline run is recorded in `meta.pipeline_state`.
+
+---
+
+## 9. Kafka CDC, Control Plane and Load Tests
+
+These suites cover the CDC engine, the control plane and the Airflow DAGs. The full CDC walkthrough is in [cdc-ingestion.md](cdc-ingestion.md).
+
+| Suite | Command | Needs |
+|---|---|---|
+| Python unit (state machine, connectors, reconciler with a fake Connect, secrets, contract, Python engine) | `pytest tests/unit -v` | nothing |
+| Integration: write path, fencing, cutover, reconciliation, multi-bank RLS | `pytest tests/integration -v` | running `warehouse` |
+| Java unit tests (parser, converter, sink delivery paths with a mock consumer) and license gate | `mvn -f ingestion/pom.xml verify` | JDK 17, Maven. Tests that need the warehouse (`FBI_TEST_DB_URL`, default `jdbc:postgresql://localhost:5434/analytics`) are skipped when it is unreachable; CI runs them |
+| Airflow DAG integrity | see below | Airflow image |
+| Load and chaos harness | `loadtest/README.md` | `warehouse`, `kafka`, `sink` |
+
+The Airflow DAG tests import `airflow`, which is not installed on the host, so run them inside the Airflow image:
+
+```bash
+docker compose --profile airflow run --rm --no-deps --entrypoint "" -v "$PWD:/repo" airflow-scheduler \
+  bash -c "pip install -q pytest && cd /repo && python -m pytest tests/airflow -q"
+```
+
+The load generator checks that the warehouse ends up **exactly** equal to a ground-truth file, with duplicates, out-of-order versions and deletes injected on purpose. See `loadtest/README.md` for the stages.

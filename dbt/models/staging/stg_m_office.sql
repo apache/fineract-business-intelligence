@@ -15,9 +15,11 @@
 
 with source as (
     select * from {{ source('raw', 'raw_m_office') }}
+    where not _is_deleted
 )
 
 select
+    source_id,
     tenant_id,
     id as office_id,
     parent_id as parent_office_id,

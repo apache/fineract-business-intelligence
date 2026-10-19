@@ -47,7 +47,7 @@ Apache Fineract — PostgreSQL: fineract_default
 ┌────────────────────────────────────────────────────────────────┐
 │ Container: fineract-bi-extractor (Python 3.11)                 │
 │                                                                │
-│ • Watermark-based polling, per-table cursor in meta.watermarks │
+│ • Watermark-based polling, per-table cursor in meta.extract_watermarks │
 │ • Incremental + backfill modes                                 │
 │ • Replica lag check before each extraction run                 │
 │                                                                │
@@ -74,7 +74,7 @@ Apache Fineract — PostgreSQL: fineract_default
                     │
                     ▼
 
-Analytics Warehouse (PostgreSQL 16-alpine)
+Analytics Warehouse (PostgreSQL 18)
 Container: fineract-bi-warehouse · Port: 5434
 ┌────────┬──────────┬──────────────┬───────────┬───────────────────┐
 │ raw    │ staging  │ intermediate │ analytics │ meta              │
@@ -185,7 +185,7 @@ Notes:
  • Thereafter, the pipeline loops every PIPELINE_INTERVAL_SECONDS.
 
 Components: Extractor (Python 3.11) · dbt (dbt-postgres <2.0) ·
-Superset (Apache Superset 4.x) · Analytics Warehouse (PostgreSQL 16)
+Superset (Apache Superset 4.x) · Analytics Warehouse (PostgreSQL 18)
 
 Warehouse schema flow: raw (landing) → staging (cleaned views) →
 intermediate (joins/pivots) → analytics (dims/facts/marts) → meta (metadata)
@@ -210,7 +210,7 @@ The pipeline log prefix is `[pipeline]` with a UTC timestamp:
 
 To avoid full-table scans on every pipeline run, the extractor uses a **watermark table** in the warehouse to track the most recent row seen for each source table.
 
-> This is watermark-based polling, not log-based CDC (e.g. WAL streaming or a Debezium-style connector). The extractor issues a `SELECT ... WHERE last_modified_on_utc > <watermark>` query against `bi_connector_source` on each run — it does not read the Postgres replication log. This is sufficient for Fineract's audit-column update pattern and needs no logical replication setup on the source, but it has one consequence worth knowing: **incremental mode never observes deletes.** A row removed at the source has no `last_modified_on_utc` to poll for, so it lingers in the warehouse until it is caught another way — see "Delete Detection" below.
+> This section describes the **Python engine**. Log-based CDC (Debezium, Kafka and a Java sink) is available as a second engine and is described in [cdc-ingestion.md](cdc-ingestion.md) and section 9 below. The rest of this paragraph applies to the Python engine only: it is watermark-based polling, not log-based CDC. The extractor issues a `SELECT ... WHERE last_modified_on_utc > <watermark>` query against `bi_connector_source` on each run — it does not read the Postgres replication log. This is sufficient for Fineract's audit-column update pattern and needs no logical replication setup on the source, but it has one consequence worth knowing: **incremental mode never observes deletes.** A row removed at the source has no `last_modified_on_utc` to poll for, so it lingers in the warehouse until it is caught another way — see "Delete Detection" below.
 
 ### Delete Detection
 
@@ -226,7 +226,7 @@ Fineract source (bi_connector_source.m_loan)
 │ 12 │  3 000 │ 2026-08-11 10:45:00 UTC │  ← new
 └────┴────────┴─────────────────────────┘
 
-meta.watermarks (in Analytics Warehouse)
+meta.extract_watermarks (in Analytics Warehouse)
 ┌──────────┬──────────────┬───────────────┬─────────────────────────┐
 │ tenant_id│ table_name   │ cursor_column │ last_cursor_value       │
 ├──────────┼──────────────┼───────────────┼─────────────────────────┤
@@ -251,8 +251,8 @@ Extracted rows: ids 11, 12
 |---|---|---|
 | Cursor column | `last_modified_on_utc` (per-table, configured in extractor spec) | `extractor/extractor.py` |
 | Lookback window | `EXTRACT_LOOKBACK_SECONDS` (default: 600 s) | `extractor/config.py` |
-| Upsert conflict key | `(id, tenant_id)` | `extractor/extractor.py` |
-| State table | `meta.watermarks` (tenant_id, table_name → last_cursor_value) | `warehouse/schema/pipeline_state.sql` |
+| Upsert conflict key | `(source_id, tenant_id, id)`, applied through `meta.apply_staged_batch()` | `warehouse/schema/platform.sql` |
+| State table | `meta.extract_watermarks` (source_id, table_name, target → cursor value and last primary key) | `warehouse/schema/platform.sql` |
 | Replica lag guard | Aborts if source replication lag > `REPLICA_LAG_THRESHOLD_SECONDS` (default: 300 s) | `extractor/replica_lag.py` |
 | Delete detection | Not automatic in incremental mode — see "Delete Detection" above | `extractor/cli.py` (`reconcile` mode) |
 
@@ -260,7 +260,7 @@ Extracted rows: ids 11, 12
 
 ## 4. Analytics Warehouse Schema Layers
 
-The warehouse (PostgreSQL 16) is a single database (`analytics`) partitioned into five schemas. Three are managed by dbt, one is the extractor landing zone, and one is the pipeline control plane.
+The warehouse (PostgreSQL 18) is a single database (`analytics`) partitioned into five schemas. Three are managed by dbt, one is the extractor landing zone, and one is the pipeline control plane.
 
 ```
 PostgreSQL database: analytics
@@ -277,7 +277,8 @@ PostgreSQL database: analytics
 │     raw.raw_m_delinquency_bucket
 │     raw.raw_m_delinquency_bucket_mappings
 │     raw.raw_batch_job_execution
-│     Columns added by extractor: tenant_id, source_loaded_at
+│     Columns added by the write path: source_id, tenant_id, _source_lsn, _source_ts,
+     _ingested_at, _ingest_engine, _is_deleted
 │
 ├── schema: raw_views    (managed by extractor — dbt source aliases)
 │     Internal use only: lets dbt declare typed sources over raw tables.
@@ -324,7 +325,7 @@ PostgreSQL database: analytics
 │                                              client_hash)
 │
 └── schema: meta         (managed by warehouse init scripts)
-      meta.watermarks          (per-table extraction cursor state)
+      meta.extract_watermarks  (per-source, per-table extraction cursor state)
       meta.pipeline_state      (run history — status, row counts)
       meta.user_office_mapping (username → office_id + role_name for RLS)
 ```
@@ -412,7 +413,7 @@ meta.user_office_mapping
 
 | Container | Image | Role | Ports |
 |---|---|---|---|
-| `fineract-bi-warehouse` | `postgres:16-alpine` | Analytics PostgreSQL warehouse | host `5434` → container `5432` |
+| `fineract-bi-warehouse` | `postgres:18.3` | Analytics PostgreSQL warehouse | host `5434` → container `5432` |
 | `fineract-bi-extractor` | Custom (Python 3.11) | Watermark extraction controller + loop runner | internal only |
 | `fineract-bi-dbt` | Custom (dbt-postgres <2.0) | SQL transformation model runner (exec target) | internal only |
 | `fineract-bi-superset` | Custom (Apache Superset 4.x) | Dashboard UI + RLS enforcement | host `8088` → container `8088` |
@@ -421,4 +422,43 @@ The extractor container mounts `/var/run/docker.sock` to issue `docker compose e
 
 ---
 
+## 9. Scalable Ingestion: Kafka CDC, Control Plane and Feature Flag
 
+Sections 1 to 3 describe the Python extraction path. The platform has a second ingestion engine that reads each Fineract database's change log instead of polling it. Both engines write through the same warehouse function, so the `raw` rows are identical whichever engine produced them.
+
+```
+ Fineract PostgreSQL databases (DB 1 ... DB N)
+        |                               |
+        | scheduled polling             | change log (WAL)
+        v                               v
+ Python extractor                 Debezium (Kafka Connect, one connector per source)
+        |                               |
+        |                               v
+        |                        Kafka: one topic per table  --> dead-letter topic
+        |                               |
+        |                               v
+        |                        Java sink (batches, offsets saved with the data)
+        v                               v
+   meta.apply_staged_batch()   <- the single write path (fencing, ordering guard,
+        |                         soft deletes, change log)
+        v
+   raw.*   (raw_shadow.* while an engine switch is being verified)
+        |
+        v
+   dbt (only changed loans are recomputed) --> marts --> Superset (RLS by source + office)
+
+ Control plane: Airflow + the controlplane package + meta.* tables
+   (source registry, ownership / feature flag, connector reconciler, audit).
+   It orchestrates; it never carries data.
+```
+
+| Concern | Where |
+|---|---|
+| Which engine owns each source and table (the feature flag) | `meta.ingestion_ownership`, `controlplane/ownership.py` |
+| Single write path, fencing, ordering guard, soft deletes | `meta.apply_staged_batch()` in `warehouse/schema/platform.sql` |
+| Debezium connectors from the registry | `controlplane/connectors.py`, `controlplane/reconciler.py` |
+| Kafka to warehouse writer | `ingestion/ingestion-sink`, `ingestion/ingestion-core` |
+| Orchestration | `airflow/dags/` |
+| Row-level security for many banks | `meta.user_office_mapping`, `meta.v_user_access_scope`, `superset/datasets/` |
+
+For commands, configuration, scaling dials and troubleshooting, see [cdc-ingestion.md](cdc-ingestion.md).

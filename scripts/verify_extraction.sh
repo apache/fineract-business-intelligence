@@ -77,7 +77,7 @@ check "At least one successful pipeline run" \
 
 check "Watermarks are populated" \
   docker compose -f "${COMPOSE_FILE}" exec -T warehouse psql -U "${WAREHOUSE_LOADER_USER}" -d "${WAREHOUSE_DB_NAME}" -tAc \
-    "SELECT 1 FROM meta.watermarks LIMIT 1"
+    "SELECT 1 FROM meta.extract_watermarks LIMIT 1"
 
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="

@@ -14,9 +14,12 @@
 -- limitations under the License.
 
 CREATE DATABASE superset_metadata;
+CREATE DATABASE airflow_metadata;
 
 \connect analytics
-\i /warehouse-schema/raw_tables.sql
-\i /warehouse-schema/pipeline_state.sql
-\i /warehouse-schema/staging_tables.sql
-\i /warehouse-schema/mart_tables.sql
+\i /warehouse-schema/platform.sql
+\i /warehouse-schema/access_control.sql
+
+\set contract `cat /contracts/fineract_tables.json`
+SELECT meta.load_table_contract(:'contract'::jsonb) AS contract_tables_loaded;
+SELECT meta.provision_raw_tables();

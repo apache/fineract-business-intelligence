@@ -14,39 +14,50 @@
 -- limitations under the License.
 
 with latest_snapshot as (
-    select max(snapshot_date) as snapshot_date
+    select
+        source_id,
+        max(snapshot_date) as snapshot_date
     from {{ ref('fact_loan_snapshot') }}
+    group by source_id
 ),
 
 flagged_par_30_loans as (
     select
+        f.source_id,
         f.tenant_id,
         f.loan_id,
         f.snapshot_date
     from {{ ref('fact_loan_snapshot') }} f
     inner join latest_snapshot ls
-        on f.snapshot_date = ls.snapshot_date
+        on
+            f.source_id = ls.source_id
+            and f.snapshot_date = ls.snapshot_date
     where f.is_par_30 = true
 ),
 
 genuinely_overdue_30_plus as (
     select distinct
+        r.source_id,
         r.tenant_id,
         r.loan_id
     from {{ source('raw', 'raw_m_loan_repayment_schedule') }} r
-    inner join latest_snapshot ls on true
+    inner join latest_snapshot ls
+        on r.source_id = ls.source_id
     where
-        r.duedate <= ls.snapshot_date - 30
+        not r._is_deleted
+        and r.duedate <= ls.snapshot_date - 30
         and (r.obligations_met_on_date is null or r.obligations_met_on_date > ls.snapshot_date)
 )
 
 select
+    p.source_id,
     p.tenant_id,
     p.loan_id,
     p.snapshot_date
 from flagged_par_30_loans p
 left join genuinely_overdue_30_plus o
     on
-        p.tenant_id = o.tenant_id
+        p.source_id = o.source_id
+        and p.tenant_id = o.tenant_id
         and p.loan_id = o.loan_id
 where o.loan_id is null

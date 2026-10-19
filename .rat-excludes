@@ -32,3 +32,9 @@ bom.xml
 **/dbt/package-lock.yml
 **/docker/superset/__pycache__/**
 **/superset/dashboards/*.json
+**/dbt/seeds/*.csv
+**/.gitkeep
+**/loadtest/results/**
+**/.pytest_cache/**
+**/.ruff_cache/**
+**/__pycache__/**

@@ -21,7 +21,7 @@ under the License.
 
 The analytics pipeline for [Apache Fineract](https://fineract.apache.org/): the open-source core banking platform for financial inclusion.
 
-This project reads data from an Apache Fineract PostgreSQL database, transforms it through a layered dbt pipeline, and serves interactive dashboards in Apache Superset. It is **downstream and operationally isolated** from Fineract: the only coupling is a read-only credential on the Fineract database. Everything else, the analytics warehouse, dbt transformations, and dashboards runs independently.
+This project reads data from one or many Apache Fineract PostgreSQL databases, transforms it through a layered dbt pipeline, and serves interactive dashboards in Apache Superset. Data can be ingested by a simple scheduled Python extractor or, for large deployments, by real-time Kafka CDC (Debezium), with a feature flag to choose per source. It is **downstream and operationally isolated** from Fineract: the only coupling is a read-only credential on the Fineract database. Everything else, the analytics warehouse, dbt transformations, and dashboards runs independently.
 
 ---
 
@@ -30,6 +30,7 @@ This project reads data from an Apache Fineract PostgreSQL database, transforms 
 | Document | Purpose |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | System topology, data flow, warehouse schemas, security model, design decisions |
+| [docs/cdc-ingestion.md](docs/cdc-ingestion.md) | Kafka CDC ingestion, the Python/Kafka feature flag, the control plane and Airflow: architecture, commands, scaling and troubleshooting |
 | [docs/testing.md](docs/testing.md) | Running tests, linters, and license checks locally |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow, branch/PR conventions, coding standards |
 | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards and reporting |
@@ -40,8 +41,10 @@ This project reads data from an Apache Fineract PostgreSQL database, transforms 
 
 | Component | Directory | Description |
 |---|---|---|
-| **Extractor** | `extractor/` | Python service that pulls changed rows from Fineract using watermark-based incremental extraction |
-| **Analytics Warehouse** | `warehouse/` | PostgreSQL 16 with `raw`, `staging`, `intermediate`, `analytics`, and `meta` schemas |
+| **Python extractor** | `extractor/` | Scheduled extraction using keyset-paginated, watermark-based incremental reads |
+| **CDC ingestion** | `ingestion/`, `compose.yaml` (`cdc` profile) | Debezium, Kafka and a Java sink that stream changes (including deletes) into the warehouse in about a second |
+| **Control plane** | `controlplane/`, `airflow/` | Source registry, the Python/Kafka feature flag, connector reconciler, audit trail, Airflow DAGs |
+| **Analytics Warehouse** | `warehouse/` | PostgreSQL 18 with `raw`, `raw_shadow`, `staging`, `intermediate`, `analytics`, and `meta` schemas |
 | **dbt Transformations** | `dbt/` | Staging views, dimensional models, daily snapshot facts, and presentation marts |
 | **Apache Superset** | `docker/superset/` | Pre-bootstrapped dashboards with office-level row-level security (RLS) |
 | **Pipeline Orchestration** | `scripts/` | Shell scripts that coordinate extraction → dbt build → Superset refresh |
@@ -85,7 +88,7 @@ Extractor (Python)                                              EXTRACTION
                           │
                           ▼
 
-Analytics Warehouse (PostgreSQL 16)                WAREHOUSE & TRANSFORMATION
+Analytics Warehouse (PostgreSQL 18)                WAREHOUSE & TRANSFORMATION
 
   raw ──▶ staging ──▶ intermediate ──▶ analytics (dims, facts, marts)
                    via dbt — Transformation Engine
@@ -115,6 +118,47 @@ Apache Superset :8088                                 BI & VISUALIZATION
 Governance and access, enforced at every layer above: least-privilege database users, row-level security, audit and monitoring, scheduled extracts, and data quality/lineage tracking.
 
 > For full pipeline flow, watermark extraction diagrams, warehouse schema breakdown, and security model detail, see **[docs/architecture.md](docs/architecture.md)**.
+
+---
+
+## Scalable ingestion: Python or Kafka CDC
+
+The platform ingests from any number of Fineract databases through **either** of two engines,
+chosen per source and table:
+
+| Engine | When to use | Needs |
+|---|---|---|
+| **Python** (`extractor/`) | small/medium deployments, minutes-to-hourly freshness | PostgreSQL only |
+| **Kafka CDC** (Debezium + Java sink, `ingestion/`) | large banks, sub-minute freshness, millions to billions of rows | Kafka, Kafka Connect |
+
+Both write through the same fenced warehouse function, so they produce identical raw rows, and
+switching a source between them is an audited, reversible migration: start a shadow, reconcile,
+then a second person approves the cutover. The **Airflow** control plane runs onboarding,
+connector reconciliation, Python ingestion, dbt and the engine-switch workflow. Full guide with
+architecture and commands: [`docs/cdc-ingestion.md`](docs/cdc-ingestion.md). Load testing:
+[`loadtest/README.md`](loadtest/README.md).
+
+```bash
+# Python only (no Kafka)
+docker compose --profile python up -d warehouse dbt superset extractor
+
+# Kafka CDC data plane and the Airflow control plane
+docker compose --profile cdc up -d
+docker compose --profile airflow up -d          # UI: http://localhost:8080 (admin / AIRFLOW_ADMIN_PASSWORD)
+
+# Switch a source to CDC (or use the fbi_ingestion_feature_flag DAG)
+python -m controlplane.cli ownership-apply --source-id default --action start_shadow --engine KAFKA --reason "migrate"
+python -m controlplane.cli cutover-gate   --source-id default --settle-seconds 900
+python -m controlplane.cli --actor alice ownership-apply --source-id default --action cutover     --approved-by bob --reason "go live"
+```
+
+Scaling is configuration: `SINK_REPLICAS`/`SINK_THREADS`, `CONNECT_REPLICAS`, per-table topic
+partitions (`TOPIC_PARTITION_SCALE`), `compose.kafka-cluster.yaml` for a 3-broker cluster, and
+`deploy/k8s/` (Strimzi + KEDA) for Kubernetes. All options are listed in `.env.example`.
+
+> **Upgrading an existing installation:** the warehouse now runs PostgreSQL 18 on a new volume
+> (`warehouse_data_pg18`) with a source-qualified raw schema. The old PostgreSQL 16 volume is left
+> untouched; run a Python backfill (`python -m extractor.cli backfill`) and `dbt build` to repopulate.
 
 ---
 

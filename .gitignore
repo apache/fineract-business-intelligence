@@ -29,3 +29,7 @@ dbt/logs/
 dbt/.user.yml
 apache-rat-*.jar
 docker/superset/__pycache__/
+
+ingestion/**/target/
+loadtest/results/*
+!loadtest/results/.gitkeep

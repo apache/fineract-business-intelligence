@@ -52,8 +52,8 @@ jobs:
           pip install -r dbt/requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: Python syntax check - extractor
-        run: python -m py_compile extractor/*.py
+      - name: Python syntax check - extractor and control plane
+        run: python -m py_compile extractor/*.py controlplane/*.py airflow/dags/*.py scripts/airflow_trigger.py
 
       - name: Python syntax check - bootstrap
         run: python -m py_compile docker/superset/bootstrap_superset_assets.py docker/superset/asset_specs.py
@@ -78,24 +78,93 @@ jobs:
             scripts/run_extractor_incremental.sh \
             scripts/run_pipeline.sh \
             scripts/stop_fineract_backend.sh \
-            scripts/verify_extraction.sh
+            scripts/verify_extraction.sh \
+            scripts/bootstrap_cdc_sources.sh \
+            loadtest/run_stages.sh \
+            loadtest/verify_incremental_equivalence.sh
 
       - name: Lint - sqlfluff
         run: |
           sqlfluff lint dbt/models dbt/tests \
             --exclude-rules structure.column_order,structure.join_condition_order,references.qualification
 
-      - name: Unit tests - extractor (no database)
-        run: pytest tests/unit/extractor -v
-
-      - name: Unit tests - superset (no database)
-        run: pytest tests/unit/superset -v
+      - name: Unit tests - extractor, control plane, superset (no database)
+        run: pytest tests/unit -v
 
       - name: dbt parse - validate all SQL models and refs (no DB connection)
+        env:
+          FBI_PII_HASH_KEY: ci-parse-only
         run: |
           cd dbt
           dbt deps
           dbt parse --profiles-dir . --target local
+
+  airflow-dags:
+    name: Airflow DAG integrity (real Airflow)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Airflow and the control plane dependencies
+        run: |
+          pip install "apache-airflow==3.1.5" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.1.5/constraints-3.11.txt"
+          pip install -r extractor/requirements.txt pytest
+
+      - name: DAG import and structure tests (must not be skipped)
+        env:
+          FBI_REQUIRE_AIRFLOW: "true"
+        run: pytest tests/airflow -v
+
+  java-build:
+    name: Java CDC sink & load generator (tests + ASF license gate)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Start a warehouse for the database-backed sink tests
+        run: |
+          docker run -d --name fbi-test-warehouse -e POSTGRES_DB=analytics -e POSTGRES_USER=analytics_admin \
+            -e POSTGRES_PASSWORD=ci-only -p 5434:5432 postgres:18.3
+          for i in $(seq 1 30); do
+            docker exec fbi-test-warehouse pg_isready -U analytics_admin -d analytics && break
+            sleep 2
+          done
+          docker exec fbi-test-warehouse psql -U analytics_admin -d analytics -c \
+            "CREATE ROLE analytics_loader LOGIN PASSWORD 'analytics_loader_dev_only'"
+          docker cp warehouse/schema fbi-test-warehouse:/schema
+          docker cp contracts fbi-test-warehouse:/contracts
+          docker exec fbi-test-warehouse sh -c "cd /schema && psql -U analytics_admin -d analytics -v ON_ERROR_STOP=1 -q \
+            -f platform.sql -f access_control.sql"
+          docker exec fbi-test-warehouse sh -c "psql -U analytics_admin -d analytics -v ON_ERROR_STOP=1 -q -c \
+            \"SELECT meta.load_table_contract(pg_read_file('/contracts/fineract_tables.json')::jsonb)\" -c \
+            'SELECT meta.provision_raw_tables()'"
+          docker exec fbi-test-warehouse psql -U analytics_admin -d analytics -v ON_ERROR_STOP=1 -q -c \
+            "GRANT USAGE ON SCHEMA meta, raw, raw_shadow TO analytics_loader; \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA meta TO analytics_loader; \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA raw, raw_shadow TO analytics_loader; \
+             GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta TO analytics_loader"
+
+      - name: Build, unit test and check dependency licenses (Category A only)
+        env:
+          FBI_TEST_DB_URL: jdbc:postgresql://localhost:5434/analytics
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64}"
+          mvn -B -f ingestion/pom.xml verify
+
+      - name: Fail if the database-backed or Kafka/PostgreSQL container tests were skipped
+        run: |
+          if grep -rlE "warehouse database not reachable|Docker is not available" ingestion/*/target/surefire-reports/*.xml; then
+            echo "The warehouse-backed or Testcontainers sink tests were skipped; they must run in CI"; exit 1
+          fi
 
   integration-test:
     name: End-to-End Build & Smoke Test
@@ -124,7 +193,7 @@ jobs:
         run: docker compose build
 
       - name: Start data services
-        run: docker compose up -d fineract-db warehouse extractor dbt
+        run: docker compose up -d fineract-db warehouse dbt
 
       - name: Wait for fineract-db to be ready
         run: |
@@ -174,10 +243,13 @@ jobs:
         run: bash scripts/bootstrap_source.sh
 
       - name: Run ELT pipeline (backfill)
-        run: docker compose exec -T extractor python -m extractor.cli backfill
+        run: docker compose run --rm -T extractor python -m extractor.cli backfill
 
       - name: Install dbt packages (dbt-utils)
         run: docker compose exec -T dbt dbt deps
+
+      - name: Load dbt seeds - certified metric catalog
+        run: docker compose exec -T dbt dbt seed
 
       - name: Run dbt models
         run: docker compose exec -T dbt dbt run
@@ -194,14 +266,20 @@ jobs:
           pip install -r extractor/requirements.txt
           pip install -r requirements-dev.txt
 
-      - name: RLS isolation tests - office-level row security on Superset datasets
+      - name: Integration tests - write path, feature-flag cutover, fencing, multi-bank RLS
         env:
           WAREHOUSE_DB_HOST: localhost
           WAREHOUSE_DB_PORT: "5434"
           WAREHOUSE_DB_NAME: analytics
           WAREHOUSE_READER_USER: analytics_reader
           WAREHOUSE_READER_PASSWORD: analytics_reader_dev_only
-        run: pytest tests/integration/test_rls_isolation.py -v
+          WAREHOUSE_LOADER_USER: analytics_loader
+          WAREHOUSE_LOADER_PASSWORD: analytics_loader_dev_only
+          WAREHOUSE_ENGINE_USER: analytics_engine
+          WAREHOUSE_ENGINE_PASSWORD: analytics_engine_dev_only
+          WAREHOUSE_ADMIN_USER: analytics_admin
+          WAREHOUSE_ADMIN_PASSWORD: analytics_admin_dev_only
+        run: pytest tests/integration -v
 
       - name: Smoke 01 - PAR hierarchy PAR 30 >= PAR 60 >= PAR 90 always
         run: |
@@ -344,6 +422,9 @@ jobs:
           TOTAL=$(docker compose exec -T warehouse psql -U analytics_admin -d analytics -t -A -c "$SQL2")
           echo "Total recovery amount in mart: $TOTAL"
           [ "$TOTAL" != "" ] || { echo "FAIL: recovery_repayment_amount missing from mart"; exit 1; }
+
+      - name: Incremental dbt build equals a full rebuild after source changes
+        run: bash loadtest/verify_incremental_equivalence.sh
 
       - name: Collect container logs on failure
         if: failure()

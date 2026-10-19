@@ -23,12 +23,14 @@ models:
       Cleaned and renamed loan account records from raw_m_loan.
       One row per loan account; all raw columns are preserved with
       standardised names.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, loan_id]
     columns:
       - name: loan_id
         description: Surrogate primary key — renamed from raw id.
         tests:
           - not_null
-          - unique
       - name: client_id
         description: Foreign key to stg_m_client.
         tests:
@@ -44,20 +46,23 @@ models:
           - accepted_values:
               values: [100, 200, 300, 400, 500, 600, 601, 602, 700]
 
+
   - name: stg_m_client
     description: >
       Cleaned client records with PII fields (date_of_birth) removed and
       replaced by the derived age_band.  client_hash provides a
       pseudonymised surrogate key safe for downstream use.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, client_id]
     columns:
       - name: client_id
         description: Surrogate primary key — renamed from raw id.
         tests:
           - not_null
-          - unique
       - name: client_hash
         description: >
-          MD5 hash of (tenant_id || '::' || id) — pseudonymised PK safe
+          MD5 hash of (source_id || '::' || tenant_id || '::' || id) — pseudonymised PK safe
           for analytics layers.
         tests:
           - not_null
@@ -74,16 +79,19 @@ models:
           - accepted_values:
               values: ['Unknown', '18-24', '25-34', '35-44', '45-54', '55+']
 
+
   - name: stg_m_loan_transaction
     description: >
       Loan transaction events with reversed transactions excluded.
       All _portion_derived columns are coalesced to 0.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, loan_transaction_id]
     columns:
       - name: loan_transaction_id
         description: Surrogate primary key — renamed from raw id.
         tests:
           - not_null
-          - unique
       - name: loan_id
         description: Foreign key to stg_m_loan.
         tests:
@@ -99,59 +107,72 @@ models:
               values: [1, 2, 3, 4, 5, 6, 7, 8]
               quote: false
 
+
   - name: stg_m_delinquency
     description: >
       Denormalised delinquency events joining tag history with range,
       bucket mapping, and bucket name.  One row per tag-history event.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, delinquency_event_id]
     columns:
       - name: delinquency_event_id
         description: Surrogate primary key — renamed from tag history id.
         tests:
           - not_null
-          - unique
       - name: loan_id
         description: Foreign key to stg_m_loan.
         tests:
           - not_null
 
+
   - name: stg_m_office
     description: Cleaned office hierarchy records.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, office_id]
     columns:
       - name: office_id
         description: Surrogate primary key — renamed from raw id.
         tests:
           - not_null
-          - unique
       - name: office_name
         description: Human-readable office name.
         tests:
           - not_null
 
+
   - name: stg_m_product_loan
     description: Cleaned loan product template records.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, product_id]
     columns:
       - name: product_id
         description: Surrogate primary key — renamed from raw id.
         tests:
           - not_null
-          - unique
       - name: product_name
         description: Human-readable product name.
         tests:
           - not_null
 
+
   - name: stg_m_currency
     description: Cleaned currency reference records.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, currency_code]
     columns:
       - name: currency_code
         description: ISO 4217 currency code — primary key.
         tests:
           - not_null
-          - unique
       - name: currency_name
         description: Full currency display name.
         tests:
           - not_null
+
 
   - name: stg_m_loan_repayment_schedule
     description: >
@@ -161,12 +182,14 @@ models:
       the authoritative record of when (if ever) an installment was fully
       settled, and downstream days-past-due calculations depend on being
       able to distinguish "not yet paid" from "paid on date X".
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, loan_repayment_schedule_id]
     columns:
       - name: loan_repayment_schedule_id
         description: Surrogate primary key — renamed from raw id.
         tests:
           - not_null
-          - unique
       - name: loan_id
         description: Foreign key to stg_m_loan.
         tests:
@@ -175,3 +198,4 @@ models:
         description: Installment due date — the basis for days-past-due calculations.
         tests:
           - not_null
+
