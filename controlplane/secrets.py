@@ -34,36 +34,50 @@ def _env_allowed(name: str) -> bool:
     return re.fullmatch(pattern, name) is not None
 
 
-def _file_allowed(path: str) -> bool:
-    base = os.getenv("FBI_SECRET_DIR")
-    if not base:
-        return False
+def bound_env_name(source_id: str) -> str:
+    return "FBI_SRC_" + source_id.upper().replace("_", "__").replace("-", "_") + "_PASSWORD"
+
+
+def _shared(secret_ref: str) -> bool:
+    return secret_ref in {r.strip() for r in os.getenv("FBI_SHARED_SECRET_REFS", "").split(",") if r.strip()}
+
+
+def _under(base: str, path: str) -> bool:
     real_base = os.path.realpath(base)
-    real_path = os.path.realpath(path)
-    return os.path.commonpath([real_base, real_path]) == real_base
+    return os.path.commonpath([real_base, os.path.realpath(path)]) == real_base
 
 
-def check_reference(secret_ref: str | None) -> None:
+def check_reference(secret_ref: str | None, source_id: str) -> None:
     if not secret_ref:
         raise SecretError("No secret_ref configured for this source")
+    shared = _shared(secret_ref)
     m = _ENV.match(secret_ref)
     if m:
-        if not _env_allowed(m.group(1)):
+        name = m.group(1)
+        if not _env_allowed(name):
             raise SecretError(
-                f"Environment variable {m.group(1)} is not allowed in a secret_ref "
+                f"Environment variable {name} is not allowed in a secret_ref "
                 "(see FBI_SECRET_ENV_ALLOWLIST; source credentials should use the FBI_SRC_ prefix)"
+            )
+        if not shared and name != bound_env_name(source_id):
+            raise SecretError(
+                f"Source {source_id} may only use env:{bound_env_name(source_id)} "
+                "(each secret is bound to its own source; see FBI_SHARED_SECRET_REFS for development)"
             )
         return
     m = _FILE.match(secret_ref)
     if m:
-        if not _file_allowed(m.group(1)):
+        base = os.getenv("FBI_SECRET_DIR")
+        if not base or not _under(base, m.group(1)):
             raise SecretError(f"Secret file {m.group(1)} is outside FBI_SECRET_DIR or FBI_SECRET_DIR is not set")
+        if not shared and not _under(os.path.join(base, source_id), m.group(1)):
+            raise SecretError(f"Source {source_id} may only read secret files below FBI_SECRET_DIR/{source_id}/")
         return
     raise SecretError(f"Unsupported secret_ref format: {secret_ref.split(':', 1)[0]}:... (use env: or file:)")
 
 
-def resolve(secret_ref: str | None) -> str:
-    check_reference(secret_ref)
+def resolve(secret_ref: str | None, source_id: str) -> str:
+    check_reference(secret_ref, source_id)
     m = _ENV.match(secret_ref)
     if m:
         value = os.getenv(m.group(1))
@@ -82,8 +96,8 @@ def resolve(secret_ref: str | None) -> str:
     raise SecretError(f"Key {key} not found in {path}")
 
 
-def connect_placeholder(secret_ref: str | None) -> str:
-    check_reference(secret_ref)
+def connect_placeholder(secret_ref: str | None, source_id: str) -> str:
+    check_reference(secret_ref, source_id)
     m = _ENV.match(secret_ref)
     if m:
         return "${env:" + m.group(1) + "}"

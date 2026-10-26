@@ -130,3 +130,19 @@ else
     echo "[equivalence] FAILED - a skipped consumer lost changes" >&2
     exit 1
 fi
+
+echo "[equivalence] round 3: a second dbt run is refused while one holds the run lock"
+fact_before="$(wh_sql "select last_run_id from meta.dbt_change_cursor where model_name = 'fact_loan_snapshot'")"
+wh_sql "insert into meta.dbt_run_lock values ('dbt', 'equivalence-check', now(), now() + interval '10 minutes')"
+if docker compose exec -T dbt dbt build --exclude "test_type:singular" -q >/dev/null 2>&1; then
+    wh_sql "delete from meta.dbt_run_lock where holder = 'equivalence-check'"
+    echo "[equivalence] FAILED - a concurrent dbt run was not refused" >&2
+    exit 1
+fi
+wh_sql "delete from meta.dbt_run_lock where holder = 'equivalence-check'"
+fact_after="$(wh_sql "select last_run_id from meta.dbt_change_cursor where model_name = 'fact_loan_snapshot'")"
+if [[ "${fact_before}" != "${fact_after}" ]]; then
+    echo "[equivalence] FAILED - the refused run moved a cursor" >&2
+    exit 1
+fi
+echo "[equivalence] PASSED - concurrent runs are serialised"

@@ -41,7 +41,7 @@ seed-paths:
 
 vars:
   historical_start_date: "2025-01-01"
-  pii_hash_key: "{{ env_var('FBI_PII_HASH_KEY') }}"
+  exclude_pii: "{{ env_var('FBI_EXCLUDE_PII', 'true') }}"
   future_end_date: "2035-12-31"
   snapshot_daily_retention_days: null
   analyze_raw_on_run_start: true
@@ -49,10 +49,11 @@ vars:
   heavy_model_work_mem: "128MB"
 
 on-run-start:
+  - "{{ acquire_run_lock() }}"
   - "{{ analyze_raw_sources() }}"
 
 on-run-end:
-  - "{{ advance_change_cursor(results) }}"
+  - "{{ finish_run() }}"
 
 seeds:
   fineract_bi:

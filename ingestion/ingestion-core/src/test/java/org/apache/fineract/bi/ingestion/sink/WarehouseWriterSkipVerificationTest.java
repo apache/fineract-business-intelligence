@@ -53,14 +53,19 @@ public class WarehouseWriterSkipVerificationTest {
         }
     }
 
+    private static String assign(String source) {
+        return "SELECT meta.transition_ownership(o.source_id, o.table_name, o.epoch, 'KAFKA', NULL, 'STEADY', "
+                + "o.epoch + 1, NULL, NULL, 'assign', 'it', NULL, 'test') FROM meta.ingestion_ownership o "
+                + "WHERE o.source_id = '" + source + "' AND o.table_name = '" + TABLE + "'";
+    }
+
     @BeforeMethod
     public void register() throws SQLException {
         source = "it-" + UUID.randomUUID().toString().substring(0, 8);
         try (Connection c = open()) {
             exec(c, "INSERT INTO meta.source_registry (source_id, tenant_id, lifecycle_state) VALUES ('" + source
                     + "', 't', 'ACTIVE')");
-            exec(c, "INSERT INTO meta.ingestion_ownership (source_id, table_name, engine) VALUES ('" + source
-                    + "', '" + TABLE + "', 'NONE')");
+            exec(c, "SELECT meta.ensure_ownership_rows('" + source + "', ARRAY['" + TABLE + "'])");
         } catch (SQLException e) {
             throw new SkipException("warehouse database not reachable or not initialised: " + e.getMessage());
         }
@@ -71,7 +76,12 @@ public class WarehouseWriterSkipVerificationTest {
         if (source == null) {
             return;
         }
-        try (Connection c = open()) {
+        String url = System.getenv().getOrDefault("FBI_TEST_DB_URL", "jdbc:postgresql://localhost:5434/analytics");
+        try (Connection c = DriverManager.getConnection(url,
+                System.getenv().getOrDefault("FBI_TEST_DB_ADMIN_USER", "analytics_admin"),
+                System.getenv().getOrDefault("FBI_TEST_DB_ADMIN_PASSWORD", "analytics_admin_dev_only"))) {
+            exec(c, "UPDATE meta.ingestion_ownership SET engine = 'NONE', epoch = epoch + 1 WHERE source_id = '"
+                    + source + "' AND engine <> 'NONE'");
             exec(c, "DELETE FROM meta.source_registry WHERE source_id = '" + source + "'");
         } catch (SQLException ignored) {
         }
@@ -101,8 +111,7 @@ public class WarehouseWriterSkipVerificationTest {
         try (Connection c = open()) {
             c.setAutoCommit(false);
             long stale = epoch(c);
-            exec(c, "UPDATE meta.ingestion_ownership SET engine = 'KAFKA', epoch = epoch + 1 WHERE source_id = '"
-                    + source + "'");
+            exec(c, assign(source));
             c.commit();
             assertThatThrownBy(() -> WarehouseWriter.verifySkips(c, List.of(new SkipCheck(source, TABLE, stale))))
                     .isInstanceOf(SQLException.class)
@@ -132,8 +141,7 @@ public class WarehouseWriterSkipVerificationTest {
             sink.setAutoCommit(false);
             long stale = epoch(control);
             exec(control, "SELECT meta.lock_ownership_exclusive('" + source + "', '" + TABLE + "')");
-            exec(control, "UPDATE meta.ingestion_ownership SET engine = 'KAFKA', epoch = epoch + 1 WHERE source_id = '"
-                    + source + "'");
+            exec(control, assign(source));
             CompletableFuture<Throwable> verifying = CompletableFuture.supplyAsync(() -> {
                 try {
                     WarehouseWriter.verifySkips(sink, List.of(new SkipCheck(source, TABLE, stale)));

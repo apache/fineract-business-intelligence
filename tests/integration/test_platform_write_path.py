@@ -77,9 +77,35 @@ def purge_audit(sid):
         admin.close()
 
 
+def drop_source(sid):
+    admin = connect(_admin_cfg())
+    try:
+        cur = admin.cursor()
+        cur.execute(
+            "UPDATE meta.ingestion_ownership SET engine = 'NONE', shadow_engine = NULL, cutover_state = 'STEADY', "
+            "epoch = epoch + 1 WHERE source_id = %s AND (engine <> 'NONE' OR shadow_engine IS NOT NULL)",
+            (sid,),
+        )
+        cur.execute("DELETE FROM meta.reconciliation_run WHERE source_id = %s", (sid,))
+        cur.execute("DELETE FROM meta.cutover_approval WHERE source_id = %s", (sid,))
+        cur.execute("DELETE FROM meta.source_registry WHERE source_id = %s", (sid,))
+        admin.commit()
+    finally:
+        admin.close()
+    purge_audit(sid)
+
+
 @pytest.fixture
 def conn():
     c = connect(_cfg())
+    yield c
+    c.rollback()
+    c.close()
+
+
+@pytest.fixture
+def admin():
+    c = connect(_admin_cfg())
     yield c
     c.rollback()
     c.close()
@@ -97,13 +123,13 @@ def source(conn):
     for schema in ("raw", "raw_shadow"):
         cur.execute(f"DELETE FROM {schema}.raw_batch_job_instance WHERE source_id = %s", (sid,))
     cur.execute("DELETE FROM meta.entity_change_log WHERE source_id = %s", (sid,))
-    cur.execute("DELETE FROM meta.source_registry WHERE source_id = %s", (sid,))
     conn.commit()
-    purge_audit(sid)
+    drop_source(sid)
 
 
 def passed_run(conn, sid, table=TABLE, status="PASSED", age="0 seconds"):
-    cur = conn.cursor()
+    admin = connect(_admin_cfg())
+    cur = admin.cursor()
     cur.execute(
         "INSERT INTO meta.reconciliation_run (source_id, table_name, comparison, status, compared_rows, "
         "mismatched_rows, missing_left, missing_right, started_at, finished_at) "
@@ -112,7 +138,8 @@ def passed_run(conn, sid, table=TABLE, status="PASSED", age="0 seconds"):
         (sid, table, status, age, age),
     )
     rid = int(cur.fetchone()[0])
-    conn.commit()
+    admin.commit()
+    admin.close()
     return rid
 
 
@@ -317,7 +344,7 @@ def test_change_log_records_affected_loans(conn, source):
     assert changes == [(10, "2026-01-02"), (11, "2026-02-01")]
 
 
-def test_retire_source_purges_every_layer_and_is_idempotent(conn, source):
+def test_retire_source_purges_every_layer_and_is_idempotent(conn, admin, source):
     from controlplane.retire import DERIVED_TABLES, retire_source
 
     assign(conn, source, Engine.KAFKA)
@@ -336,7 +363,7 @@ def test_retire_source_purges_every_layer_and_is_idempotent(conn, source):
         )
     conn.commit()
 
-    first = retire_source(conn, source)
+    first = retire_source(admin, source)
     assert first["raw_rows"] == 2
     assert rows(conn, source) == []
     assert SourceRegistry(conn).get(source).lifecycle_state == "RETIRED"
@@ -353,19 +380,20 @@ def test_retire_source_purges_every_layer_and_is_idempotent(conn, source):
     conn.rollback()
     assert sqlstate(err.value) == "FBI01"
 
-    again = retire_source(conn, source, forget=True)
+    again = retire_source(admin, source, forget=True)
     assert again["raw_rows"] == 0 and again["lifecycle"] == "removed from registry"
-    again2 = retire_source(conn, source)
+    again2 = retire_source(admin, source)
     assert again2["lifecycle"] == "not registered"
 
 
-def test_reregistered_source_never_reuses_a_connector_name(conn, source):
+def test_reregistered_source_never_reuses_a_connector_name(conn, admin, source):
     from controlplane.retire import retire_source
 
     registry = SourceRegistry(conn)
     first = registry.get(source)
     assert first.capture_generation == 0 and first.connector_name.endswith("-g0")
-    retire_source(conn, source, forget=True)
+    conn.commit()
+    retire_source(admin, source, forget=True)
     registry.upsert([SourceRecord(source, f"tenant-{source}", lifecycle_state="ACTIVE")])
     conn.commit()
     again = registry.get(source)

@@ -21,6 +21,7 @@ package org.apache.fineract.bi.ingestion.app;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.micrometer.core.instrument.Gauge;
+import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -31,6 +32,7 @@ import org.apache.fineract.bi.ingestion.cdc.DebeziumEnvelopeParser;
 import org.apache.fineract.bi.ingestion.config.Env;
 import org.apache.fineract.bi.ingestion.contract.Contract;
 import org.apache.fineract.bi.ingestion.contract.ContractLoader;
+import org.apache.fineract.bi.ingestion.contract.ContractVerifier;
 import org.apache.fineract.bi.ingestion.routing.OwnershipCache;
 import org.apache.fineract.bi.ingestion.sink.WarehouseWriter;
 import org.slf4j.Logger;
@@ -71,6 +73,10 @@ public final class SinkApplication {
         SinkMetrics metrics = new SinkMetrics();
         try (HikariDataSource ds = new HikariDataSource(hc);
                 DeadLetterPublisher dlt = new DeadLetterPublisher(config)) {
+            try (Connection c = ds.getConnection()) {
+                ContractVerifier.verify(c, contract);
+                c.rollback();
+            }
             OwnershipCache ownership = new OwnershipCache(ds, 1_000);
             ownership.refresh(true);
             LOG.info("Loaded ownership: {} KAFKA routes across {} registered sources",

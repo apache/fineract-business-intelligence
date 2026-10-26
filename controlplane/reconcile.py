@@ -50,15 +50,14 @@ class ReconciliationResult:
 
 
 def record_run(conn, result: ReconciliationResult, status: str) -> int:
+    if result.comparison != "source_vs_warehouse":
+        raise ValueError("shadow_vs_prod runs are computed and recorded by meta.run_shadow_reconciliation")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO meta.reconciliation_run (source_id, table_name, comparison, status, compared_rows, "
-        "mismatched_rows, missing_left, missing_right, details, finished_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()) RETURNING reconciliation_id",
+        "SELECT meta.record_source_reconciliation(%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
         (
             result.source_id,
             result.table_name,
-            result.comparison,
             status,
             result.compared_rows,
             result.mismatched_rows,
@@ -72,16 +71,18 @@ def record_run(conn, result: ReconciliationResult, status: str) -> int:
     return rid
 
 
-def reconcile_shadow(conn, source_id: str, table_name: str, settle_seconds: int) -> ReconciliationResult:
+def reconcile_shadow(
+    conn, source_id: str, table_name: str, settle_seconds: int
+) -> tuple[int, bool, ReconciliationResult]:
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT compared_rows, mismatched_rows, missing_in_prod, missing_in_shadow, sample_keys "
-        "FROM meta.reconcile_shadow(%s, %s, make_interval(secs => %s))",
+        "SELECT reconciliation_id, passed, compared_rows, mismatched_rows, missing_in_prod, missing_in_shadow, "
+        "sample_keys, settle_seconds FROM meta.run_shadow_reconciliation(%s, %s, %s)",
         (source_id, table_name, settle_seconds),
     )
-    compared, mismatched, missing_prod, missing_shadow, sample = cursor.fetchone()
+    rid, passed, compared, mismatched, missing_prod, missing_shadow, sample, settle = cursor.fetchone()
     conn.commit()
-    return ReconciliationResult(
+    result = ReconciliationResult(
         source_id=source_id,
         table_name=table_name,
         comparison="shadow_vs_prod",
@@ -90,8 +91,9 @@ def reconcile_shadow(conn, source_id: str, table_name: str, settle_seconds: int)
         missing_left=int(missing_prod or 0),
         missing_right=int(missing_shadow or 0),
         sample_keys=sample if isinstance(sample, list) else json.loads(sample or "[]"),
-        details={"settle_seconds": settle_seconds},
+        details={"settle_seconds": settle},
     )
+    return int(rid), bool(passed), result
 
 
 def run_cutover_gate(
@@ -106,9 +108,8 @@ def run_cutover_gate(
     repo.apply(source_id, tables, TransitionRequest(Action.BEGIN_RECONCILIATION, actor, "cutover gate started"))
     outcome: dict[str, dict] = {}
     for table in sorted(tables):
-        result = reconcile_shadow(conn, source_id, table, settle_seconds)
-        passed = result.passed(max_discrepancies)
-        rid = record_run(conn, result, "PASSED" if passed else "FAILED")
+        rid, db_passed, result = reconcile_shadow(conn, source_id, table, settle_seconds)
+        passed = db_passed and result.passed(max_discrepancies)
         repo.apply(
             source_id,
             [table],

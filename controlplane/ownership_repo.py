@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 
 from controlplane.contract import load_contract
@@ -79,16 +78,8 @@ class OwnershipRepository:
 
     def ensure_rows(self, source_id: str, tables: Iterable[str]) -> int:
         cursor = self._conn.cursor()
-        created = 0
-        for table in tables:
-            cursor.execute(
-                "INSERT INTO meta.ingestion_ownership (source_id, table_name, engine, updated_by, change_reason) "
-                "VALUES (%s, %s, 'NONE', 'controlplane', 'registered') "
-                "ON CONFLICT (source_id, table_name) DO NOTHING",
-                (source_id, table),
-            )
-            created += cursor.rowcount
-        return created
+        cursor.execute("SELECT meta.ensure_ownership_rows(%s, %s::text[])", (source_id, sorted(set(tables))))
+        return int(cursor.fetchone()[0])
 
     def dual_control_required(self) -> bool:
         cursor = self._conn.cursor()
@@ -107,6 +98,8 @@ class OwnershipRepository:
         cursor.execute(
             "SELECT EXISTS (SELECT 1 FROM meta.reconciliation_run r WHERE r.reconciliation_id = %s "
             "AND r.source_id = %s AND r.table_name = %s AND r.comparison = 'shadow_vs_prod' AND r.status = 'PASSED' "
+            "AND r.started_at >= COALESCE((SELECT o.shadow_started_at FROM meta.ingestion_ownership o "
+            "WHERE o.source_id = r.source_id AND o.table_name = r.table_name), '-infinity'::timestamptz) "
             "AND r.finished_at > NOW() - "
             "make_interval(mins => meta.setting('reconciliation_max_age_minutes', '120')::int))",
             (o.last_reconciliation_id, o.source_id, o.table_name),
@@ -163,7 +156,7 @@ class OwnershipRepository:
         try:
             for table in sorted(set(tables)):
                 cursor.execute("SELECT meta.lock_ownership_exclusive(%s, %s)", (source_id, table))
-                cursor.execute(_SELECT + " WHERE source_id = %s AND table_name = %s FOR UPDATE", (source_id, table))
+                cursor.execute(_SELECT + " WHERE source_id = %s AND table_name = %s", (source_id, table))
                 rows = rows_as_dicts(cursor)
                 if not rows:
                     raise KeyError(f"No ownership row for {source_id}/{table}")
@@ -183,49 +176,31 @@ class OwnershipRepository:
                 treq = TransitionRequest(**req_fields)
                 result = transition(current, treq)
                 cur = result.current
-                if request.action is Action.FORCE_ASSIGN:
-                    cursor.execute("SELECT set_config('fbi.force_approved_by', %s, true)", (treq.approved_by or "",))
                 cursor.execute(
-                    "UPDATE meta.ingestion_ownership SET engine = %s, shadow_engine = %s, cutover_state = %s, "
-                    "epoch = %s, last_reconciliation_id = %s, shadow_requested_by = %s, updated_at = NOW(), "
-                    "updated_by = %s, change_reason = %s "
-                    "WHERE source_id = %s AND table_name = %s AND epoch = %s",
+                    "SELECT meta.transition_ownership(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
+                        source_id,
+                        table,
+                        result.previous.epoch,
                         cur.engine.value,
                         cur.shadow_engine.value if cur.shadow_engine else None,
                         cur.cutover_state.value,
                         cur.epoch,
                         cur.last_reconciliation_id,
                         cur.shadow_requested_by,
+                        treq.action.value,
                         treq.actor,
+                        treq.approved_by,
                         treq.reason,
-                        source_id,
-                        table,
-                        result.previous.epoch,
                     ),
                 )
-                if cursor.rowcount != 1:
+                if not cursor.fetchone()[0]:
                     raise RuntimeError(f"Optimistic concurrency failure on {source_id}/{table}")
                 for effect in result.side_effects:
                     if effect is SideEffect.PROMOTE_SHADOW:
                         cursor.execute("SELECT meta.promote_shadow(%s, %s)", (source_id, table))
                     elif effect is SideEffect.CLEAR_SHADOW:
                         cursor.execute("SELECT meta.clear_shadow(%s, %s)", (source_id, table))
-                cursor.execute(
-                    "INSERT INTO meta.ingestion_ownership_audit "
-                    "(source_id, table_name, action, previous_state, new_state, actor, approved_by, reason) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (
-                        source_id,
-                        table,
-                        treq.action.value,
-                        json.dumps(result.previous.as_dict()),
-                        json.dumps(cur.as_dict()),
-                        treq.actor,
-                        treq.approved_by,
-                        treq.reason,
-                    ),
-                )
                 results.append(result)
                 if per_table_commit:
                     self._conn.commit()

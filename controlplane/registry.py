@@ -38,6 +38,7 @@ LIFECYCLE_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 RUNNING_STATES = frozenset({"PROVISIONING", "ACTIVE", "DEGRADED"})
+CONNECTION_FIELDS = ("db_host", "db_port", "db_name", "db_user", "secret_ref")
 
 
 class RegistryError(ValueError):
@@ -74,7 +75,7 @@ class SourceRecord:
             raise RegistryError(f"Unknown lifecycle state {self.lifecycle_state}")
         if self.secret_ref:
             try:
-                check_reference(self.secret_ref)
+                check_reference(self.secret_ref, self.source_id)
             except SecretError as exc:
                 raise RegistryError(f"secret_ref rejected: {exc}") from exc
 
@@ -112,7 +113,42 @@ class SourceRegistry:
     def __init__(self, conn) -> None:
         self._conn = conn
 
-    def upsert(self, records: Iterable[SourceRecord]) -> int:
+    def create(self, record: SourceRecord) -> None:
+        record.validate()
+        d = asdict(record)
+        d["labels"] = json.dumps(d["labels"])
+        cols = ", ".join(_COLUMNS)
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"INSERT INTO meta.source_registry ({cols}) VALUES ({', '.join(['%s'] * len(_COLUMNS))}) "
+            "ON CONFLICT (source_id) DO NOTHING",
+            tuple(d[c] for c in _COLUMNS),
+        )
+        if cursor.rowcount != 1:
+            raise RegistryError(f"Source {record.source_id} is already registered")
+
+    def _refuse_connection_changes(self, records: list[SourceRecord]) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"SELECT source_id, {', '.join(CONNECTION_FIELDS)} FROM meta.source_registry WHERE source_id = ANY(%s)",
+            ([r.source_id for r in records],),
+        )
+        existing = {row[0]: tuple(row[1:]) for row in cursor.fetchall()}
+        for r in records:
+            old = existing.get(r.source_id)
+            if old is None:
+                continue
+            changed = [f for f, before in zip(CONNECTION_FIELDS, old, strict=True) if before != getattr(r, f)]
+            if changed:
+                raise RegistryError(
+                    f"Source {r.source_id} is already registered with different {', '.join(changed)}; changing "
+                    "where an existing source connects needs allow_connection_change (CLI --allow-connection-change)"
+                )
+
+    def upsert(self, records: Iterable[SourceRecord], allow_connection_change: bool = False) -> int:
+        records = list(records)
+        if records and not allow_connection_change:
+            self._refuse_connection_changes(records)
         rows = []
         for r in records:
             r.validate()

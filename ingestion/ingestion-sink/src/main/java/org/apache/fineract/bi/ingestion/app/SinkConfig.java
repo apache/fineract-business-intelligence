@@ -51,6 +51,8 @@ public record SinkConfig(
         long healthStuckMs,
         boolean allowOffsetReset,
         int dltMaxBytes,
+        int quarantineMaxRows,
+        double quarantineMaxRatio,
         Properties consumerOverrides,
         Properties producerOverrides) {
 
@@ -83,6 +85,8 @@ public record SinkConfig(
                 env.longValue("SINK_HEALTH_STUCK_MS", 300_000),
                 env.bool("SINK_ALLOW_OFFSET_RESET", false),
                 env.integer("SINK_DLT_MAX_BYTES", 3_900_000),
+                env.integer("SINK_QUARANTINE_MAX_ROWS", 100),
+                env.decimal("SINK_QUARANTINE_MAX_RATIO", 0.1),
                 Env.prefixed(environment, "SINK_KAFKA_"),
                 Env.prefixed(environment, "SINK_PRODUCER_"));
     }

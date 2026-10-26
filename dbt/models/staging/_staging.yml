@@ -77,7 +77,7 @@ models:
         description: Derived age cohort; replaces the raw date_of_birth field.
         tests:
           - accepted_values:
-              values: ['Unknown', '18-24', '25-34', '35-44', '45-54', '55+']
+              values: ['Not collected', 'Unknown', '18-24', '25-34', '35-44', '45-54', '55+']
 
 
   - name: stg_m_loan_transaction

@@ -50,11 +50,13 @@ def _shard(value: str | None) -> tuple[int | None, int | None]:
     return i, n
 
 
-def register_and_assign(conn, records: list[SourceRecord], engine: str, actor: str) -> dict:
+def register_and_assign(
+    conn, records: list[SourceRecord], engine: str, actor: str, allow_connection_change: bool = False
+) -> dict:
     contract = load_contract()
     registry = SourceRegistry(conn)
     repo = OwnershipRepository(conn)
-    registry.upsert(records)
+    registry.upsert(records, allow_connection_change=allow_connection_change)
     for r in records:
         repo.ensure_rows(r.source_id, contract.table_names)
     conn.commit()
@@ -96,7 +98,7 @@ def cmd_register_source(conn, args) -> dict:
         lifecycle_state=args.lifecycle,
         labels=json.loads(args.labels),
     )
-    return register_and_assign(conn, [rec], args.engine, args.actor)
+    return register_and_assign(conn, [rec], args.engine, args.actor, args.allow_connection_change)
 
 
 def cmd_register_bulk(conn, args) -> dict:
@@ -192,7 +194,7 @@ def cmd_reconcile_source(conn, args) -> dict:
 
     source = SourceRegistry(conn).get(args.source_id)
     conn.commit()
-    src = connect(source_pg_config(source, secrets.resolve(source.secret_ref), "fbi-reconcile"))
+    src = connect(source_pg_config(source, secrets.resolve(source.secret_ref, source.source_id), "fbi-reconcile"))
     contract = load_contract()
     out = {}
     try:
@@ -297,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--engine", choices=["PYTHON", "KAFKA", "NONE"], default=os.getenv("INGESTION_ENGINE_DEFAULT", "PYTHON")
     )
+    r.add_argument("--allow-connection-change", action="store_true")
     r.set_defaults(func=cmd_register_source)
 
     b = sub.add_parser("register-bulk")

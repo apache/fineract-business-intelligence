@@ -29,7 +29,7 @@ from controlplane.db import connect, rows_as_dicts, source_pg_config, warehouse_
 from controlplane.ownership import Action, Engine, TransitionRequest
 from controlplane.ownership_repo import OwnershipRepository
 from controlplane.reconciler import reconcile
-from controlplane.registry import RUNNING_STATES, SourceRecord, SourceRegistry
+from controlplane.registry import RUNNING_STATES, RegistryError, SourceRecord, SourceRegistry
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def shard_plan(shard_size: int | None = None, max_shards: int | None = None) -> 
     conn = _wh()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM meta.source_registry WHERE lifecycle_state <> 'RETIRED'")
+        cur.execute("SELECT COUNT(*) FROM meta.source_registry")
         total = int(cur.fetchone()[0])
         conn.commit()
     finally:
@@ -154,7 +154,7 @@ def cutover_gate(source_id: str, tables: str, actor: str, settle_seconds: int, m
 
 def validate_source(source: SourceRecord, engine: str) -> dict:
     checks: dict[str, object] = {}
-    cfg = source_pg_config(source, secrets.resolve(source.secret_ref), "fbi-onboarding")
+    cfg = source_pg_config(source, secrets.resolve(source.secret_ref, source.source_id), "fbi-onboarding")
     conn = connect(cfg)
     try:
         cur = conn.cursor()
@@ -204,18 +204,23 @@ def onboard_source(params: dict, actor: str) -> dict:
         lifecycle_state="REQUESTED",
         labels=params.get("labels") or {},
     )
+    record.validate()
     conn = _wh()
     try:
         registry = SourceRegistry(conn)
-        registry.upsert([record])
-        conn.commit()
-        registry.set_lifecycle(record.source_id, "VALIDATING")
-        conn.commit()
+        try:
+            registry.get(record.source_id)
+            raise RuntimeError(
+                f"Source {record.source_id} is already registered; onboarding never modifies an existing source"
+            )
+        except RegistryError:
+            conn.rollback()
         checks = validate_source(record, engine)
         if not checks.get("ok"):
-            registry.set_lifecycle(record.source_id, "REQUESTED")
-            conn.commit()
             raise RuntimeError(f"Source {record.source_id} failed validation: {checks}")
+        registry.create(record)
+        conn.commit()
+        registry.set_lifecycle(record.source_id, "VALIDATING")
         registry.set_lifecycle(record.source_id, "PROVISIONING")
         repo = OwnershipRepository(conn)
         repo.ensure_rows(record.source_id, load_contract().table_names)
@@ -245,7 +250,7 @@ def source_reconcile_shard(index: int, count: int, max_discrepancies: int = 0) -
                  if o.engine in (Engine.PYTHON, Engine.KAFKA)}
         conn.commit()
         for s in sources:
-            src = connect(source_pg_config(s, secrets.resolve(s.secret_ref), "fbi-reconcile"))
+            src = connect(source_pg_config(s, secrets.resolve(s.secret_ref, s.source_id), "fbi-reconcile"))
             try:
                 for t in contract.tables:
                     if (s.source_id, t.table_name) not in owned:
@@ -270,19 +275,27 @@ def source_reconcile_shard(index: int, count: int, max_discrepancies: int = 0) -
 def maintenance() -> dict:
     conn = _wh()
     try:
+        conn.autocommit = True
         cur = conn.cursor()
-        cur.execute("SELECT meta.purge_change_log()")
-        dropped_partitions = cur.fetchone()[0]
+        cur.execute("SELECT meta.ensure_change_log_partitions()")
+        created_partitions = cur.fetchone()[0]
+        dropped_partitions = 0
+        while True:
+            cur.execute("SELECT meta.purge_change_log(NULL, 1)")
+            dropped = cur.fetchone()[0]
+            if not dropped:
+                break
+            dropped_partitions += dropped
         cur.execute("SELECT meta.purge_progress()")
         purged_progress = cur.fetchone()[0]
         cur.execute("SELECT meta.purge_ownership_audit()")
         purged_audit = cur.fetchone()[0]
-        cur.execute("DELETE FROM meta.reconciliation_run WHERE started_at < NOW() - INTERVAL '180 days'")
-        purged_recon = cur.rowcount
-        conn.commit()
+        cur.execute("SELECT meta.purge_reconciliation_runs()")
+        purged_recon = cur.fetchone()[0]
     finally:
         conn.close()
     return {
+        "change_log_partitions_created": created_partitions,
         "change_log_partitions_dropped": dropped_partitions,
         "progress_and_audit_rows": purged_progress,
         "ownership_audit_rows": purged_audit,

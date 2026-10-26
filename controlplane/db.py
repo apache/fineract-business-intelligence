@@ -17,9 +17,10 @@
 from __future__ import annotations
 
 import os
+import socket
 import ssl
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 
 import pg8000.dbapi
@@ -35,6 +36,7 @@ class PgConfig:
     ssl_mode: str = "disable"
     application_name: str = "fbi-controlplane"
     timeout: float | None = None
+    statement_timeout_ms: int | None = None
 
     def connect_kwargs(self) -> dict:
         kwargs = {
@@ -47,6 +49,8 @@ class PgConfig:
         }
         if self.timeout:
             kwargs["timeout"] = self.timeout
+        if self.statement_timeout_ms:
+            kwargs["startup_params"] = {"statement_timeout": str(int(self.statement_timeout_ms))}
         if self.ssl_mode in ("require", "verify-full"):
             ctx = ssl.create_default_context()
             if self.ssl_mode == "require":
@@ -70,6 +74,7 @@ def source_pg_config(source, password: str, application_name: str = "fbi-control
         source.labels.get("sslmode") or default_source_sslmode(),
         application_name,
         float(os.getenv("FBI_SOURCE_CONNECT_TIMEOUT_SECONDS", "10")),
+        int(float(os.getenv("FBI_SOURCE_STATEMENT_TIMEOUT_SECONDS", "1800")) * 1000),
     )
 
 
@@ -90,9 +95,21 @@ def warehouse_config_from_env(application_name: str = "fbi-controlplane", engine
     )
 
 
-def connect(cfg: PgConfig) -> pg8000.dbapi.Connection:
+def _after_connect(conn: pg8000.dbapi.Connection) -> None:
+    sock = getattr(conn, "_usock", None)
+    if sock is None:
+        return
+    sock.settimeout(None)
+    for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+        if hasattr(socket, name):
+            with suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+
+
+def connect(cfg: PgConfig, autocommit: bool = False) -> pg8000.dbapi.Connection:
     conn = pg8000.dbapi.connect(**cfg.connect_kwargs())
-    conn.autocommit = False
+    _after_connect(conn)
+    conn.autocommit = autocommit
     return conn
 
 

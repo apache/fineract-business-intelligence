@@ -323,3 +323,28 @@ def test_settings_and_legacy_bootstrap_from_env(monkeypatch):
 
 def test_copy_payload_is_streamable():
     assert isinstance(build_copy_payload([]), io.StringIO)
+
+
+def test_excluded_pii_columns_are_marked_unavailable_like_the_kafka_engine(source_record, contract):
+    from extractor.config import ExtractSettings
+
+    settings = ExtractSettings(
+        page_size=2, lookback_seconds=600, cob_lookback_hours=48, writer_id="t", exclude_pii=True
+    )
+    table = contract.table("m_client")
+    for op, expected in (("u", '"{""date_of_birth""}"'), ("d", None)):
+        cursor = FakeCursor(fetchone_results=[("stage_raw_m_client",)], fetchall_results=[[("prod", 1, 0)]])
+        extractor = SourceExtractor(source_record, None, settings, contract)
+        extractor._write_page(
+            FakeConnection(cursor), Assignment(table, "prod", 3), [(1,) + (None,) * (len(table.columns) - 1)], None, op
+        )
+        staged = cursor.streams[0]
+        if expected:
+            assert expected in staged, "the stored date_of_birth is kept instead of being overwritten with NULL"
+        else:
+            assert "date_of_birth" not in staged
+
+
+def test_csv_lists_become_postgres_array_literals():
+    assert csv_field(["date_of_birth"]) == '"{""date_of_birth""}"'
+    assert csv_field(["a", 'b"c']) == '"{""a"",""b\\""c""}"'

@@ -116,7 +116,7 @@ def source_record():
         db_port=5432,
         db_name="fineract_default",
         db_user="reader",
-        secret_ref="env:FBI_SRC_TEST_PASSWORD",
+        secret_ref="env:FBI_SRC_BRANCH_001_PASSWORD",
         compat_schema="bi_connector_source",
         lifecycle_state="ACTIVE",
         capture_generation=3,

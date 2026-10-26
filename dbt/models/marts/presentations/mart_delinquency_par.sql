@@ -20,7 +20,8 @@
         incremental_strategy='append',
         on_schema_change='append_new_columns',
         indexes=[{'columns': ['source_id', 'snapshot_date']}, {'columns': ['snapshot_date', 'bucket_key']}],
-        pre_hook=["{{ heavy_model_settings() }}", "{{ mart_delete_recompute_window('mart_delinquency_par', 'snapshot_date') }}"]
+        pre_hook=["{{ heavy_model_settings() }}", "{{ mart_delete_recompute_window('mart_delinquency_par', 'snapshot_date') }}"],
+        post_hook=["{{ advance_mart_cursor() }}"]
     )
 }}
 

@@ -51,6 +51,7 @@
         ],
         post_hook=[
             "{{ record_dirty_partitions('after') }}",
+            "{{ advance_fact_cursor() }}",
             "{% if var('snapshot_daily_retention_days', none) is not none %}
             delete from {{ this }}
             where snapshot_date < current_date - {{ var('snapshot_daily_retention_days') | int }}

@@ -33,6 +33,7 @@ from tests.conftest import FakeConnection, FakeCursor
 @pytest.fixture(autouse=True)
 def source_password(monkeypatch):
     monkeypatch.setenv("FBI_SRC_TEST_PASSWORD", "pw")
+    monkeypatch.setenv("FBI_SHARED_SECRET_REFS", "env:FBI_SRC_TEST_PASSWORD")
     monkeypatch.setenv("FBI_DEFAULT_SSLMODE", "disable")
 
 
@@ -207,7 +208,7 @@ def test_the_slot_check_key_changes_with_generation_owner_and_lifecycle():
 
 @pytest.mark.parametrize(
     "row,expected",
-    [(None, False), ((False,), False), ((True,), True)],
+    [(None, True), ((False,), False), ((True,), True)],
 )
 def test_a_slot_check_is_due_only_when_the_key_changed_or_the_interval_passed(row, expected):
     conn = FakeConnection(FakeCursor(fetchone_results=[row]))
@@ -252,6 +253,68 @@ def test_only_this_shards_connectors_are_described():
     assert connect.described == ["fbi-src-mine-g0"]
     first = observe_cluster(FakeConnect({"fbi-src-orphan-g0": observed("fbi-src-orphan-g0")}), set(), set(), 0)
     assert list(first) == ["fbi-src-orphan-g0"], "shard 0 owns unregistered orphans"
+
+
+def _tombstone():
+    return source("bank-a", generation=1, state="RETIRED", labels={"forget_after_cleanup": True})
+
+
+def _forgot(conn) -> bool:
+    return any("DELETE FROM meta.source_registry" in sql for sql, _ in conn.cursor().executed)
+
+
+def _cleanup(conn, src, observed=None, all_clusters_observed=True, report=None):
+    state = DesiredState([], {"bank-a"}, [], set())
+    return reconciler.cleanup_stale_slots(
+        conn, state, observed or {}, None, None, report or reconciler.ReconcileReport(), lambda cfg: src,
+        all_clusters_observed=all_clusters_observed,
+    )
+
+
+def test_a_tombstone_is_not_forgotten_while_an_active_slot_remains(fake_registry, monkeypatch):
+    fake_registry["sources"] = [_tombstone()]
+    monkeypatch.setattr(reconciler, "_slot_check_due", lambda conn, sid, key, minutes: True)
+    src = FakeSource([("fbi_bank_a_g1", True)])
+    conn, report = FakeConnection(), reconciler.ReconcileReport()
+    actions = _cleanup(conn, src, report=report)
+    assert actions == [] and not _forgot(conn), "an active slot keeps WAL; the registry row must stay"
+    assert "fbi_bank_a_g1" in report.errors[0]["error"]
+    src.slots[:] = [("fbi_bank_a_g1", False)]
+    actions = _cleanup(conn, src)
+    assert {"kind": "forget_source", "source_id": "bank-a"} in actions and _forgot(conn)
+
+
+def test_a_tombstone_is_not_forgotten_when_a_connect_cluster_could_not_be_observed(fake_registry, monkeypatch):
+    fake_registry["sources"] = [_tombstone()]
+    monkeypatch.setattr(reconciler, "_slot_check_due", lambda conn, sid, key, minutes: True)
+    conn, report = FakeConnection(), reconciler.ReconcileReport()
+    actions = _cleanup(conn, FakeSource([]), all_clusters_observed=False, report=report)
+    assert actions == [] and not _forgot(conn)
+    assert "Connect cluster" in report.errors[0]["error"]
+
+
+def test_retired_sources_are_throttled_and_an_unreachable_one_is_not_retried_every_cycle(fake_registry, monkeypatch):
+    fake_registry["sources"] = [_tombstone()]
+    intervals = []
+
+    def due(conn, sid, key, minutes):
+        intervals.append(minutes)
+        return len(intervals) == 1
+
+    monkeypatch.setattr(reconciler, "_slot_check_due", due)
+    attempts = []
+
+    def unreachable(cfg):
+        attempts.append(cfg)
+        raise OSError("no route to host")
+
+    conn, report = FakeConnection(), reconciler.ReconcileReport()
+    state = DesiredState([], {"bank-a"}, [], set())
+    for _ in range(3):
+        reconciler.cleanup_stale_slots(conn, state, {}, None, None, report, unreachable)
+    assert len(attempts) == 1, "a decommissioned host is probed once per interval, not every two minutes"
+    assert intervals == [30, 30, 30], "tombstones retry on their own (shorter) interval"
+    assert any("INSERT INTO meta.slot_check" in sql for sql, _ in conn.cursor().executed), "failures are throttled too"
 
 
 def test_retire_artifacts_removes_every_generation_and_confirms_the_slot_is_gone():

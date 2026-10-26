@@ -83,7 +83,7 @@ public class SinkWorkerDeliveryTest {
         }
     }
 
-    static final class FakeLetters implements DeadLetterSink {
+    static class FakeLetters implements DeadLetterSink {
         final List<DeadLetterPublisher.DeadLetter> letters = new ArrayList<>();
 
         @Override
@@ -371,5 +371,116 @@ public class SinkWorkerDeliveryTest {
         w.rebalanceListener().onPartitionsAssigned(Set.of(P0, P1));
         assertThat(consumer.position(P0)).isEqualTo(40L);
         assertThat(consumer.position(P1)).isEqualTo(7L);
+    }
+
+    private static OwnershipSnapshot bankBPaused() {
+        return new OwnershipSnapshot(
+                Map.of(OwnershipSnapshot.key("bank-a", "batch_job_instance"),
+                        new OwnershipSnapshot.Entry("KAFKA", null, "STEADY", 7),
+                        OwnershipSnapshot.key("bank-b", "batch_job_instance"),
+                        new OwnershipSnapshot.Entry("KAFKA", null, "PAUSED", 7)),
+                Map.of("bank-a", new OwnershipSnapshot.SourceMeta("t-a", 0),
+                        "bank-b", new OwnershipSnapshot.SourceMeta("t-b", 0)),
+                System.currentTimeMillis());
+    }
+
+    private FakeWriter rejecting(java.util.function.Predicate<Long> poison) {
+        return new FakeWriter() {
+            @Override
+            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+                    Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
+                for (RoutedEvent e : events) {
+                    if (poison.test(Long.parseLong(e.event().values()[0]))) {
+                        throw new SQLException("numeric field overflow", "22003");
+                    }
+                }
+                return super.write(c, events, offs, group, skip);
+            }
+        };
+    }
+
+    @Test
+    public void aFenceDuringIsolationRefreshesOwnershipInsteadOfKillingTheWorker() {
+        int[] calls = {0};
+        FakeWriter base = rejecting(id -> id == 3L);
+        writer = new FakeWriter() {
+            @Override
+            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+                    Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
+                if (++calls[0] == 2) {
+                    throw new org.apache.fineract.bi.ingestion.sink.FencedWriteException(
+                            new SQLException("Writer KAFKA fenced", "FBI01"));
+                }
+                List<WarehouseWriter.Applied> out = base.write(c, events, offs, group, skip);
+                batches.add(base.batches.get(base.batches.size() - 1));
+                return out;
+            }
+        };
+        SinkWorker w = worker(new View(snapshot("STEADY", "KAFKA")), Map.of());
+        for (int i = 1; i <= 5; i++) {
+            w.enqueue(record(P0, i - 1, "bank-a", i));
+        }
+
+        Map<TopicPartition, OffsetAndMetadata> commit = w.processWithRetry(consumer);
+
+        assertThat(w.isAlive()).as("a fence in the middle of an isolation is retried, not fatal").isTrue();
+        assertThat(writer.allIds()).containsExactlyInAnyOrder(1L, 2L, 4L, 5L);
+        assertThat(letters.letters).hasSize(1);
+        assertThat(commit.get(P0).offset()).isEqualTo(5L);
+    }
+
+    @Test
+    public void aHoldFoundInOneIsolationPartStopsLaterPartsFromCommittingPastIt() throws Exception {
+        View view = new View(bankBPaused());
+        writer = rejecting(id -> id == 10L);
+        letters = new FakeLetters() {
+            @Override
+            public void publish(List<DeadLetterPublisher.DeadLetter> l) {
+                super.publish(l);
+                view.current.set(snapshot("STEADY", "KAFKA"));
+            }
+        };
+        SinkWorker w = worker(view, Map.of("SINK_QUARANTINE_MAX_RATIO", "1"));
+        List<ConsumerRecord<byte[], byte[]>> batch = List.of(record(P0, 0, "bank-a", 10), record(P0, 1, "bank-b", 11),
+                record(P0, 2, "bank-a", 12), record(P0, 3, "bank-a", 13));
+        batch.forEach(w::enqueue);
+
+        Map<TopicPartition, OffsetAndMetadata> commit = w.isolate(consumer, new ArrayList<>(batch));
+
+        assertThat(letters.letters).hasSize(1);
+        assertThat(commit.get(P0).offset()).as("the pause lifted mid-isolation, but nothing past offset 1 is committed")
+                .isEqualTo(1L);
+        assertThat(writer.allIds()).doesNotContain(11L, 12L, 13L);
+        assertThat(w.buffered()).isEqualTo(3);
+        assertThat(w.heldPartitions()).containsExactly(P0);
+
+        Map<TopicPartition, OffsetAndMetadata> later = w.processWithRetry(consumer);
+        assertThat(writer.allIds()).as("the held records are applied later, in order").endsWith(11L, 12L, 13L);
+        assertThat(later.get(P0).offset()).isEqualTo(4L);
+    }
+
+    @Test
+    public void aSystemicDataErrorTripsTheQuarantineBreakerInsteadOfDeadLetteringEverything() throws Exception {
+        writer = rejecting(id -> true);
+        SinkWorker w = worker(new View(snapshot("STEADY", "KAFKA")), Map.of("SINK_QUARANTINE_MAX_ROWS", "3"));
+        for (int i = 1; i <= 40; i++) {
+            w.enqueue(record(i % 2 == 0 ? P0 : P1, i / 2, "bank-a", i));
+        }
+        assertThat(w.quarantineLimit(40)).isEqualTo(3);
+        Thread t = new Thread(() -> w.processWithRetry(consumer));
+        t.start();
+        long deadline = System.currentTimeMillis() + 5_000;
+        while ((letters.letters.size() < 3 || w.isHealthy(System.currentTimeMillis()))
+                && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        Thread.sleep(300);
+        w.shutdown();
+        t.join(5_000);
+
+        assertThat(letters.letters).as("at most the limit is dead-lettered, retries do not leak more").hasSize(3);
+        assertThat(w.buffered()).isEqualTo(37);
+        assertThat(w.isAlive()).isTrue();
+        assertThat(w.isHealthy(System.currentTimeMillis())).as("the tripped breaker turns health red").isFalse();
     }
 }

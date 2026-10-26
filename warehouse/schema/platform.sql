@@ -23,6 +23,17 @@ CREATE SCHEMA IF NOT EXISTS intermediate;
 CREATE SCHEMA IF NOT EXISTS analytics;
 CREATE SCHEMA IF NOT EXISTS meta;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fbi_control_plane') THEN
+        CREATE ROLE fbi_control_plane NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fbi_platform_admin') THEN
+        CREATE ROLE fbi_platform_admin NOLOGIN;
+    END IF;
+END
+$$;
+
 CREATE TABLE IF NOT EXISTS meta.platform_settings (
     setting_key TEXT PRIMARY KEY,
     setting_value TEXT NOT NULL,
@@ -51,8 +62,46 @@ VALUES
     ('progress_retention_days', '7', FALSE,
      'ingestion_progress and ingestion_audit rows older than this are purged by maintenance.'),
     ('ownership_audit_retention_days', '730', FALSE,
-     'ingestion_ownership_audit rows older than this are purged by meta.purge_ownership_audit().')
+     'ingestion_ownership_audit rows older than this are purged by meta.purge_ownership_audit().'),
+    ('reconciliation_max_discrepancies', '0', FALSE,
+     'A shadow_vs_prod reconciliation passes only with at most this many mismatched or missing rows.'),
+    ('reconciliation_max_settle_seconds', '3600', FALSE,
+     'Upper bound for the settle window a shadow reconciliation may exclude from the comparison.'),
+    ('reconciliation_retention_days', '180', FALSE,
+     'reconciliation_run rows older than this are purged by meta.purge_reconciliation_runs().'),
+    ('change_log_lock_timeout_ms', '2000', FALSE,
+     'How long partition maintenance waits for the change-log lock before giving up until the next run.'),
+    ('dbt_run_lease_minutes', '360', FALSE,
+     'A dbt run lock not released within this time (crashed run) can be taken over by the next run.')
 ON CONFLICT (setting_key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS meta.pii_hash_key (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    hash_key BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO meta.pii_hash_key (id, hash_key)
+SELECT 1, gen_random_bytes(32)
+WHERE NOT EXISTS (SELECT 1 FROM meta.pii_hash_key);
+
+CREATE OR REPLACE FUNCTION meta.client_hash(p_source_id TEXT, p_tenant_id TEXT, p_client_id BIGINT)
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT encode(
+        hmac(convert_to(p_source_id || '::' || p_tenant_id || '::' || p_client_id::TEXT, 'UTF8'),
+             (SELECT k.hash_key FROM meta.pii_hash_key k WHERE k.id = 1), 'sha256'),
+        'hex')
+$$;
+
+CREATE OR REPLACE FUNCTION meta.rotate_pii_hash_key()
+RETURNS TIMESTAMPTZ
+LANGUAGE sql
+AS $$
+    UPDATE meta.pii_hash_key SET hash_key = gen_random_bytes(32), created_at = NOW() WHERE id = 1 RETURNING created_at
+$$;
 
 CREATE OR REPLACE FUNCTION meta.setting(p_key TEXT, p_default TEXT DEFAULT NULL)
 RETURNS TEXT
@@ -283,6 +332,12 @@ CREATE TABLE IF NOT EXISTS meta.ingestion_ownership (
 
 ALTER TABLE meta.ingestion_ownership ADD COLUMN IF NOT EXISTS shadow_requested_by TEXT;
 ALTER TABLE meta.ingestion_ownership ADD COLUMN IF NOT EXISTS shadow_requested_db_user TEXT;
+ALTER TABLE meta.ingestion_ownership ADD COLUMN IF NOT EXISTS shadow_started_at TIMESTAMPTZ;
+ALTER TABLE meta.ingestion_ownership ADD COLUMN IF NOT EXISTS ever_owned BOOLEAN NOT NULL DEFAULT FALSE;
+
+UPDATE meta.ingestion_ownership SET ever_owned = TRUE WHERE NOT ever_owned AND (engine <> 'NONE' OR epoch > 1);
+UPDATE meta.ingestion_ownership SET shadow_started_at = updated_at
+WHERE shadow_engine IS NOT NULL AND shadow_started_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS ix_ingestion_ownership_engine ON meta.ingestion_ownership (engine, shadow_engine);
 
@@ -308,8 +363,10 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF COALESCE(current_setting('fbi.audit_maintenance', TRUE), '') = 'on' THEN
-        RETURN CASE TG_OP WHEN 'DELETE' THEN OLD ELSE NEW END;
+    IF TG_OP = 'DELETE' AND COALESCE(current_setting('fbi.audit_maintenance', TRUE), '') = 'on'
+       AND current_user = (SELECT r.rolname FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner
+                           WHERE c.oid = 'meta.ingestion_ownership_audit'::regclass) THEN
+        RETURN OLD;
     END IF;
     RAISE EXCEPTION 'meta.ingestion_ownership_audit is append-only (% rejected)', TG_OP USING ERRCODE = 'FBI03';
 END;
@@ -334,6 +391,8 @@ CREATE TABLE IF NOT EXISTS meta.cutover_approval (
 CREATE OR REPLACE FUNCTION meta.approve_cutover(p_source_id TEXT, p_table_name TEXT, p_label TEXT DEFAULT NULL)
 RETURNS BIGINT
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
 AS $$
 DECLARE
     o meta.ingestion_ownership%ROWTYPE;
@@ -355,6 +414,14 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION meta.is_platform_admin()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT pg_has_role(session_user, 'fbi_platform_admin', 'MEMBER')
+$$;
+
 CREATE OR REPLACE FUNCTION meta.guard_ownership_update()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -364,8 +431,11 @@ DECLARE
     v_mode TEXT := meta.setting('dual_control_mode', 'parameter');
     v_ok BOOLEAN;
 BEGIN
+    IF NEW.source_id IS DISTINCT FROM OLD.source_id OR NEW.table_name IS DISTINCT FROM OLD.table_name THEN
+        RAISE EXCEPTION 'The key of an ownership row cannot change' USING ERRCODE = 'FBI03';
+    END IF;
     IF NEW.engine IS DISTINCT FROM OLD.engine THEN
-        IF OLD.engine = 'NONE' OR NEW.engine = 'NONE' THEN
+        IF OLD.engine = 'NONE' AND NOT OLD.ever_owned AND OLD.shadow_engine IS NULL THEN
             NULL;
         ELSIF OLD.shadow_engine IS NOT NULL AND NEW.engine = OLD.shadow_engine
               AND NEW.shadow_engine IS NULL AND OLD.cutover_state = 'CUTOVER_READY' THEN
@@ -376,11 +446,13 @@ BEGIN
                   AND r.table_name = OLD.table_name
                   AND r.comparison = 'shadow_vs_prod'
                   AND r.status = 'PASSED'
+                  AND r.started_at >= COALESCE(OLD.shadow_started_at, '-infinity'::TIMESTAMPTZ)
                   AND r.finished_at > NOW() - make_interval(mins => v_max_age)
             ) INTO v_ok;
             IF NOT v_ok THEN
-                RAISE EXCEPTION 'Cutover of %/% needs a PASSED shadow_vs_prod reconciliation of this table newer than % minutes',
-                    OLD.source_id, OLD.table_name, v_max_age USING ERRCODE = 'FBI03';
+                RAISE EXCEPTION 'Cutover of %/% needs a PASSED shadow_vs_prod reconciliation of this table, taken during '
+                    'the current shadow and newer than % minutes', OLD.source_id, OLD.table_name, v_max_age
+                    USING ERRCODE = 'FBI03';
             END IF;
             IF v_mode = 'database' THEN
                 SELECT EXISTS (
@@ -394,11 +466,11 @@ BEGIN
                         OLD.source_id, OLD.table_name USING ERRCODE = 'FBI03';
                 END IF;
             END IF;
-        ELSIF COALESCE(current_setting('fbi.force_approved_by', TRUE), '') <> '' THEN
+        ELSIF meta.is_platform_admin() THEN
             NULL;
         ELSE
-            RAISE EXCEPTION 'Illegal engine change % -> % for %/%', OLD.engine, NEW.engine, OLD.source_id, OLD.table_name
-                USING ERRCODE = 'FBI03';
+            RAISE EXCEPTION 'Engine change % -> % for %/% needs a reconciled cutover, or a login that is a member of '
+                'fbi_platform_admin', OLD.engine, NEW.engine, OLD.source_id, OLD.table_name USING ERRCODE = 'FBI03';
         END IF;
     END IF;
     IF (NEW.engine IS DISTINCT FROM OLD.engine OR NEW.shadow_engine IS DISTINCT FROM OLD.shadow_engine)
@@ -408,10 +480,19 @@ BEGIN
     END IF;
     IF NEW.shadow_engine IS NOT NULL AND OLD.shadow_engine IS NULL THEN
         NEW.shadow_requested_db_user := session_user;
+        NEW.shadow_started_at := NOW();
     ELSIF NEW.shadow_engine IS NULL THEN
         NEW.shadow_requested_db_user := NULL;
         NEW.shadow_requested_by := NULL;
+        NEW.shadow_started_at := NULL;
+    ELSIF NEW.shadow_engine IS DISTINCT FROM OLD.shadow_engine THEN
+        RAISE EXCEPTION 'Shadow of %/% cannot switch engines; abort it first', OLD.source_id, OLD.table_name
+            USING ERRCODE = 'FBI03';
+    ELSE
+        NEW.shadow_requested_db_user := OLD.shadow_requested_db_user;
+        NEW.shadow_started_at := OLD.shadow_started_at;
     END IF;
+    NEW.ever_owned := OLD.ever_owned OR NEW.engine <> 'NONE';
     RETURN NEW;
 END;
 $$;
@@ -420,6 +501,127 @@ DROP TRIGGER IF EXISTS trg_ownership_guard ON meta.ingestion_ownership;
 CREATE TRIGGER trg_ownership_guard
     BEFORE UPDATE ON meta.ingestion_ownership
     FOR EACH ROW EXECUTE FUNCTION meta.guard_ownership_update();
+
+CREATE OR REPLACE FUNCTION meta.audit_ownership_change()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+BEGIN
+    IF (NEW.engine, NEW.shadow_engine, NEW.cutover_state, NEW.epoch, NEW.last_reconciliation_id)
+       IS NOT DISTINCT FROM (OLD.engine, OLD.shadow_engine, OLD.cutover_state, OLD.epoch, OLD.last_reconciliation_id) THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO meta.ingestion_ownership_audit (source_id, table_name, action, previous_state, new_state, actor,
+                                                approved_by, reason)
+    VALUES (
+        NEW.source_id,
+        NEW.table_name,
+        COALESCE(NULLIF(current_setting('fbi.action', TRUE), ''), 'direct_update'),
+        to_jsonb(OLD) - 'updated_at',
+        to_jsonb(NEW) - 'updated_at',
+        COALESCE(NULLIF(current_setting('fbi.actor', TRUE), ''), session_user),
+        NULLIF(current_setting('fbi.approved_by', TRUE), ''),
+        COALESCE(NULLIF(current_setting('fbi.reason', TRUE), ''), NEW.change_reason)
+    );
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_ownership_audit ON meta.ingestion_ownership;
+CREATE TRIGGER trg_ownership_audit
+    AFTER UPDATE ON meta.ingestion_ownership
+    FOR EACH ROW EXECUTE FUNCTION meta.audit_ownership_change();
+
+CREATE OR REPLACE FUNCTION meta.ensure_ownership_rows(p_source_id TEXT, p_tables TEXT[])
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+DECLARE
+    n INTEGER;
+BEGIN
+    INSERT INTO meta.ingestion_ownership (source_id, table_name, engine, updated_by, change_reason)
+    SELECT p_source_id, t, 'NONE', session_user, 'registered'
+    FROM unnest(p_tables) AS t
+    ON CONFLICT (source_id, table_name) DO NOTHING;
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION meta.transition_ownership(
+    p_source_id TEXT,
+    p_table_name TEXT,
+    p_expected_epoch BIGINT,
+    p_engine TEXT,
+    p_shadow_engine TEXT,
+    p_cutover_state TEXT,
+    p_epoch BIGINT,
+    p_last_reconciliation_id BIGINT,
+    p_shadow_requested_by TEXT,
+    p_action TEXT,
+    p_actor TEXT,
+    p_approved_by TEXT,
+    p_reason TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+DECLARE
+    v_found BOOLEAN;
+BEGIN
+    IF COALESCE(btrim(p_actor), '') = '' OR COALESCE(btrim(p_reason), '') = '' OR COALESCE(btrim(p_action), '') = '' THEN
+        RAISE EXCEPTION 'action, actor and reason are required' USING ERRCODE = '22023';
+    END IF;
+    PERFORM set_config('fbi.action', p_action, TRUE);
+    PERFORM set_config('fbi.actor', p_actor, TRUE);
+    PERFORM set_config('fbi.approved_by', COALESCE(p_approved_by, ''), TRUE);
+    PERFORM set_config('fbi.reason', p_reason, TRUE);
+    UPDATE meta.ingestion_ownership
+    SET engine = p_engine,
+        shadow_engine = p_shadow_engine,
+        cutover_state = p_cutover_state,
+        epoch = p_epoch,
+        last_reconciliation_id = p_last_reconciliation_id,
+        shadow_requested_by = p_shadow_requested_by,
+        updated_at = NOW(),
+        updated_by = p_actor,
+        change_reason = p_reason
+    WHERE source_id = p_source_id AND table_name = p_table_name AND epoch = p_expected_epoch;
+    v_found := FOUND;
+    PERFORM set_config('fbi.action', '', TRUE);
+    PERFORM set_config('fbi.actor', '', TRUE);
+    PERFORM set_config('fbi.approved_by', '', TRUE);
+    PERFORM set_config('fbi.reason', '', TRUE);
+    RETURN v_found;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION meta.guard_source_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM meta.ingestion_ownership o
+        WHERE o.source_id = OLD.source_id AND (o.engine <> 'NONE' OR o.shadow_engine IS NOT NULL)
+    ) THEN
+        RAISE EXCEPTION 'Source % still owns tables; retire it (as a platform administrator) before deleting it',
+            OLD.source_id USING ERRCODE = 'FBI03';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_source_delete_guard ON meta.source_registry;
+CREATE TRIGGER trg_source_delete_guard
+    BEFORE DELETE ON meta.source_registry
+    FOR EACH ROW EXECUTE FUNCTION meta.guard_source_delete();
 
 CREATE OR REPLACE FUNCTION meta.ownership_lock_key(p_source_id TEXT, p_table_name TEXT)
 RETURNS BIGINT
@@ -510,37 +712,34 @@ CREATE TABLE IF NOT EXISTS meta.entity_change_log_default PARTITION OF meta.enti
 CREATE INDEX IF NOT EXISTS ix_entity_change_log_txid ON meta.entity_change_log (txid);
 CREATE INDEX IF NOT EXISTS ix_entity_change_log_source ON meta.entity_change_log (source_id, entity, entity_id);
 
-CREATE OR REPLACE FUNCTION meta.ensure_change_log_partitions(p_days_back INTEGER DEFAULT 1, p_days_ahead INTEGER DEFAULT 3)
+CREATE OR REPLACE FUNCTION meta.ensure_change_log_partitions(p_days_back INTEGER DEFAULT 1, p_days_ahead INTEGER DEFAULT 7)
 RETURNS INTEGER
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = meta, pg_temp
 AS $$
 DECLARE
+    v_back INTEGER := LEAST(GREATEST(COALESCE(p_days_back, 1), 0), 62);
+    v_ahead INTEGER := LEAST(GREATEST(COALESCE(p_days_ahead, 7), 0), 31);
     d DATE;
     v_name TEXT;
     n INTEGER := 0;
 BEGIN
-    FOR d IN SELECT generate_series(CURRENT_DATE - p_days_back, CURRENT_DATE + p_days_ahead, INTERVAL '1 day')::DATE LOOP
+    PERFORM set_config('lock_timeout', meta.setting('change_log_lock_timeout_ms', '2000') || 'ms', TRUE);
+    FOR d IN SELECT generate_series(CURRENT_DATE - v_back, CURRENT_DATE + v_ahead, INTERVAL '1 day')::DATE LOOP
         v_name := 'entity_change_log_' || to_char(d, 'YYYYMMDD');
         IF to_regclass('meta.' || v_name) IS NULL THEN
-            IF EXISTS (
-                SELECT 1 FROM meta.entity_change_log_default
-                WHERE changed_at >= d::TIMESTAMPTZ AND changed_at < (d + 1)::TIMESTAMPTZ
-            ) THEN
-                EXECUTE format('CREATE TABLE meta.%I (LIKE meta.entity_change_log INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', v_name);
-                EXECUTE format(
-                    'WITH moved AS (DELETE FROM meta.entity_change_log_default WHERE changed_at >= %L AND changed_at < %L '
-                    'RETURNING *) INSERT INTO meta.%I SELECT * FROM moved',
-                    d::TIMESTAMPTZ, (d + 1)::TIMESTAMPTZ, v_name);
-                EXECUTE format(
-                    'ALTER TABLE meta.entity_change_log ATTACH PARTITION meta.%I FOR VALUES FROM (%L) TO (%L)',
-                    v_name, d::TIMESTAMPTZ, (d + 1)::TIMESTAMPTZ);
-            ELSE
-                EXECUTE format(
-                    'CREATE TABLE meta.%I PARTITION OF meta.entity_change_log FOR VALUES FROM (%L) TO (%L)',
-                    v_name, d::TIMESTAMPTZ, (d + 1)::TIMESTAMPTZ);
-            END IF;
+            EXECUTE format('CREATE TABLE meta.%I (LIKE meta.entity_change_log INCLUDING DEFAULTS INCLUDING CONSTRAINTS)', v_name);
+            EXECUTE format('ALTER TABLE meta.%I ADD CONSTRAINT %I CHECK (changed_at >= %L AND changed_at < %L)',
+                           v_name, v_name || '_range', d::TIMESTAMPTZ, (d + 1)::TIMESTAMPTZ);
+            EXECUTE format(
+                'WITH moved AS (DELETE FROM meta.entity_change_log_default WHERE changed_at >= %L AND changed_at < %L '
+                'RETURNING *) INSERT INTO meta.%I SELECT * FROM moved',
+                d::TIMESTAMPTZ, (d + 1)::TIMESTAMPTZ, v_name);
+            EXECUTE format(
+                'ALTER TABLE meta.entity_change_log ATTACH PARTITION meta.%I FOR VALUES FROM (%L) TO (%L)',
+                v_name, d::TIMESTAMPTZ, (d + 1)::TIMESTAMPTZ);
+            EXECUTE format('ALTER TABLE meta.%I DROP CONSTRAINT %I', v_name, v_name || '_range');
             n := n + 1;
         END IF;
     END LOOP;
@@ -590,6 +789,44 @@ CREATE TABLE IF NOT EXISTS meta.dbt_mart_dirty (
 );
 CREATE INDEX IF NOT EXISTS ix_dbt_mart_dirty_run ON meta.dbt_mart_dirty (run_id);
 
+CREATE TABLE IF NOT EXISTS meta.dbt_run_lock (
+    lock_name TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE OR REPLACE FUNCTION meta.acquire_dbt_lock(p_holder TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_holder TEXT;
+    r meta.dbt_run_lock%ROWTYPE;
+BEGIN
+    INSERT INTO meta.dbt_run_lock AS l (lock_name, holder, acquired_at, expires_at)
+    VALUES ('dbt', p_holder, NOW(), NOW() + make_interval(mins => meta.setting('dbt_run_lease_minutes', '360')::INTEGER))
+    ON CONFLICT (lock_name) DO UPDATE
+    SET holder = EXCLUDED.holder, acquired_at = EXCLUDED.acquired_at, expires_at = EXCLUDED.expires_at
+    WHERE l.expires_at < NOW() OR l.holder = EXCLUDED.holder
+    RETURNING l.holder INTO v_holder;
+    IF v_holder IS NULL THEN
+        SELECT * INTO r FROM meta.dbt_run_lock WHERE lock_name = 'dbt';
+        RAISE EXCEPTION 'Another dbt run (%) has held the run lock since %; runs are serialised so change cursors '
+            'never skip changes', r.holder, r.acquired_at USING ERRCODE = 'FBI04';
+    END IF;
+    RETURN v_holder;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION meta.release_dbt_lock(p_holder TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+AS $$
+    WITH released AS (DELETE FROM meta.dbt_run_lock WHERE lock_name = 'dbt' AND holder = p_holder RETURNING 1)
+    SELECT EXISTS (SELECT 1 FROM released)
+$$;
+
 CREATE OR REPLACE FUNCTION meta.change_log_horizon()
 RETURNS xid8
 LANGUAGE sql
@@ -598,44 +835,49 @@ AS $$
     SELECT pg_snapshot_xmin(pg_current_snapshot())
 $$;
 
-CREATE OR REPLACE FUNCTION meta.purge_change_log(p_retention_days INTEGER DEFAULT NULL)
+DROP FUNCTION IF EXISTS meta.purge_change_log(INTEGER);
+
+CREATE OR REPLACE FUNCTION meta.purge_change_log(p_retention_days INTEGER DEFAULT NULL, p_max_partitions INTEGER DEFAULT 1)
 RETURNS INTEGER
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = meta, pg_temp
 AS $$
 DECLARE
-    v_days INTEGER := COALESCE(p_retention_days, meta.setting('change_log_retention_days', '14')::INTEGER);
+    v_days INTEGER := GREATEST(COALESCE(p_retention_days, 0), meta.setting('change_log_retention_days', '14')::INTEGER);
     v_stale INTEGER := meta.setting('cursor_stale_days', '7')::INTEGER;
     v_floor xid8;
     r RECORD;
-    v_bound DATE;
     v_has_pending BOOLEAN;
     n INTEGER := 0;
 BEGIN
+    PERFORM meta.ensure_change_log_partitions();
     SELECT MIN(last_txid) INTO v_floor
     FROM meta.dbt_change_cursor
     WHERE updated_at > NOW() - make_interval(days => v_stale);
     IF v_floor IS NULL THEN
         RETURN 0;
     END IF;
-    PERFORM meta.ensure_change_log_partitions();
+    PERFORM set_config('lock_timeout', meta.setting('change_log_lock_timeout_ms', '2000') || 'ms', TRUE);
     FOR r IN
         SELECT c.relname
         FROM pg_inherits i
         JOIN pg_class c ON c.oid = i.inhrelid
         WHERE i.inhparent = 'meta.entity_change_log'::regclass
           AND c.relname ~ '^entity_change_log_[0-9]{8}$'
+          AND to_date(right(c.relname, 8), 'YYYYMMDD') + 1 <= (NOW() - make_interval(days => v_days))::DATE
+        ORDER BY c.relname
     LOOP
-        v_bound := to_date(right(r.relname, 8), 'YYYYMMDD');
-        IF v_bound + 1 > (NOW() - make_interval(days => v_days))::DATE THEN
-            CONTINUE;
-        END IF;
+        EXIT WHEN n >= GREATEST(COALESCE(p_max_partitions, 1), 1);
         EXECUTE format('SELECT EXISTS (SELECT 1 FROM meta.%I WHERE txid >= $1)', r.relname) INTO v_has_pending USING v_floor;
-        IF NOT v_has_pending THEN
+        CONTINUE WHEN v_has_pending;
+        BEGIN
             EXECUTE format('DROP TABLE meta.%I', r.relname);
             n := n + 1;
-        END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            RAISE NOTICE 'change-log partition % is busy; it will be dropped by a later run', r.relname;
+            EXIT;
+        END;
     END LOOP;
     DELETE FROM meta.entity_change_log_default
     WHERE changed_at < NOW() - make_interval(days => v_days) AND txid < v_floor;
@@ -646,9 +888,11 @@ $$;
 CREATE OR REPLACE FUNCTION meta.purge_progress(p_days INTEGER DEFAULT NULL)
 RETURNS BIGINT
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
 AS $$
 DECLARE
-    v_days INTEGER := COALESCE(p_days, meta.setting('progress_retention_days', '7')::INTEGER);
+    v_days INTEGER := GREATEST(COALESCE(p_days, 0), meta.setting('progress_retention_days', '7')::INTEGER);
     v_a BIGINT;
     v_b BIGINT;
 BEGIN
@@ -667,7 +911,7 @@ SECURITY DEFINER
 SET search_path = meta, pg_temp
 AS $$
 DECLARE
-    v_days INTEGER := COALESCE(p_days, meta.setting('ownership_audit_retention_days', '730')::INTEGER);
+    v_days INTEGER := GREATEST(COALESCE(p_days, 0), meta.setting('ownership_audit_retention_days', '730')::INTEGER);
     v_n BIGINT;
 BEGIN
     PERFORM set_config('fbi.audit_maintenance', 'on', TRUE);
@@ -695,6 +939,52 @@ CREATE TABLE IF NOT EXISTS meta.reconciliation_run (
 
 CREATE INDEX IF NOT EXISTS ix_reconciliation_source ON meta.reconciliation_run (source_id, table_name, started_at DESC);
 
+CREATE OR REPLACE FUNCTION meta.record_source_reconciliation(
+    p_source_id TEXT,
+    p_table_name TEXT,
+    p_status TEXT,
+    p_compared_rows BIGINT,
+    p_mismatched_rows BIGINT,
+    p_missing_left BIGINT,
+    p_missing_right BIGINT,
+    p_details JSONB
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+DECLARE
+    v_id BIGINT;
+BEGIN
+    INSERT INTO meta.reconciliation_run (source_id, table_name, comparison, status, compared_rows, mismatched_rows,
+                                         missing_left, missing_right, details, finished_at)
+    VALUES (p_source_id, p_table_name, 'source_vs_warehouse', p_status, p_compared_rows, p_mismatched_rows,
+            p_missing_left, p_missing_right,
+            COALESCE(p_details, '{}'::jsonb) || jsonb_build_object('db_user', session_user), NOW())
+    RETURNING reconciliation_id INTO v_id;
+    RETURN v_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION meta.purge_reconciliation_runs(p_days INTEGER DEFAULT NULL)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+DECLARE
+    v_days INTEGER := GREATEST(COALESCE(p_days, 0), meta.setting('reconciliation_retention_days', '180')::INTEGER);
+    v_n BIGINT;
+BEGIN
+    DELETE FROM meta.reconciliation_run r
+    WHERE r.started_at < NOW() - make_interval(days => v_days)
+      AND NOT EXISTS (SELECT 1 FROM meta.ingestion_ownership o WHERE o.last_reconciliation_id = r.reconciliation_id);
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS meta.connector_state (
     source_id TEXT PRIMARY KEY,
     connector_name TEXT NOT NULL,
@@ -707,8 +997,11 @@ CREATE TABLE IF NOT EXISTS meta.connector_state (
     observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-ALTER TABLE meta.connector_state ADD COLUMN IF NOT EXISTS slot_checked_at TIMESTAMPTZ;
-ALTER TABLE meta.connector_state ADD COLUMN IF NOT EXISTS slot_check_key TEXT;
+CREATE TABLE IF NOT EXISTS meta.slot_check (
+    source_id TEXT PRIMARY KEY,
+    check_key TEXT NOT NULL,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 CREATE TABLE IF NOT EXISTS meta.pipeline_state (
     run_id UUID PRIMARY KEY,
@@ -1090,7 +1383,8 @@ BEGIN
            string_agg(format('s.%I', col ->> 'name'), ', ' ORDER BY ord)
       INTO v_row_expr_p, v_row_expr_s
       FROM jsonb_array_elements(c.columns) WITH ORDINALITY AS x(col, ord)
-     WHERE NOT COALESCE((col ->> 'synthetic')::BOOLEAN, FALSE);
+     WHERE NOT COALESCE((col ->> 'synthetic')::BOOLEAN, FALSE)
+       AND NOT COALESCE((col ->> 'pii')::BOOLEAN, FALSE);
 
     RETURN QUERY EXECUTE format($q$
         WITH p AS (SELECT * FROM raw.%1$I WHERE source_id = $1 AND NOT _is_deleted),
@@ -1110,6 +1404,37 @@ BEGIN
                COALESCE((SELECT jsonb_agg(k) FROM (SELECT k FROM j WHERE differs LIMIT 20) sample), '[]'::jsonb)
         FROM j
     $q$, c.raw_table, c.primary_key, v_row_expr_p, v_row_expr_s) USING p_source_id, p_settle;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION meta.run_shadow_reconciliation(p_source_id TEXT, p_table TEXT, p_settle_seconds INTEGER)
+RETURNS TABLE (reconciliation_id BIGINT, passed BOOLEAN, compared_rows BIGINT, mismatched_rows BIGINT,
+               missing_in_prod BIGINT, missing_in_shadow BIGINT, sample_keys JSONB, settle_seconds INTEGER)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+DECLARE
+    v_settle INTEGER := LEAST(GREATEST(COALESCE(p_settle_seconds, 0), 0),
+                              meta.setting('reconciliation_max_settle_seconds', '3600')::INTEGER);
+    v_tolerance BIGINT := meta.setting('reconciliation_max_discrepancies', '0')::BIGINT;
+    v RECORD;
+    v_passed BOOLEAN;
+    v_id BIGINT;
+BEGIN
+    SELECT * INTO v FROM meta.reconcile_shadow(p_source_id, p_table, make_interval(secs => v_settle));
+    v_passed := COALESCE(v.mismatched_rows, 0) + COALESCE(v.missing_in_prod, 0) + COALESCE(v.missing_in_shadow, 0)
+                <= v_tolerance;
+    INSERT INTO meta.reconciliation_run AS r (source_id, table_name, comparison, status, compared_rows, mismatched_rows,
+                                              missing_left, missing_right, details, finished_at)
+    VALUES (p_source_id, p_table, 'shadow_vs_prod', CASE WHEN v_passed THEN 'PASSED' ELSE 'FAILED' END,
+            v.compared_rows, v.mismatched_rows, v.missing_in_prod, v.missing_in_shadow,
+            jsonb_build_object('settle_seconds', v_settle, 'tolerance', v_tolerance, 'sample_keys', v.sample_keys,
+                               'db_user', session_user),
+            NOW())
+    RETURNING r.reconciliation_id INTO v_id;
+    RETURN QUERY SELECT v_id, v_passed, v.compared_rows, v.mismatched_rows, v.missing_in_prod, v.missing_in_shadow,
+                        v.sample_keys, v_settle;
 END;
 $$;
 
@@ -1137,3 +1462,95 @@ SELECT
 FROM meta.ingestion_ownership o
 JOIN meta.source_registry r USING (source_id)
 GROUP BY r.region, o.engine, o.shadow_engine, o.cutover_state;
+
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT DISTINCT c.oid::regclass AS rel, g.grantee::regrole AS grantee
+        FROM pg_class c
+        CROSS JOIN LATERAL aclexplode(c.relacl) g
+        WHERE c.oid IN ('meta.ingestion_ownership'::regclass, 'meta.cutover_approval'::regclass,
+                        'meta.reconciliation_run'::regclass, 'meta.ingestion_ownership_audit'::regclass,
+                        'meta.pii_hash_key'::regclass)
+          AND g.grantee <> c.relowner
+          AND g.grantee <> 0
+          AND g.privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE')
+    LOOP
+        EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON %s FROM %s', r.rel, r.grantee);
+    END LOOP;
+    FOR r IN
+        SELECT DISTINCT g.grantee::regrole AS grantee
+        FROM pg_class c
+        CROSS JOIN LATERAL aclexplode(c.relacl) g
+        WHERE c.oid = 'meta.pii_hash_key'::regclass
+          AND g.grantee <> c.relowner
+          AND g.grantee <> 0
+          AND g.grantee <> 'fbi_control_plane'::regrole
+    LOOP
+        EXECUTE format('REVOKE ALL ON meta.pii_hash_key FROM %s', r.grantee);
+    END LOOP;
+END
+$$;
+
+REVOKE ALL ON meta.pii_hash_key FROM PUBLIC;
+GRANT SELECT ON meta.pii_hash_key TO fbi_control_plane;
+CREATE OR REPLACE FUNCTION meta.scrub_pii()
+RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    t RECORD;
+    v_col TEXT;
+    v_schema TEXT;
+    v_rows BIGINT;
+    n BIGINT := 0;
+BEGIN
+    FOR t IN SELECT raw_table, columns FROM meta.table_contract LOOP
+        FOR v_col IN
+            SELECT x ->> 'name' FROM jsonb_array_elements(t.columns) AS x WHERE COALESCE((x ->> 'pii')::BOOLEAN, FALSE)
+        LOOP
+            FOREACH v_schema IN ARRAY ARRAY['raw', 'raw_shadow'] LOOP
+                EXECUTE format('UPDATE %I.%I SET %I = NULL WHERE %I IS NOT NULL', v_schema, t.raw_table, v_col, v_col);
+                GET DIAGNOSTICS v_rows = ROW_COUNT;
+                n := n + v_rows;
+            END LOOP;
+        END LOOP;
+    END LOOP;
+    RETURN n;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION meta.rotate_pii_hash_key() FROM PUBLIC;
+REVOKE ALL ON FUNCTION meta.scrub_pii() FROM PUBLIC;
+
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON meta.ingestion_ownership, meta.cutover_approval, meta.reconciliation_run,
+    meta.ingestion_ownership_audit FROM PUBLIC;
+
+REVOKE ALL ON FUNCTION
+    meta.approve_cutover(TEXT, TEXT, TEXT),
+    meta.audit_ownership_change(),
+    meta.ensure_ownership_rows(TEXT, TEXT[]),
+    meta.transition_ownership(TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, BIGINT, BIGINT, TEXT, TEXT, TEXT, TEXT, TEXT),
+    meta.ensure_change_log_partitions(INTEGER, INTEGER),
+    meta.purge_change_log(INTEGER, INTEGER),
+    meta.purge_progress(INTEGER),
+    meta.purge_ownership_audit(INTEGER),
+    meta.record_source_reconciliation(TEXT, TEXT, TEXT, BIGINT, BIGINT, BIGINT, BIGINT, JSONB),
+    meta.purge_reconciliation_runs(INTEGER),
+    meta.run_shadow_reconciliation(TEXT, TEXT, INTEGER)
+FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION
+    meta.approve_cutover(TEXT, TEXT, TEXT),
+    meta.ensure_ownership_rows(TEXT, TEXT[]),
+    meta.transition_ownership(TEXT, TEXT, BIGINT, TEXT, TEXT, TEXT, BIGINT, BIGINT, TEXT, TEXT, TEXT, TEXT, TEXT),
+    meta.ensure_change_log_partitions(INTEGER, INTEGER),
+    meta.purge_change_log(INTEGER, INTEGER),
+    meta.purge_progress(INTEGER),
+    meta.purge_ownership_audit(INTEGER),
+    meta.record_source_reconciliation(TEXT, TEXT, TEXT, BIGINT, BIGINT, BIGINT, BIGINT, JSONB),
+    meta.purge_reconciliation_runs(INTEGER),
+    meta.run_shadow_reconciliation(TEXT, TEXT, INTEGER)
+TO fbi_control_plane;

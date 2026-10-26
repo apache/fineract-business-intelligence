@@ -79,6 +79,14 @@ public final class SinkWorker implements Runnable {
         }
     }
 
+    static final class QuarantineLimitException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        QuarantineLimitException(String message) {
+            super(message);
+        }
+    }
+
     record Outcome(Map<TopicPartition, OffsetAndMetadata> commit, Map<TopicPartition, Long> heldFrom) {
     }
 
@@ -105,6 +113,7 @@ public final class SinkWorker implements Runnable {
     private volatile boolean alive = true;
     private volatile boolean fatal;
     private volatile long failingSince;
+    private boolean quarantineTripped;
     private Consumer<byte[], byte[]> consumer;
 
     public SinkWorker(int index, SinkConfig config, ConnectionSource connections, OwnershipView ownership,
@@ -249,6 +258,7 @@ public final class SinkWorker implements Runnable {
                     settle(c, batch, outcome);
                     mergeCommit(commit, outcome.commit());
                     failingSince = 0;
+                    quarantineTripped = false;
                     return commit;
                 } catch (FencedWriteException e) {
                     metrics.fenced();
@@ -265,12 +275,32 @@ public final class SinkWorker implements Runnable {
                         fail("Permanent warehouse error, stopping this worker: " + e.getMessage(), e);
                         return commit;
                     }
-                    if (kind == SqlFailures.Kind.DATA) {
+                    if (kind == SqlFailures.Kind.DATA && quarantineTripped) {
+                        metrics.dbError();
+                        markFailing();
+                        LOG.error("Batch rejected by the warehouse again ({}); dead-lettering stays suspended until a "
+                                + "batch applies or the sink restarts", e.getMessage());
+                    } else if (kind == SqlFailures.Kind.DATA) {
                         LOG.warn("Batch rejected by the warehouse ({}), isolating the offending record", e.getMessage());
+                        if (!paused) {
+                            c.pause(c.assignment());
+                            paused = true;
+                        }
                         try {
                             mergeCommit(commit, isolate(c, new ArrayList<>(buffer)));
                             failingSince = 0;
                             continue;
+                        } catch (FencedWriteException inner) {
+                            metrics.fenced();
+                            markFailing();
+                            refreshOwnership(true);
+                            LOG.info("Isolation kept being fenced ({}), retrying in {} ms", inner.getMessage(), backoff);
+                        } catch (QuarantineLimitException inner) {
+                            quarantineTripped = true;
+                            metrics.quarantineTripped();
+                            metrics.dbError();
+                            markFailing();
+                            LOG.error(inner.getMessage());
                         } catch (SQLException inner) {
                             if (SqlFailures.classify(inner) == SqlFailures.Kind.FATAL) {
                                 fail("Permanent warehouse error, stopping this worker: " + inner.getMessage(), inner);
@@ -363,22 +393,30 @@ public final class SinkWorker implements Runnable {
     }
 
     private void settle(Consumer<byte[], byte[]> c, List<ConsumerRecord<byte[], byte[]>> batch, Outcome outcome) {
+        removeProcessed(batch, outcome.heldFrom());
+        applyHolds(c, outcome.heldFrom());
+    }
+
+    private void removeProcessed(List<ConsumerRecord<byte[], byte[]>> batch, Map<TopicPartition, Long> heldFrom) {
         Set<ConsumerRecord<byte[], byte[]>> processed = Collections.newSetFromMap(new IdentityHashMap<>());
         for (ConsumerRecord<byte[], byte[]> r : batch) {
-            Long heldFrom = outcome.heldFrom().get(partitionOf(r));
-            if (heldFrom == null || r.offset() < heldFrom) {
+            Long from = heldFrom.get(partitionOf(r));
+            if (from == null || r.offset() < from) {
                 processed.add(r);
             }
         }
         buffer.removeIf(processed::contains);
+    }
+
+    private void applyHolds(Consumer<byte[], byte[]> c, Map<TopicPartition, Long> heldFrom) {
         Set<TopicPartition> assigned = c.assignment();
         Set<TopicPartition> release = new HashSet<>(held);
-        release.removeAll(outcome.heldFrom().keySet());
+        release.removeAll(heldFrom.keySet());
         release.retainAll(assigned);
         if (!release.isEmpty()) {
             c.resume(release);
         }
-        Set<TopicPartition> hold = new HashSet<>(outcome.heldFrom().keySet());
+        Set<TopicPartition> hold = new HashSet<>(heldFrom.keySet());
         hold.retainAll(assigned);
         if (!hold.isEmpty()) {
             c.pause(hold);
@@ -391,30 +429,76 @@ public final class SinkWorker implements Runnable {
         held.addAll(hold);
     }
 
+    int quarantineLimit(int batchSize) {
+        int byRatio = (int) Math.ceil(config.quarantineMaxRatio() * batchSize);
+        return Math.max(1, Math.min(config.quarantineMaxRows(), byRatio));
+    }
+
+    private void keepAlive(Consumer<byte[], byte[]> c, Deque<List<ConsumerRecord<byte[], byte[]>>> work) {
+        c.pause(c.assignment());
+        ConsumerRecords<byte[], byte[]> stray = c.poll(Duration.ZERO);
+        for (TopicPartition tp : stray.partitions()) {
+            c.seek(tp, stray.records(tp).get(0).offset());
+        }
+        Set<TopicPartition> assigned = c.assignment();
+        for (List<ConsumerRecord<byte[], byte[]>> part : work) {
+            part.removeIf(r -> !assigned.contains(partitionOf(r)));
+        }
+    }
+
     Map<TopicPartition, OffsetAndMetadata> isolate(Consumer<byte[], byte[]> c,
             List<ConsumerRecord<byte[], byte[]>> batch)
             throws SQLException, ExecutionException, InterruptedException {
         Map<TopicPartition, OffsetAndMetadata> commit = new HashMap<>();
+        Map<TopicPartition, Long> heldFrom = new HashMap<>();
+        OwnershipSnapshot snap = ownership.snapshot();
+        int limit = quarantineLimit(batch.size());
+        int quarantined = 0;
+        int fencedInARow = 0;
         Deque<List<ConsumerRecord<byte[], byte[]>>> work = new ArrayDeque<>();
-        work.add(batch);
-        while (!work.isEmpty()) {
-            List<ConsumerRecord<byte[], byte[]>> part = work.pollFirst();
-            try {
-                Outcome outcome = process(part);
-                settle(c, part, outcome);
-                mergeCommit(commit, outcome.commit());
-            } catch (SQLException e) {
-                if (SqlFailures.classify(e) != SqlFailures.Kind.DATA) {
-                    throw e;
+        work.add(new ArrayList<>(batch));
+        try {
+            while (!work.isEmpty()) {
+                keepAlive(c, work);
+                List<ConsumerRecord<byte[], byte[]>> part = work.pollFirst();
+                if (part.isEmpty()) {
+                    continue;
                 }
-                if (part.size() == 1) {
-                    mergeCommit(commit, quarantine(part.get(0), e));
-                } else {
-                    int mid = part.size() / 2;
-                    work.addFirst(new ArrayList<>(part.subList(mid, part.size())));
-                    work.addFirst(new ArrayList<>(part.subList(0, mid)));
+                try {
+                    Outcome outcome = process(part, snap, heldFrom);
+                    heldFrom.putAll(outcome.heldFrom());
+                    removeProcessed(part, outcome.heldFrom());
+                    mergeCommit(commit, outcome.commit());
+                    fencedInARow = 0;
+                } catch (FencedWriteException e) {
+                    metrics.fenced();
+                    if (++fencedInARow >= 5) {
+                        throw e;
+                    }
+                    refreshOwnership(true);
+                    snap = ownership.snapshot();
+                    work.addFirst(part);
+                } catch (SQLException e) {
+                    if (SqlFailures.classify(e) != SqlFailures.Kind.DATA) {
+                        throw e;
+                    }
+                    if (part.size() > 1) {
+                        int mid = part.size() / 2;
+                        work.addFirst(new ArrayList<>(part.subList(mid, part.size())));
+                        work.addFirst(new ArrayList<>(part.subList(0, mid)));
+                    } else if (quarantined >= limit) {
+                        throw new QuarantineLimitException("More than " + limit + " of " + batch.size()
+                                + " records in one batch were rejected by the warehouse (last: " + e.getSQLState() + " "
+                                + e.getMessage() + "); this looks systemic (contract or type mismatch), so dead-lettering "
+                                + "is suspended and the batch is retried until it applies or the sink restarts");
+                    } else {
+                        mergeCommit(commit, quarantine(part.get(0), e));
+                        quarantined++;
+                    }
                 }
             }
+        } finally {
+            applyHolds(c, heldFrom);
         }
         return commit;
     }
@@ -441,13 +525,18 @@ public final class SinkWorker implements Runnable {
 
     Outcome process(List<ConsumerRecord<byte[], byte[]>> batch)
             throws SQLException, ExecutionException, InterruptedException {
+        return process(batch, ownership.snapshot(), Map.of());
+    }
+
+    Outcome process(List<ConsumerRecord<byte[], byte[]>> batch, OwnershipSnapshot snap,
+            Map<TopicPartition, Long> alreadyHeld)
+            throws SQLException, ExecutionException, InterruptedException {
         long started = System.nanoTime();
-        OwnershipSnapshot snap = ownership.snapshot();
         List<RoutedEvent> writes = new ArrayList<>(batch.size());
         List<DeadLetterPublisher.DeadLetter> letters = new ArrayList<>();
         List<SkipCheck> skips = new ArrayList<>();
         Map<TopicPartition, Long> next = new HashMap<>();
-        Map<TopicPartition, Long> heldFrom = new HashMap<>();
+        Map<TopicPartition, Long> heldFrom = new HashMap<>(alreadyHeld);
         Map<String, long[]> perTable = new HashMap<>();
 
         for (ConsumerRecord<byte[], byte[]> r : batch) {

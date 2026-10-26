@@ -27,7 +27,7 @@ from controlplane.connectors import (
 )
 from controlplane.reconciler import stale_slots
 from controlplane.registry import RegistryError, SourceRecord, connector_name, source_id_from_connector
-from controlplane.secrets import SecretError, connect_placeholder, resolve
+from controlplane.secrets import SecretError, bound_env_name, connect_placeholder, resolve
 
 
 def settings(**kw) -> CdcSettings:
@@ -37,7 +37,7 @@ def settings(**kw) -> CdcSettings:
 def test_connector_config_is_secret_free_minimal_and_routed(source_record, contract, monkeypatch):
     monkeypatch.delenv("FBI_DEFAULT_SSLMODE", raising=False)
     cfg = build_connector_config(source_record, contract, settings())
-    assert cfg["database.password"] == "${env:FBI_SRC_TEST_PASSWORD}"
+    assert cfg["database.password"] == "${env:FBI_SRC_BRANCH_001_PASSWORD}"
     assert cfg["database.sslmode"] == "verify-full"
     assert not any(k.startswith("producer.override.") for k in cfg), "per-connector client overrides are disabled"
     assert "secret" not in str(cfg).lower().replace("secret_ref", "")
@@ -180,25 +180,66 @@ def test_registry_and_resolver_accept_the_same_schemes():
     with pytest.raises(RegistryError, match="rejected"):
         SourceRecord("s1", "t", secret_ref="vault:secret/data/s1#password").validate()
     with pytest.raises(SecretError):
-        resolve("vault:secret/data/s1#password")
+        resolve("vault:secret/data/s1#password", "s1")
     with pytest.raises(SecretError):
-        connect_placeholder("vault:secret/data/s1#password")
+        connect_placeholder("vault:secret/data/s1#password", "s1")
     SourceRecord("s1", "t", secret_ref="env:FBI_SRC_S1_PASSWORD").validate()
 
 
 def test_secret_resolution(monkeypatch, tmp_path):
-    monkeypatch.setenv("FBI_SRC_TEST_PW", "s3cret")
-    assert resolve("env:FBI_SRC_TEST_PW") == "s3cret"
-    f = tmp_path / "creds.properties"
+    monkeypatch.setenv("FBI_SRC_S1_PASSWORD", "s3cret")
+    assert resolve("env:FBI_SRC_S1_PASSWORD", "s1") == "s3cret"
+    (tmp_path / "s1").mkdir()
+    f = tmp_path / "s1" / "creds.properties"
     f.write_text("# comment\npassword = abc=def\n", encoding="utf-8")
     monkeypatch.setenv("FBI_SECRET_DIR", str(tmp_path))
     if f.as_posix().startswith("/"):
-        assert resolve(f"file:{f.as_posix()}:password") == "abc=def"
-    assert connect_placeholder("env:FBI_SRC_TEST_PW") == "${env:FBI_SRC_TEST_PW}"
+        assert resolve(f"file:{f.as_posix()}:password", "s1") == "abc=def"
+    assert connect_placeholder("env:FBI_SRC_S1_PASSWORD", "s1") == "${env:FBI_SRC_S1_PASSWORD}"
+    monkeypatch.delenv("FBI_SRC_S1_PASSWORD")
+    with pytest.raises(SecretError, match="not set"):
+        resolve("env:FBI_SRC_S1_PASSWORD", "s1")
     with pytest.raises(SecretError):
-        resolve("env:FBI_SRC_DOES_NOT_EXIST_123")
+        resolve("plaintext", "s1")
+
+
+@pytest.mark.parametrize(
+    "source_id,name",
+    [
+        ("bank-a", "FBI_SRC_BANK_A_PASSWORD"),
+        ("bank_a", "FBI_SRC_BANK__A_PASSWORD"),
+        ("default", "FBI_SRC_DEFAULT_PASSWORD"),
+    ],
+)
+def test_each_source_has_exactly_one_bound_env_name(source_id, name):
+    assert bound_env_name(source_id) == name
+
+
+def test_a_source_cannot_use_another_sources_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv("FBI_SRC_BANK_B_PASSWORD", "b-secret")
+    with pytest.raises(SecretError, match="bound to its own source"):
+        resolve("env:FBI_SRC_BANK_B_PASSWORD", "bank-a")
+    with pytest.raises(SecretError, match="bound to its own source"):
+        connect_placeholder("env:FBI_SRC_BANK_B_PASSWORD", "bank-a")
+    with pytest.raises(RegistryError, match="rejected"):
+        SourceRecord("bank-a", "t", secret_ref="env:FBI_SRC_BANK_B_PASSWORD").validate()
+    assert bound_env_name("bank-a") != bound_env_name("bank_a"), "ids differing only in - and _ never collide"
+    monkeypatch.setenv("FBI_SECRET_DIR", str(tmp_path))
+    (tmp_path / "bank-b").mkdir()
+    other = tmp_path / "bank-b" / "db.properties"
+    other.write_text("password = x\n", encoding="utf-8")
+    if other.as_posix().startswith("/"):
+        with pytest.raises(SecretError, match="FBI_SECRET_DIR/bank-a"):
+            resolve(f"file:{other.as_posix()}:password", "bank-a")
+
+
+def test_shared_refs_are_an_explicit_development_opt_in(monkeypatch):
+    monkeypatch.setenv("FBI_SRC_DEMO_PASSWORD", "demo")
     with pytest.raises(SecretError):
-        resolve("plaintext")
+        resolve("env:FBI_SRC_DEMO_PASSWORD", "bank-a")
+    monkeypatch.setenv("FBI_SHARED_SECRET_REFS", "env:FBI_SRC_DEMO_PASSWORD")
+    assert resolve("env:FBI_SRC_DEMO_PASSWORD", "bank-a") == "demo"
+    assert resolve("env:FBI_SRC_DEMO_PASSWORD", "bank-b") == "demo"
 
 
 @pytest.mark.parametrize(
@@ -207,9 +248,9 @@ def test_secret_resolution(monkeypatch, tmp_path):
 def test_secret_refs_cannot_name_arbitrary_worker_secrets(monkeypatch, name):
     monkeypatch.setenv(name, "value")
     with pytest.raises(SecretError, match="not allowed"):
-        resolve(f"env:{name}")
+        resolve(f"env:{name}", "s1")
     with pytest.raises(SecretError, match="not allowed"):
-        connect_placeholder(f"env:{name}")
+        connect_placeholder(f"env:{name}", "s1")
     with pytest.raises(RegistryError, match="rejected"):
         SourceRecord("s1", "t", secret_ref=f"env:{name}").validate()
 
@@ -223,18 +264,19 @@ def test_secret_file_references_are_confined_to_the_secret_directory(monkeypatch
     ref = f"file:{outside.as_posix()}:password"
     if outside.as_posix().startswith("/"):
         with pytest.raises(SecretError, match="outside"):
-            resolve(ref)
+            resolve(ref, "s1")
         monkeypatch.delenv("FBI_SECRET_DIR")
         with pytest.raises(SecretError, match="FBI_SECRET_DIR"):
-            resolve(ref)
+            resolve(ref, "s1")
 
 
 def test_env_allowlist_is_configurable(monkeypatch):
-    monkeypatch.setenv("FBI_SECRET_ENV_ALLOWLIST", "CUSTOM_[A-Z]+")
+    monkeypatch.setenv("FBI_SECRET_ENV_ALLOWLIST", "CUSTOM_[A-Z_]+")
+    monkeypatch.setenv("FBI_SHARED_SECRET_REFS", "env:CUSTOM_PW")
     monkeypatch.setenv("CUSTOM_PW", "p")
-    assert resolve("env:CUSTOM_PW") == "p"
-    with pytest.raises(SecretError):
-        resolve("env:FBI_SRC_TEST_PW")
+    assert resolve("env:CUSTOM_PW", "s1") == "p"
+    with pytest.raises(SecretError, match="not allowed"):
+        resolve("env:FBI_SRC_S1_PASSWORD", "s1")
 
 
 @pytest.mark.parametrize("state,path", [

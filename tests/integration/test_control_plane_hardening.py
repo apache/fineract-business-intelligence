@@ -26,7 +26,8 @@ from controlplane.db import PgConfig, connect
 from controlplane.ownership import Action, Engine, TransitionError, TransitionRequest
 from controlplane.ownership_repo import OwnershipRepository
 from controlplane.registry import SourceRecord, SourceRegistry
-from tests.integration.test_platform_write_path import _admin_cfg, _cfg, passed_run, purge_audit, sqlstate
+from controlplane.secrets import bound_env_name
+from tests.integration.test_platform_write_path import _admin_cfg, _cfg, drop_source, passed_run, sqlstate
 
 
 def _reachable() -> bool:
@@ -71,11 +72,8 @@ def source(conn):
         for schema in ("raw", "raw_shadow"):
             cur.execute(f"DELETE FROM {schema}.{table} WHERE source_id = %s", (sid,))
     cur.execute("DELETE FROM meta.entity_change_log WHERE source_id = %s", (sid,))
-    cur.execute("DELETE FROM meta.reconciliation_run WHERE source_id = %s", (sid,))
-    cur.execute("DELETE FROM meta.cutover_approval WHERE source_id = %s", (sid,))
-    cur.execute("DELETE FROM meta.source_registry WHERE source_id = %s", (sid,))
     conn.commit()
-    purge_audit(sid)
+    drop_source(sid)
 
 
 def assign(conn, sid, table, engine=Engine.KAFKA):
@@ -267,10 +265,56 @@ def test_cutover_needs_a_recent_passed_run_for_the_same_table(conn, source):
                    TransitionRequest(Action.CUTOVER, "alice", "go", approved_by="bob"))
     conn.rollback()
     cur = conn.cursor()
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        cur.execute("UPDATE meta.ingestion_ownership SET last_reconciliation_id = 1 WHERE source_id = %s", (source,))
+    conn.rollback()
+    assert sqlstate(err.value) == "42501", "the loader cannot write ownership rows directly"
     fresh = passed_run(conn, source)
-    cur.execute("UPDATE meta.ingestion_ownership SET last_reconciliation_id = %s WHERE source_id = %s", (fresh, source))
-    conn.commit()
+    repo.apply(source, ["batch_job_instance"], TransitionRequest(Action.BEGIN_RECONCILIATION, "alice", "again"))
+    repo.apply(source, ["batch_job_instance"], TransitionRequest(
+        Action.RECORD_RECONCILIATION, "alice", "t", reconciliation_passed=True, reconciliation_id=fresh))
     repo.apply(source, ["batch_job_instance"], TransitionRequest(Action.CUTOVER, "alice", "go", approved_by="bob"))
+
+
+def test_a_reconciliation_taken_before_the_shadow_started_cannot_authorise_a_cutover(conn, source):
+    assign(conn, source, "batch_job_instance", Engine.PYTHON)
+    early = passed_run(conn, source)
+    repo = OwnershipRepository(conn)
+    repo.apply(source, ["batch_job_instance"], TransitionRequest(
+        Action.START_SHADOW, "alice", "shadow", engine=Engine.KAFKA))
+    repo.apply(source, ["batch_job_instance"], TransitionRequest(Action.BEGIN_RECONCILIATION, "alice", "gate"))
+    repo.apply(source, ["batch_job_instance"], TransitionRequest(
+        Action.RECORD_RECONCILIATION, "alice", "t", reconciliation_passed=True, reconciliation_id=early))
+    with pytest.raises(TransitionError, match="recent PASSED"):
+        repo.apply(source, ["batch_job_instance"], TransitionRequest(Action.CUTOVER, "alice", "go", approved_by="bob"))
+    conn.rollback()
+
+
+def test_shadow_reconciliation_is_computed_and_recorded_by_the_database(conn, source):
+    cur = conn.cursor()
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        cur.execute(
+            "INSERT INTO meta.reconciliation_run (source_id, table_name, comparison, status) "
+            "VALUES (%s, 'batch_job_instance', 'shadow_vs_prod', 'PASSED')",
+            (source,),
+        )
+    conn.rollback()
+    assert sqlstate(err.value) == "42501", "a PASSED shadow run cannot be forged"
+    cur.execute(
+        "SELECT reconciliation_id, passed, settle_seconds FROM meta.run_shadow_reconciliation(%s, %s, %s)",
+        (source, "batch_job_instance", 10 ** 9),
+    )
+    rid, passed, settle = cur.fetchone()
+    conn.commit()
+    assert passed is True and settle == 3600, "the settle window is clamped so it cannot hide every row"
+    cur.execute("SELECT comparison, status FROM meta.reconciliation_run WHERE reconciliation_id = %s", (rid,))
+    assert tuple(cur.fetchone()) == ("shadow_vs_prod", "PASSED")
+    conn.commit()
+    with pytest.raises(pg8000.dbapi.DatabaseError):
+        cur.execute("SELECT meta.record_source_reconciliation(%s, 'batch_job_instance', 'PASSED', 0, 0, 0, 0, '{}')",
+                    (source,))
+        cur.execute("UPDATE meta.reconciliation_run SET comparison = 'shadow_vs_prod' WHERE source_id = %s", (source,))
+    conn.rollback()
 
 
 def test_a_run_for_another_table_cannot_authorise_a_cutover(conn, source):
@@ -283,7 +327,15 @@ def test_a_run_for_another_table_cannot_authorise_a_cutover(conn, source):
                    TransitionRequest(Action.CUTOVER, "alice", "go", approved_by="bob"))
 
 
-def test_the_database_rejects_an_engine_flip_that_skipped_the_gate(conn, source):
+def _flip(cur, sid, table, expected_epoch, engine, epoch, action="sneak"):
+    cur.execute(
+        "SELECT meta.transition_ownership(%s, %s, %s, %s, NULL, 'STEADY', %s, NULL, NULL, %s, 'mallory', NULL, 'x')",
+        (sid, table, expected_epoch, engine, epoch, action),
+    )
+    return cur.fetchone()[0]
+
+
+def test_the_database_rejects_an_engine_flip_that_skipped_the_gate(conn, admin, source):
     assign(conn, source, "batch_job_instance", Engine.PYTHON)
     cur = conn.cursor()
     with pytest.raises(pg8000.dbapi.DatabaseError) as err:
@@ -293,22 +345,98 @@ def test_the_database_rejects_an_engine_flip_that_skipped_the_gate(conn, source)
             (source,),
         )
     conn.rollback()
-    assert sqlstate(err.value) == "FBI03"
+    assert sqlstate(err.value) == "42501", "the loader has no direct DML on ownership"
+    current = epoch(conn, source, "batch_job_instance")
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        _flip(cur, source, "batch_job_instance", current, "KAFKA", current + 1)
+    conn.rollback()
+    assert sqlstate(err.value) == "FBI03", "a cutover without a reconciliation is rejected"
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        _flip(cur, source, "batch_job_instance", current, "NONE", current + 1)
+    conn.rollback()
+    assert sqlstate(err.value) == "FBI03", "unassigning (the first step of KAFKA -> NONE -> PYTHON) needs an admin"
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        cur.execute("SELECT set_config('fbi.force_approved_by', 'bob', true)")
+        _flip(cur, source, "batch_job_instance", current, "KAFKA", current + 1, "force_assign")
+    conn.rollback()
+    assert sqlstate(err.value) == "FBI03", "a session setting no longer unlocks the force path"
+
+    acur = admin.cursor()
+    acur.execute(
+        "UPDATE meta.ingestion_ownership SET engine = 'NONE', epoch = epoch + 1 "
+        "WHERE source_id = %s AND table_name = 'batch_job_instance'",
+        (source,),
+    )
+    admin.commit()
+    current = epoch(conn, source, "batch_job_instance")
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        _flip(cur, source, "batch_job_instance", current, "KAFKA", current + 1, "assign")
+    conn.rollback()
+    assert sqlstate(err.value) == "FBI03", "re-assigning a table that was owned before needs an admin"
+    assert _flip(cur, source, "m_loan", 1, "PYTHON", 2, "assign") is True, "a never-owned table can be assigned"
+    conn.commit()
+
+
+def test_every_ownership_change_is_audited_by_the_database(conn, admin, source):
+    assign(conn, source, "batch_job_instance", Engine.PYTHON)
+    acur = admin.cursor()
+    acur.execute(
+        "UPDATE meta.ingestion_ownership SET cutover_state = 'PAUSED', epoch = epoch + 1 "
+        "WHERE source_id = %s AND table_name = 'batch_job_instance'",
+        (source,),
+    )
+    admin.commit()
+    acur.execute(
+        "SELECT action, actor, db_user FROM meta.ingestion_ownership_audit WHERE source_id = %s ORDER BY audit_id",
+        (source,),
+    )
+    rows = [tuple(r) for r in acur.fetchall()]
+    admin.commit()
+    assert rows[0] == ("assign", "it", _cfg().user)
+    assert rows[1] == ("direct_update", _admin_cfg().user, _admin_cfg().user), "even a direct admin update is audited"
+    cur = conn.cursor()
     with pytest.raises(pg8000.dbapi.DatabaseError) as err:
         cur.execute(
-            "UPDATE meta.ingestion_ownership SET engine = 'NONE' WHERE source_id = %s AND table_name = 'm_loan'",
-            (source,),
-        )
-        cur.execute(
-            "UPDATE meta.ingestion_ownership SET engine = 'PYTHON' WHERE source_id = %s AND table_name = 'm_loan'",
-            (source,),
-        )
-        cur.execute(
-            "UPDATE meta.ingestion_ownership SET engine = 'KAFKA' WHERE source_id = %s AND table_name = 'm_loan'",
+            "INSERT INTO meta.ingestion_ownership_audit (source_id, table_name, action, actor) "
+            "VALUES (%s, 'batch_job_instance', 'assign', 'mallory')",
             (source,),
         )
     conn.rollback()
-    assert sqlstate(err.value) == "FBI03"
+    assert sqlstate(err.value) == "42501"
+
+
+def test_a_source_that_still_owns_tables_cannot_be_deleted(conn, source):
+    assign(conn, source, "batch_job_instance", Engine.PYTHON)
+    cur = conn.cursor()
+    with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+        cur.execute("DELETE FROM meta.source_registry WHERE source_id = %s", (source,))
+    conn.rollback()
+    assert sqlstate(err.value) == "FBI03", "delete-and-re-register cannot reset ownership"
+
+
+def test_maintenance_functions_are_not_callable_by_the_reader_or_the_engine(conn):
+    for cfg in (_engine_cfg(), _reader_cfg()):
+        other = connect(cfg)
+        try:
+            cur = other.cursor()
+            for statement in (
+                "SELECT meta.purge_ownership_audit(0)",
+                "SELECT meta.ensure_change_log_partitions(100000, 100000)",
+                "SELECT meta.purge_change_log(0, 1000)",
+                "SELECT meta.purge_progress(0)",
+            ):
+                with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+                    cur.execute(statement)
+                other.rollback()
+                assert sqlstate(err.value) == "42501", (cfg.user, statement)
+        finally:
+            other.close()
+    cur = conn.cursor()
+    cur.execute("SELECT meta.purge_ownership_audit(0)")
+    conn.rollback()
+    cur.execute("SELECT count(*) FROM meta.ingestion_ownership_audit WHERE created_at > NOW() - INTERVAL '700 days'")
+    assert cur.fetchone()[0] >= 0
+    conn.rollback()
 
 
 def test_the_ownership_audit_trail_is_append_only(conn, admin, source):
@@ -354,6 +482,81 @@ def test_a_cutover_lock_blocks_only_its_own_source_and_table():
         other.rollback()
         holder.close()
         other.close()
+
+
+def test_onboarding_validates_before_writing_and_never_modifies_an_existing_source(conn, source, monkeypatch):
+    from controlplane import tasks
+    from controlplane.registry import RegistryError
+
+    validated = []
+    monkeypatch.setattr(tasks, "validate_source", lambda rec, engine: validated.append(rec.source_id) or {"ok": False})
+    new_id = f"it-new-{uuid.uuid4().hex[:8]}"
+    params = {"db_host": "attacker.example", "db_name": "x", "db_user": "u"}
+    with pytest.raises(RuntimeError, match="failed validation"):
+        tasks.onboard_source({**params, "source_id": new_id, "secret_ref": f"env:{bound_env_name(new_id)}"}, "alice")
+    assert validated == [new_id]
+    with pytest.raises(RegistryError):
+        SourceRegistry(conn).get(new_id)
+    conn.rollback()
+    with pytest.raises(RuntimeError, match="already registered"):
+        tasks.onboard_source({**params, "source_id": source, "secret_ref": f"env:{bound_env_name(source)}"}, "alice")
+    assert validated == [new_id], "an existing source is refused before anything connects anywhere"
+    assert SourceRegistry(conn).get(source).db_host is None
+    conn.rollback()
+    with pytest.raises(RegistryError, match="different db_host"):
+        SourceRegistry(conn).upsert([SourceRecord(source, f"tenant-{source}", db_host="attacker.example")])
+    conn.rollback()
+    with pytest.raises(RegistryError, match="bound to its own source"):
+        SourceRegistry(conn).upsert([SourceRecord(
+            new_id, "t", db_host="attacker.example", secret_ref=f"env:{bound_env_name(source)}")])
+    conn.rollback()
+
+
+def test_a_connect_timeout_is_not_a_read_timeout_and_statements_have_their_own_limit():
+    import time
+
+    base = _cfg()
+    cfg = PgConfig(base.host, base.port, base.database, base.user, base.password, timeout=1,
+                   statement_timeout_ms=2500)
+    c = connect(cfg)
+    try:
+        cur = c.cursor()
+        started = time.monotonic()
+        cur.execute("SELECT pg_sleep(1.6)")
+        assert time.monotonic() - started > 1.2, "a query longer than the connect timeout completes"
+        with pytest.raises(pg8000.dbapi.DatabaseError) as err:
+            cur.execute("SELECT pg_sleep(5)")
+        assert sqlstate(err.value) == "57014", "long statements are cancelled by statement_timeout"
+    finally:
+        c.close()
+
+
+def test_both_engines_keep_a_withheld_pii_value_instead_of_overwriting_it(conn, source):
+    assign(conn, source, "m_client", Engine.PYTHON)
+    cols = ["id", "status_enum", "office_id", "date_of_birth"]
+    apply_events(conn, source, "m_client", cols,
+                 [{"id": 1, "status_enum": 300, "office_id": 1, "date_of_birth": date(1990, 5, 1), "lsn": 1}],
+                 engine="PYTHON")
+    apply_events(conn, source, "m_client", cols,
+                 [{"id": 1, "status_enum": 600, "office_id": 1, "lsn": 2, "unavailable": ["date_of_birth"]}],
+                 engine="PYTHON")
+    cur = conn.cursor()
+    cur.execute("SELECT status_enum, date_of_birth FROM raw.raw_m_client WHERE source_id = %s", (source,))
+    assert tuple(cur.fetchone()) == (600, date(1990, 5, 1))
+    conn.commit()
+    cur.execute("SELECT * FROM meta.reconcile_shadow(%s, 'm_client', interval '0 seconds')", (source,))
+    conn.commit()
+
+
+def _reader_cfg() -> PgConfig:
+    base = _cfg()
+    return PgConfig(
+        base.host,
+        base.port,
+        base.database,
+        os.getenv("WAREHOUSE_READER_USER", "analytics_reader"),
+        os.getenv("WAREHOUSE_READER_PASSWORD", "analytics_reader_dev_only"),
+    )
 
 
 def _engine_cfg() -> PgConfig:
@@ -465,7 +668,9 @@ def test_change_log_partitions_are_dropped_whole_and_stale_cursors_do_not_pin_th
         (source,),
     )
     admin.commit()
-    cur.execute("SELECT model_name, last_txid::text, updated_at FROM meta.dbt_change_cursor")
+    cur.execute(
+        "SELECT model_name, last_txid::text, updated_at, last_change_id, last_run_id FROM meta.dbt_change_cursor"
+    )
     saved = [tuple(r) for r in cur.fetchall()]
     cur.execute("DELETE FROM meta.dbt_change_cursor")
     cur.execute(
@@ -480,19 +685,26 @@ def test_change_log_partitions_are_dropped_whole_and_stale_cursors_do_not_pin_th
         cur.execute("SELECT to_regclass(%s)", (f"meta.{part}",))
         assert cur.fetchone()[0] is not None
         dropped_by_loader = conn.cursor()
-        dropped_by_loader.execute("SELECT meta.purge_change_log(14)")
-        dropped = dropped_by_loader.fetchone()[0]
-        conn.commit()
+        dropped = 0
+        while True:
+            dropped_by_loader.execute("SELECT meta.purge_change_log(14, 1)")
+            n = dropped_by_loader.fetchone()[0]
+            conn.commit()
+            assert n <= 1, "one partition per call keeps each ACCESS EXCLUSIVE lock short"
+            if not n:
+                break
+            dropped += n
         assert dropped >= 1
         cur.execute("SELECT to_regclass(%s)", (f"meta.{part}",))
         assert cur.fetchone()[0] is None, "an old partition is dropped as a whole instead of row by row"
         admin.rollback()
     finally:
         cur.execute("DELETE FROM meta.dbt_change_cursor")
-        for model, txid, updated in saved:
+        for model, txid, updated, change_id, run_id in saved:
             cur.execute(
-                "INSERT INTO meta.dbt_change_cursor (model_name, last_txid, updated_at) VALUES (%s, %s::xid8, %s)",
-                (model, txid, updated),
+                "INSERT INTO meta.dbt_change_cursor (model_name, last_txid, updated_at, last_change_id, last_run_id) "
+                "VALUES (%s, %s::xid8, %s, %s, %s)",
+                (model, txid, updated, change_id, run_id),
             )
         admin.commit()
 
@@ -513,17 +725,21 @@ def test_retire_dry_run_changes_nothing_and_forget_waits_for_the_replication_slo
     from controlplane.connectors import CdcSettings
     from controlplane.retire import retire_source
 
-    monkeypatch.setenv("FBI_SRC_IT_PASSWORD", "pw")
+    secret = bound_env_name(source)
+    monkeypatch.setenv(secret, "pw")
     monkeypatch.setenv("FBI_DEFAULT_SSLMODE", "disable")
     SourceRegistry(conn).upsert([SourceRecord(
         source, f"tenant-{source}", db_host="db.example", db_name="fineract", db_user="fbi_cdc",
-        secret_ref="env:FBI_SRC_IT_PASSWORD", lifecycle_state="ACTIVE", capture_generation=1)])
+        secret_ref=f"env:{secret}", lifecycle_state="ACTIVE", capture_generation=1)], allow_connection_change=True)
     conn.commit()
     assign(conn, source, "batch_job_instance")
     apply_events(conn, source, "batch_job_instance", ["job_instance_id", "job_name"],
                  [{"job_instance_id": 1, "job_name": "a", "lsn": 1}])
 
     dry = retire_source(conn, source, dry_run=True)
+    with pytest.raises(PermissionError, match="fbi_platform_admin"):
+        retire_source(conn, source)
+    admin = connect(_admin_cfg())
     assert dry["dry_run"] is True and dry["raw_rows"] == 1 and dry["registered"] is True
     cur = conn.cursor()
     cur.execute("SELECT count(*) FROM raw.raw_batch_job_instance WHERE source_id = %s", (source,))
@@ -571,7 +787,8 @@ def test_retire_dry_run_changes_nothing_and_forget_waits_for_the_replication_slo
         return original(c, src, st, {"default": Connect()}, lambda cfg: stuck, wait_seconds=0.0)
 
     monkeypatch.setattr("controlplane.retire.retire_artifacts", with_fakes)
-    out = retire_source(conn, source, forget=True, settings=settings)
+    out = retire_source(admin, source, forget=True, settings=settings)
+    admin.close()
     assert "tombstone" in out["lifecycle"]
     assert SourceRegistry(conn).get(source).labels.get("forget_after_cleanup") is True
     conn.commit()
@@ -588,4 +805,3 @@ def test_retire_dry_run_changes_nothing_and_forget_waits_for_the_replication_slo
     with pytest.raises(Exception, match="Unknown source"):
         SourceRegistry(conn).get(source)
     conn.rollback()
-    os.environ.pop("FBI_SRC_IT_PASSWORD", None)

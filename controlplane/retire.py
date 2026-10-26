@@ -97,6 +97,13 @@ def retire_source(
 
     summary: dict = {"source_id": source_id, "raw_rows": 0, "derived_rows": {}, "lifecycle": "not registered"}
     cursor = conn.cursor()
+    cursor.execute("SELECT meta.is_platform_admin()")
+    if not cursor.fetchone()[0]:
+        conn.rollback()
+        raise PermissionError(
+            "retire-source purges data and unassigns ownership; run it under a database login that is a member of "
+            "fbi_platform_admin"
+        )
     try:
         if generation is not None:
             cursor.execute(
@@ -113,6 +120,9 @@ def retire_source(
 
         for table in sorted(contract.table_names):
             cursor.execute("SELECT meta.lock_ownership_exclusive(%s, %s)", (source_id, table))
+        for key, value in (("fbi.action", "retire"), ("fbi.actor", actor), ("fbi.approved_by", approved_by or ""),
+                           ("fbi.reason", "source retired")):
+            cursor.execute("SELECT set_config(%s, %s, true)", (key, value))
         cursor.execute(
             "UPDATE meta.ingestion_ownership SET engine = 'NONE', shadow_engine = NULL, cutover_state = 'STEADY', "
             "epoch = epoch + 1, updated_at = NOW(), updated_by = 'retire', change_reason = 'source retired' "

@@ -170,7 +170,10 @@ def reconcile(
         _record_observed(conn, desired, observed)
         if settings.drop_stale_slots:
             report.actions.extend(
-                cleanup_stale_slots(conn, state, observed, shard_index, shard_count, report, connect_source)
+                cleanup_stale_slots(
+                    conn, state, observed, shard_index, shard_count, report, connect_source,
+                    all_clusters_observed=set(observed) == set(clients),
+                )
             )
     return report
 
@@ -204,41 +207,63 @@ def slot_check_key(source: SourceRecord, kafka_sources: set[str]) -> str:
 def _slot_check_due(conn, source_id: str, key: str, interval_minutes: int) -> bool:
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT slot_check_key IS DISTINCT FROM %s OR slot_checked_at IS NULL "
-        "OR slot_checked_at < NOW() - make_interval(mins => %s) "
-        "FROM meta.connector_state WHERE source_id = %s",
+        "SELECT check_key IS DISTINCT FROM %s OR checked_at < NOW() - make_interval(mins => %s) "
+        "FROM meta.slot_check WHERE source_id = %s",
         (key, interval_minutes, source_id),
     )
     row = cursor.fetchone()
-    return False if row is None else bool(row[0])
+    return True if row is None else bool(row[0])
 
 
 def _mark_slot_checked(conn, source_id: str, key: str) -> None:
     conn.cursor().execute(
-        "UPDATE meta.connector_state SET slot_checked_at = NOW(), slot_check_key = %s WHERE source_id = %s",
-        (key, source_id),
+        "INSERT INTO meta.slot_check (source_id, check_key, checked_at) VALUES (%s, %s, NOW()) "
+        "ON CONFLICT (source_id) DO UPDATE SET check_key = EXCLUDED.check_key, checked_at = EXCLUDED.checked_at",
+        (source_id, key),
     )
 
 
-def drop_slots(source: SourceRecord, keep: str | None, connect_source: Callable = pg_connect) -> list[str]:
-    src = connect_source(source_pg_config(source, secrets.resolve(source.secret_ref)))
-    dropped: list[str] = []
+@dataclass
+class SlotCleanup:
+    dropped: list[str] = field(default_factory=list)
+    remaining: list[str] = field(default_factory=list)
+
+
+def drop_slots(source: SourceRecord, keep: str | None, connect_source: Callable = pg_connect) -> SlotCleanup:
+    src = connect_source(source_pg_config(source, secrets.resolve(source.secret_ref, source.source_id)))
+    result = SlotCleanup()
+    prefix = f"fbi_{source.source_id.replace('-', '_')}_g"
     try:
         cur = src.cursor()
         cur.execute("SELECT slot_name, active FROM pg_replication_slots WHERE database = current_database()")
         for slot in stale_slots([(r[0], bool(r[1])) for r in cur.fetchall()], source.source_id, keep):
             cur.execute("SELECT pg_drop_replication_slot(%s)", (slot,))
-            dropped.append(slot)
+            result.dropped.append(slot)
         src.commit()
+        cur.execute(
+            "SELECT slot_name FROM pg_replication_slots WHERE database = current_database() AND slot_name LIKE %s",
+            (prefix + "%",),
+        )
+        result.remaining = sorted(
+            r[0] for r in cur.fetchall() if r[0].startswith(prefix) and r[0][len(prefix):].isdigit() and r[0] != keep
+        )
     finally:
         src.close()
-    return dropped
+    return result
 
 
 def cleanup_stale_slots(
-    conn, state: DesiredState, observed, shard_index, shard_count, report, connect_source: Callable = pg_connect
+    conn,
+    state: DesiredState,
+    observed,
+    shard_index,
+    shard_count,
+    report,
+    connect_source: Callable = pg_connect,
+    all_clusters_observed: bool = True,
 ) -> list[dict]:
     interval = int(os.getenv("FBI_SLOT_CLEANUP_INTERVAL_MINUTES", "1440"))
+    tombstone_interval = int(os.getenv("FBI_TOMBSTONE_RETRY_MINUTES", "30"))
     desired_slots = {d.source_id: d.config.get("slot.name") for d in state.connectors}
     kafka_sources = kafka_owned_sources(conn)
     observed_names = {name for conns in observed.values() for name in conns}
@@ -251,26 +276,36 @@ def cleanup_stale_slots(
             continue
         if s.capture_generation == 0 and s.source_id not in desired_slots and s.lifecycle_state != "RETIRED":
             continue
+        tombstone = s.lifecycle_state == "RETIRED" and bool(s.labels.get("forget_after_cleanup"))
         check_key = slot_check_key(s, kafka_sources)
-        if s.lifecycle_state != "RETIRED" and not _slot_check_due(conn, s.source_id, check_key, interval):
+        if not _slot_check_due(conn, s.source_id, check_key, tombstone_interval if tombstone else interval):
             continue
         try:
-            for slot in drop_slots(s, keep, connect_source):
-                actions.append({"kind": "drop_slot", "name": slot, "source_id": s.source_id})
-            _mark_slot_checked(conn, s.source_id, check_key)
-            conn.commit()
+            cleanup = drop_slots(s, keep, connect_source)
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
+            _mark_slot_checked(conn, s.source_id, check_key)
+            conn.commit()
             report.errors.append({"source_id": s.source_id, "error": f"slot cleanup: {exc}"})
             continue
-        if (
-            s.lifecycle_state == "RETIRED"
-            and s.labels.get("forget_after_cleanup")
-            and not any(source_id_from_connector(n) == s.source_id for n in observed_names)
-        ):
-            conn.cursor().execute("DELETE FROM meta.source_registry WHERE source_id = %s", (s.source_id,))
-            conn.commit()
-            actions.append({"kind": "forget_source", "source_id": s.source_id})
+        for slot in cleanup.dropped:
+            actions.append({"kind": "drop_slot", "name": slot, "source_id": s.source_id})
+        _mark_slot_checked(conn, s.source_id, check_key)
+        conn.commit()
+        if not tombstone:
+            continue
+        connector_left = any(source_id_from_connector(n) == s.source_id for n in observed_names)
+        if cleanup.remaining or connector_left or not all_clusters_observed:
+            report.errors.append({
+                "source_id": s.source_id,
+                "error": "retired source kept as a tombstone: "
+                + (f"slots still present {cleanup.remaining}" if cleanup.remaining else
+                   "a connector still exists" if connector_left else "not every Connect cluster could be observed"),
+            })
+            continue
+        conn.cursor().execute("DELETE FROM meta.source_registry WHERE source_id = %s", (s.source_id,))
+        conn.commit()
+        actions.append({"kind": "forget_source", "source_id": s.source_id})
     return actions
 
 
@@ -299,22 +334,13 @@ def retire_artifacts(
         deadline = time.monotonic() + wait_seconds
         while True:
             try:
-                result["slots_dropped"].extend(drop_slots(source, None, connect_source))
-                src = connect_source(source_pg_config(source, secrets.resolve(source.secret_ref)))
-                try:
-                    cur = src.cursor()
-                    cur.execute(
-                        "SELECT slot_name FROM pg_replication_slots WHERE database = current_database() "
-                        "AND slot_name LIKE %s",
-                        (f"fbi_{source.source_id.replace('-', '_')}_g%",),
-                    )
-                    result["slots_remaining"] = [r[0] for r in cur.fetchall()]
-                finally:
-                    src.close()
+                cleanup = drop_slots(source, None, connect_source)
             except Exception as exc:  # noqa: BLE001
                 result["errors"].append(f"source slots: {exc}")
                 break
-            if not result["slots_remaining"] or time.monotonic() >= deadline:
+            result["slots_dropped"].extend(cleanup.dropped)
+            result["slots_remaining"] = cleanup.remaining
+            if not cleanup.remaining or time.monotonic() >= deadline:
                 break
             time.sleep(1)
     return result

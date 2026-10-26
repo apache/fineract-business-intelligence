@@ -13,26 +13,12 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-{% macro fact_in_run() -%}
-    {%- set ns = namespace(found=false) -%}
-    {%- if execute -%}
-        {%- for resource in selected_resources if resource.endswith('.fact_loan_snapshot') -%}
-            {%- set ns.found = true -%}
-        {%- endfor -%}
-    {%- endif -%}
-    {{- return(ns.found) -}}
-{%- endmacro %}
-
 {% macro mart_upper_run_id() -%}
-    {%- if fact_in_run() -%}
-        (select w.run_id from intermediate.int_change_window as w)
-    {%- else -%}
-        (
-            select coalesce(max(c.last_run_id), 0)
-            from {{ source('meta', 'dbt_change_cursor') }} as c
-            where c.model_name = 'fact_loan_snapshot'
-        )
-    {%- endif -%}
+    (
+        select coalesce(max(c.last_run_id), 0)
+        from {{ source('meta', 'dbt_change_cursor') }} as c
+        where c.model_name = 'fact_loan_snapshot'
+    )
 {%- endmacro %}
 
 {% macro mart_recompute_window(consumer, from_column='from_date') -%}
@@ -112,39 +98,47 @@
     {%- endif %}
 {%- endmacro %}
 
-{% macro advance_change_cursor(results) -%}
-    {%- if execute -%}
-        {%- set marts = ['mart_delinquency_par', 'mart_portfolio_health', 'mart_repayment_behavior'] -%}
-        {%- set fact_chain = ['int_change_window', 'int_snapshot_scope', 'fact_loan_snapshot'] -%}
-        {%- set model_results = results | selectattr('node.resource_type', 'equalto', 'model') | list -%}
-        {%- set built = model_results | selectattr('status', 'equalto', 'success') | map(attribute='node.name') | list -%}
-        {%- set statements = [] -%}
-        {%- if fact_chain | reject('in', built) | list | length == 0 -%}
-            {%- do statements.append(
-                "insert into meta.dbt_change_cursor (model_name, last_change_id, last_txid, last_run_id, updated_at) "
-                ~ "select 'fact_loan_snapshot', max_change_id, horizon_txid, run_id, now() "
-                ~ "from intermediate.int_change_window "
-                ~ "on conflict (model_name) do update set last_change_id = excluded.last_change_id, "
-                ~ "last_txid = excluded.last_txid, last_run_id = excluded.last_run_id, updated_at = excluded.updated_at"
-            ) -%}
-        {%- endif -%}
-        {%- for mart in marts if mart in built -%}
-            {%- do statements.append(
-                "insert into meta.dbt_mart_cursor (model_name, last_run_id, updated_at) select '" ~ mart ~ "', "
-                ~ mart_upper_run_id() ~ ", now() "
-                ~ "on conflict (model_name) do update set last_run_id = excluded.last_run_id, updated_at = excluded.updated_at"
-            ) -%}
-        {%- endfor -%}
-        {%- if statements | length > 0 -%}
-            {%- do statements.append(
-                "delete from meta.dbt_mart_dirty where run_id <= ("
-                ~ "select case when count(*) < " ~ (marts | length) ~ " then 0 else min(last_run_id) end "
-                ~ "from meta.dbt_mart_cursor where model_name in ('" ~ (marts | join("', '")) ~ "'))"
-            ) -%}
-            {{ statements | join(';\n') }}
-        {%- else -%}
-            select 1
-        {%- endif -%}
+{% macro advance_fact_cursor() -%}
+    insert into {{ source('meta', 'dbt_change_cursor') }} (model_name, last_change_id, last_txid, last_run_id, updated_at)
+    select 'fact_loan_snapshot', w.max_change_id, w.horizon_txid, w.run_id, now()
+    from {{ ref('int_change_window') }} as w
+    where w.invocation_id = '{{ invocation_id }}'
+    on conflict (model_name) do update
+    set last_change_id = excluded.last_change_id,
+        last_txid = excluded.last_txid,
+        last_run_id = excluded.last_run_id,
+        updated_at = excluded.updated_at
+{%- endmacro %}
+
+{% macro advance_mart_cursor() -%}
+    insert into {{ source('meta', 'dbt_mart_cursor') }} (model_name, last_run_id, updated_at)
+    select '{{ this.identifier }}', {{ mart_upper_run_id() }}, now()
+    on conflict (model_name) do update
+    set last_run_id = excluded.last_run_id,
+        updated_at = excluded.updated_at
+{%- endmacro %}
+
+{% macro builds_models() -%}
+    {{- return(flags.WHICH in ('run', 'build')) -}}
+{%- endmacro %}
+
+{% macro acquire_run_lock() -%}
+    {%- if execute and builds_models() -%}
+        select meta.acquire_dbt_lock('{{ invocation_id }}')
+    {%- else -%}
+        select 1
+    {%- endif -%}
+{%- endmacro %}
+
+{% macro finish_run() -%}
+    {%- if execute and builds_models() -%}
+        delete from meta.dbt_mart_dirty
+        where run_id <= (
+            select case when count(*) < 3 then 0 else min(last_run_id) end
+            from meta.dbt_mart_cursor
+            where model_name in ('mart_delinquency_par', 'mart_portfolio_health', 'mart_repayment_behavior')
+        );
+        select meta.release_dbt_lock('{{ invocation_id }}')
     {%- else -%}
         select 1
     {%- endif -%}

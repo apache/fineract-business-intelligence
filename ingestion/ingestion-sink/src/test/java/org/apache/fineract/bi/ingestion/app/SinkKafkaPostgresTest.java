@@ -19,6 +19,7 @@
 package org.apache.fineract.bi.ingestion.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
@@ -42,6 +43,7 @@ import org.apache.fineract.bi.ingestion.cdc.DebeziumEnvelopeParser;
 import org.apache.fineract.bi.ingestion.config.Env;
 import org.apache.fineract.bi.ingestion.contract.Contract;
 import org.apache.fineract.bi.ingestion.contract.ContractLoader;
+import org.apache.fineract.bi.ingestion.contract.ContractVerifier;
 import org.apache.fineract.bi.ingestion.routing.OwnershipCache;
 import org.apache.fineract.bi.ingestion.sink.WarehouseWriter;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -366,5 +368,33 @@ public class SinkKafkaPostgresTest {
         }
         assertThat(scalar("SELECT epoch FROM meta.ingestion_ownership WHERE source_id = '" + SOURCE + "'"))
                 .isGreaterThan(1L);
+    }
+
+    @Test
+    public void theStartupContractCheckCatchesDriftBetweenTheSinkAndTheWarehouse() throws Exception {
+        String original;
+        try (Connection c = postgres.createConnection(""); Statement s = c.createStatement();
+                ResultSet rs = s.executeQuery("SELECT columns::text FROM meta.table_contract WHERE table_name = '"
+                        + TABLE + "'")) {
+            rs.next();
+            original = rs.getString(1);
+        }
+        try (Connection c = postgres.createConnection("")) {
+            assertThat(ContractVerifier.differences(c, contract)).isEmpty();
+            update("UPDATE meta.table_contract SET columns = jsonb_set(columns, '{1,type}', '\"bigint\"') "
+                    + "WHERE table_name = '" + TABLE + "'");
+            assertThat(ContractVerifier.differences(c, contract))
+                    .anyMatch(d -> d.startsWith(TABLE + ".") && d.contains("type bigint in the warehouse"));
+            assertThatThrownBy(() -> ContractVerifier.verify(c, contract)).isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("does not match meta.table_contract");
+        } finally {
+            try (Connection c = postgres.createConnection("");
+                    java.sql.PreparedStatement ps = c.prepareStatement(
+                            "UPDATE meta.table_contract SET columns = ?::jsonb WHERE table_name = ?")) {
+                ps.setString(1, original);
+                ps.setString(2, TABLE);
+                ps.executeUpdate();
+            }
+        }
     }
 }

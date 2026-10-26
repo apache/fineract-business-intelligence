@@ -80,6 +80,8 @@ def csv_field(value) -> str:
         text = as_utc_datetime(value).isoformat()
     elif isinstance(value, (date, Decimal, int, float)):
         text = str(value)
+    elif isinstance(value, (list, tuple)):
+        text = "{" + ",".join('"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"' for v in value) + "}"
     else:
         text = str(value)
     return '"' + text.replace('"', '""') + '"'
@@ -197,10 +199,8 @@ class SourceExtractor:
         self.tables = tables
 
     def _source_conn(self):
-        cfg = source_pg_config(self.source, secrets.resolve(self.source.secret_ref), "fbi-python-engine")
-        conn = pg8000.dbapi.connect(**cfg.connect_kwargs())
-        conn.autocommit = True
-        return conn
+        password = secrets.resolve(self.source.secret_ref, self.source.source_id)
+        return connect(source_pg_config(self.source, password, "fbi-python-engine"), autocommit=True)
 
     def run(self, mode: str) -> SourceOutcome:
         if mode not in MODES:
@@ -331,6 +331,8 @@ class SourceExtractor:
     ) -> tuple[int, int]:
         t = a.table
         now = datetime.now(UTC)
+        withheld = [c.name for c in t.columns if c.pii] if self.settings.exclude_pii else []
+        unavailable = withheld if withheld and op != "d" else None
         staged = []
         for row in rows:
             source_ts = as_utc_datetime(row[cursor_idx]) if cursor_idx is not None and row[cursor_idx] else now
@@ -343,7 +345,7 @@ class SourceExtractor:
                     None,
                     source_ts,
                     op,
-                    None,
+                    unavailable,
                     a.epoch,
                     a.target,
                 )
@@ -507,7 +509,7 @@ def ensure_env_source(conn, boot: EnvSourceBootstrap, settings: ExtractSettings,
         cob_job_name=boot.cob_job_name,
         labels={**labels, "sslmode": boot.ssl_mode},
     )
-    registry.upsert([record])
+    registry.upsert([record], allow_connection_change=True)
     repo = OwnershipRepository(conn)
     repo.ensure_rows(boot.source_id, contract.table_names)
     conn.commit()

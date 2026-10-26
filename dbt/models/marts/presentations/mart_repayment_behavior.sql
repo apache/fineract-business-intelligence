@@ -21,7 +21,8 @@
         incremental_strategy='append',
         on_schema_change='append_new_columns',
         indexes=[{'columns': ['source_id', 'reporting_date']}, {'columns': ['reporting_date']}],
-        pre_hook=["{{ heavy_model_settings() }}", "{{ mart_delete_recompute_window('mart_repayment_behavior', 'reporting_date', 'changed_from') }}"]
+        pre_hook=["{{ heavy_model_settings() }}", "{{ mart_delete_recompute_window('mart_repayment_behavior', 'reporting_date', 'changed_from') }}"],
+        post_hook=["{{ advance_mart_cursor() }}"]
     )
 }}
 
@@ -177,6 +178,8 @@ due_amounts as (
     inner join recompute as w
         on
             s.source_id = w.source_id
+            and ld.office_id is not distinct from w.office_id
+            and ld.product_id is not distinct from w.product_id
             and s.duedate >= w.recompute_from
     group by 1, 2, 3, 4, 5, 6, 7
 ),

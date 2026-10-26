@@ -113,7 +113,7 @@ def build_connector_config(source: SourceRecord, contract: Contract, settings: C
         "database.hostname": source.db_host,
         "database.port": str(source.db_port),
         "database.user": source.db_user,
-        "database.password": connect_placeholder(source.secret_ref),
+        "database.password": connect_placeholder(source.secret_ref, source.source_id),
         "database.dbname": source.db_name,
         "database.sslmode": source.labels.get("sslmode") or default_source_sslmode(),
         "topic.prefix": source.source_id,

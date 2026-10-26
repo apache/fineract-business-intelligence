@@ -118,6 +118,10 @@ public final class SinkMetrics implements AutoCloseable {
         registry.counter("fbi_sink_offset_gap_total").increment();
     }
 
+    public void quarantineTripped() {
+        registry.counter("fbi_sink_quarantine_tripped_total").increment();
+    }
+
     public long lastSuccessMillis() {
         return lastSuccessMillis.get();
     }

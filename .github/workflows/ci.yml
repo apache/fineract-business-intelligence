@@ -92,8 +92,6 @@ jobs:
         run: pytest tests/unit -v
 
       - name: dbt parse - validate all SQL models and refs (no DB connection)
-        env:
-          FBI_PII_HASH_KEY: ci-parse-only
         run: |
           cd dbt
           dbt deps
@@ -151,11 +149,15 @@ jobs:
             "GRANT USAGE ON SCHEMA meta, raw, raw_shadow TO analytics_loader; \
              GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA meta TO analytics_loader; \
              GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA raw, raw_shadow TO analytics_loader; \
-             GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta TO analytics_loader"
+             GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta TO analytics_loader; \
+             REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON meta.ingestion_ownership, meta.cutover_approval, \
+               meta.reconciliation_run, meta.ingestion_ownership_audit, meta.platform_settings FROM analytics_loader; \
+             GRANT fbi_control_plane TO analytics_loader"
 
       - name: Build, unit test and check dependency licenses (Category A only)
         env:
           FBI_TEST_DB_URL: jdbc:postgresql://localhost:5434/analytics
+          FBI_TEST_DB_ADMIN_PASSWORD: ci-only
         run: |
           export JAVA_HOME="${JAVA_HOME_17_X64}"
           mvn -B -f ingestion/pom.xml verify

@@ -28,6 +28,7 @@ select
     ) as last_txid,
     pg_snapshot_xmin(pg_current_snapshot()) as horizon_txid,
     nextval('meta.dbt_run_seq')::bigint as run_id,
+    '{{ invocation_id }}'::text as invocation_id,
     coalesce(
         (select max(l.change_id) from {{ source('meta', 'entity_change_log') }} l),
         0
