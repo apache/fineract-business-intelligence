@@ -49,7 +49,7 @@ under the License.
     <postgresql.version>42.7.13</postgresql.version>
     <hikaricp.version>6.3.0</hikaricp.version>
     <jackson.version>2.20.0</jackson.version>
-    <micrometer.version>1.15.4</micrometer.version>
+    <micrometer.version>1.15.12</micrometer.version>
     <slf4j.version>2.0.17</slf4j.version>
     <log4j.version>2.25.1</log4j.version>
     <testng.version>7.11.0</testng.version>
