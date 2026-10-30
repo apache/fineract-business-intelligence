@@ -15,14 +15,16 @@
 
 with source as (
     select * from {{ source('raw', 'raw_m_client') }}
+    where not _is_deleted
 )
 
 select
+    source_id,
     tenant_id,
     id as client_id,
     account_no as client_account_no,
     external_id as client_external_id,
-    md5(tenant_id || '::' || id::text) as client_hash,
+    meta.client_hash(source_id, tenant_id, id) as client_hash,
     status_enum,
     activation_date,
     office_joining_date,
@@ -34,17 +36,21 @@ select
     updated_on,
     created_on_utc,
     last_modified_on_utc,
-    case
-        when date_of_birth is null
-            then 'Unknown'
-        when extract(year from age(current_date, date_of_birth)) < 25
-            then '18-24'
-        when extract(year from age(current_date, date_of_birth)) < 35
-            then '25-34'
-        when extract(year from age(current_date, date_of_birth)) < 45
-            then '35-44'
-        when extract(year from age(current_date, date_of_birth)) < 55
-            then '45-54'
-        else '55+'
-    end as age_band
+    {% if var('exclude_pii') | string | lower in ('1', 'true', 'yes', 'on') %}
+        'Not collected' as age_band
+    {% else %}
+        case
+            when date_of_birth is null
+                then 'Unknown'
+            when extract(year from age(current_date, date_of_birth)) < 25
+                then '18-24'
+            when extract(year from age(current_date, date_of_birth)) < 35
+                then '25-34'
+            when extract(year from age(current_date, date_of_birth)) < 45
+                then '35-44'
+            when extract(year from age(current_date, date_of_birth)) < 55
+                then '45-54'
+            else '55+'
+        end as age_band
+    {% endif %}
 from source

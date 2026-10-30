@@ -13,8 +13,29 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-with delinquency_events as (
+with tag_history as (
+    select * from {{ source('raw', 'raw_m_loan_delinquency_tag_history') }}
+    where not _is_deleted
+),
+
+ranges as (
+    select * from {{ source('raw', 'raw_m_delinquency_range') }}
+    where not _is_deleted
+),
+
+mappings as (
+    select * from {{ source('raw', 'raw_m_delinquency_bucket_mappings') }}
+    where not _is_deleted
+),
+
+buckets as (
+    select * from {{ source('raw', 'raw_m_delinquency_bucket') }}
+    where not _is_deleted
+),
+
+delinquency_events as (
     select
+        d.source_id,
         d.tenant_id,
         d.id as delinquency_event_id,
         d.loan_id,
@@ -28,18 +49,21 @@ with delinquency_events as (
         d.liftedon_date,
         d.created_on_utc,
         d.last_modified_on_utc
-    from {{ source('raw', 'raw_m_loan_delinquency_tag_history') }} d
-    left join {{ source('raw', 'raw_m_delinquency_range') }} r
+    from tag_history d
+    left join ranges r
         on
-            d.tenant_id = r.tenant_id
+            d.source_id = r.source_id
+            and d.tenant_id = r.tenant_id
             and d.delinquency_range_id = r.id
-    left join {{ source('raw', 'raw_m_delinquency_bucket_mappings') }} m
+    left join mappings m
         on
-            r.tenant_id = m.tenant_id
+            r.source_id = m.source_id
+            and r.tenant_id = m.tenant_id
             and r.id = m.delinquency_range_id
-    left join {{ source('raw', 'raw_m_delinquency_bucket') }} b
+    left join buckets b
         on
-            m.tenant_id = b.tenant_id
+            m.source_id = b.source_id
+            and m.tenant_id = b.tenant_id
             and m.delinquency_bucket_id = b.id
 )
 

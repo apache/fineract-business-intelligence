@@ -14,32 +14,41 @@
 -- limitations under the License.
 
 with latest_snapshot as (
-    select max(snapshot_date) as snapshot_date
+    select
+        source_id,
+        max(snapshot_date) as snapshot_date
     from {{ ref('fact_loan_snapshot') }}
+    group by source_id
 ),
 
 latest_transaction_balance as (
-    select distinct on (tenant_id, loan_id)
+    select distinct on (source_id, tenant_id, loan_id)
+        source_id,
         tenant_id,
         loan_id,
         outstanding_loan_balance_derived
     from {{ source('raw', 'raw_m_loan_transaction') }}
     where
-        is_reversed = false
+        not _is_deleted
+        and is_reversed = false
         and outstanding_loan_balance_derived is not null
-    order by tenant_id asc, loan_id asc, transaction_date desc, id desc
+    order by source_id asc, tenant_id asc, loan_id asc, transaction_date desc, id desc
 )
 
 select
+    f.source_id,
     f.tenant_id,
     f.loan_id,
     f.principal_outstanding as reconstructed_principal_outstanding,
     t.outstanding_loan_balance_derived as latest_ledger_balance
 from {{ ref('fact_loan_snapshot') }} f
 inner join latest_snapshot ls
-    on f.snapshot_date = ls.snapshot_date
+    on
+        f.source_id = ls.source_id
+        and f.snapshot_date = ls.snapshot_date
 inner join latest_transaction_balance t
     on
-        f.tenant_id = t.tenant_id
+        f.source_id = t.source_id
+        and f.tenant_id = t.tenant_id
         and f.loan_id = t.loan_id
 where abs(f.principal_outstanding - t.outstanding_loan_balance_derived) > 0.01

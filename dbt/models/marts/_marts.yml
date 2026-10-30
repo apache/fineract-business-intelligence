@@ -25,7 +25,7 @@ models:
       client_hash is the surrogate primary key safe for analytics use.
     columns:
       - name: client_hash
-        description: Pseudonymised surrogate primary key (MD5 of tenant_id + client_id).
+        description: Pseudonymised surrogate primary key (MD5 of source_id + tenant_id + client_id).
         tests:
           - not_null
           - unique
@@ -34,21 +34,27 @@ models:
     description: >
       Office hierarchy dimension.  office_level is derived from the
       dot-delimited hierarchy string.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, office_id]
     columns:
       - name: office_id
         description: Surrogate primary key.
         tests:
           - not_null
-          - unique
+
 
   - name: dim_product
     description: Loan product dimension containing product templates and default terms.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, product_id]
     columns:
       - name: product_id
         description: Surrogate primary key.
         tests:
           - not_null
-          - unique
+
 
   - name: dim_date
     description: >
@@ -66,12 +72,15 @@ models:
       Delinquency bucket dimension with a synthetic bucket_key=0 row for
       'Current' (non-delinquent) loans.  Includes CGAP standard_par_band
       classification and sort_order for ordered reporting.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [source_id, tenant_id, bucket_key]
     columns:
       - name: bucket_key
         description: Surrogate primary key; 0 = Current, -1 reserved for rollups.
         tests:
           - not_null
-          - unique
+
 
   - name: dim_currency
     description: Currency reference dimension.
@@ -85,11 +94,12 @@ models:
   - name: fact_loan_snapshot
     description: >
       Daily grain fact table capturing each active loan's delinquency
-      status and outstanding balance per snapshot date.  Loaded
-      incrementally with a 120-day lookback delete+insert strategy.
+      status and outstanding balance per snapshot date.  Maintained
+      change-driven: only loans in int_snapshot_scope are recomputed, from
+      their earliest affected date (backdated changes of any age).
     columns:
       - name: snapshot_key
-        description: MD5 surrogate key over (tenant_id, loan_id, snapshot_date).
+        description: MD5 surrogate key over (source_id, tenant_id, loan_id, snapshot_date).
         tests:
           - not_null
           - unique
@@ -132,7 +142,7 @@ models:
       bucket for migration matrix analysis and event duration in days.
     columns:
       - name: delinquency_event_key
-        description: MD5 surrogate key over (tenant_id, delinquency_event_id).
+        description: MD5 surrogate key over (source_id, tenant_id, delinquency_event_id).
         tests:
           - not_null
           - unique

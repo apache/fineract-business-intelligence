@@ -26,4 +26,4 @@ fineract_bi:
       password: "{{ env_var('PGPASSWORD', 'ci') }}"
       dbname: "{{ env_var('PGDATABASE', 'analytics') }}"
       schema: analytics
-      threads: 4
+      threads: "{{ env_var('DBT_THREADS', '4') | int }}"

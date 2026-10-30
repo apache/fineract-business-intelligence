@@ -13,7 +13,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-select
+select distinct on (currency_code)
     currency_code,
     currency_name,
     display_symbol,
@@ -21,3 +21,4 @@ select
     currency_multiplesof,
     internationalized_name_code
 from {{ ref('stg_m_currency') }}
+order by currency_code, source_id

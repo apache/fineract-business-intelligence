@@ -41,4 +41,7 @@ python /workspace/docker/superset/bootstrap_superset_assets.py || {
 }
 
 echo "[superset] Starting web server on :8088..."
-exec superset run -h 0.0.0.0 -p 8088 --with-threads
+if [ "${SUPERSET_DEV_SERVER:-false}" = "true" ]; then
+    exec superset run -h 0.0.0.0 -p 8088 --with-threads
+fi
+exec gunicorn     --bind 0.0.0.0:8088     --workers "${SUPERSET_WEBSERVER_WORKERS:-2}"     --worker-class gthread     --threads "${SUPERSET_WEBSERVER_THREADS:-4}"     --timeout "${SUPERSET_WEBSERVER_TIMEOUT:-120}"     --limit-request-line 0     --limit-request-field_size 0     "superset.app:create_app()"

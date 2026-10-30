@@ -90,6 +90,7 @@ def build_layout(
 
 DELINQUENCY_COLUMNS: list[dict] = [
     {"name": "snapshot_date",             "type": "DATE",    "is_dttm": True},
+    {"name": "source_id",                 "type": "TEXT"},
     {"name": "tenant_id",                 "type": "TEXT"},
     {"name": "office_id",                 "type": "BIGINT"},
     {"name": "office_name",               "type": "TEXT"},
@@ -130,6 +131,7 @@ DELINQUENCY_COLUMNS: list[dict] = [
 
 PORTFOLIO_COLUMNS: list[dict] = [
     {"name": "snapshot_date",                   "type": "DATE",    "is_dttm": True},
+    {"name": "source_id",                       "type": "TEXT"},
     {"name": "tenant_id",                       "type": "TEXT"},
     {"name": "office_id",                       "type": "BIGINT"},
     {"name": "office_name",                     "type": "TEXT"},
@@ -162,6 +164,8 @@ PORTFOLIO_COLUMNS: list[dict] = [
 
 REPAYMENT_COLUMNS: list[dict] = [
     {"name": "reporting_date",                        "type": "DATE",    "is_dttm": True},
+    {"name": "source_id",                             "type": "TEXT"},
+    {"name": "tenant_id",                             "type": "TEXT"},
     {"name": "client_hash",                           "type": "TEXT"},
     {"name": "office_id",                             "type": "BIGINT"},
     {"name": "office_name",                           "type": "TEXT"},

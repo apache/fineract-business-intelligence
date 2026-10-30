@@ -188,6 +188,7 @@ DROP VIEW IF EXISTS ${SOURCE_DB_SCHEMA}.batch_job_execution;
 CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_execution AS
 SELECT
     bje.job_execution_id,
+    bje.job_instance_id,
     bji.job_name,
     bje.status,
     bje.start_time   ::timestamptz AS start_time,
@@ -199,6 +200,12 @@ SELECT
 FROM public.batch_job_execution bje
 INNER JOIN public.batch_job_instance bji
     ON bje.job_instance_id = bji.job_instance_id;
+
+-- batch_job_instance: captured separately so CDC (which sees base tables only)
+-- and the Python engine produce the same raw rows; dbt joins job_name.
+CREATE OR REPLACE VIEW ${SOURCE_DB_SCHEMA}.batch_job_instance AS
+SELECT job_instance_id, job_name, job_key
+FROM public.batch_job_instance;
 COMMIT;
 SQL
 

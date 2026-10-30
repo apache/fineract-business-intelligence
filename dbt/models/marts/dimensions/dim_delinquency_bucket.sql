@@ -15,16 +15,20 @@
 
 with source_buckets as (
     select
+        source_id,
+        tenant_id,
         bucket_id as bucket_key,
         max(bucket_name) as bucket_name,
         min(min_age_days) as min_age_days,
         max(coalesce(max_age_days, 99999)) as max_age_days
     from {{ ref('stg_m_delinquency') }}
     where bucket_id is not null
-    group by bucket_id
+    group by source_id, tenant_id, bucket_id
 )
 
 select
+    '*' as source_id,
+    '*' as tenant_id,
     0::bigint as bucket_key,
     'Performing' as bucket_name,
     0 as min_age_days,
@@ -33,6 +37,8 @@ select
     0 as sort_order
 union all
 select
+    source_id,
+    tenant_id,
     bucket_key,
     bucket_name,
     min_age_days,
