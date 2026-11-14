@@ -454,8 +454,20 @@ The following changes should trigger a revision of this threat model:
 
 ## §13 Triage dispositions
 
-Use these dispositions when evaluating a security report before escalating to the ASF
-Security team.
+> [!IMPORTANT]
+> **Rule 1 is checked before anything else in this table and short-circuits the rest.**
+> This project has never been released by the Apache Fineract PMC — there is no
+> release tag, and the document already says it is not release-ready. No operator
+> can be running a released version of this pipeline, because there isn't one.
+
+| Disposition | Meaning | Licensed by |
+|---|---|---|
+| **1. `NOT-ACCEPTED: unreleased-project`** | **Checked first.** The report concerns this repository rather than a released Apache Fineract artifact. It is closed without further triage: no CVE is requested, no security release is made, and no embargo applies. None of the rows below are evaluated. | §2, §13a |
+
+The rest of this table applies **only** once rule 1 no longer does — see §13a. It is
+kept current rather than deleted, because it is what triage returns to on the day
+this pipeline is released, and what the project applies to its own findings in the
+meantime.
 
 | Disposition | Meaning | Licensed by |
 |---|---|---|
@@ -468,6 +480,36 @@ Security team.
 | `BY-DESIGN: property-disclaimed` | Concerns a property the project explicitly does not provide (TLS between services, Docker socket isolation, SQL Lab restriction, audit log, storage encryption at rest). | §9 |
 | `KNOWN-NON-FINDING` | Matches a known misuse pattern documented in §11 or a CI-only credential known to be public. | §11 |
 | `MODEL-GAP` | Cannot be cleanly routed to any of the above. Triggers §12 revision and requires model update before triage can conclude. | §12 |
+
+---
+
+## §13a When rule 1 stops applying
+
+Rule 1 of §13 is removed **in the same change that first releases this pipeline** —
+not separately, and not later. Whoever prepares that release removes it; the release
+is not complete while it is still here.
+
+That coupling is the point. An exemption of this shape is only honest while its
+premise holds, and the failure mode is not someone abusing it — it is everyone
+forgetting it. A file that still says "reports about this are closed unread" after
+the artifact ships would turn a true statement about pre-release work into a false
+one about a release, silently.
+
+Three things rule 1 does **not** do:
+
+- **It does not suppress the model above it.** §1–§12 and §14–§18 describe a model
+  this project holds itself to today, and the project applies the dispositions below
+  rule 1 to its own findings — that is how the controls in §14 came to exist. Rule 1
+  governs what an *inbound report* is entitled to, not what is worth fixing.
+- **It does not reach Fineract Core, Superset or PostgreSQL.** A finding in any of
+  those concerns a *released* artifact of another project and is routed by
+  `OUT-OF-MODEL: upstream-layer`. The release status of this pipeline says nothing
+  about the release status of what it reads from or renders with, and conflating the
+  two is the one misreading of rule 1 that could do real harm.
+- **It does not cover a deployed warehouse.** If an operator has stood this pipeline
+  up against real data despite §2, their *deployment* is theirs to secure under §10
+  and a finding about it is a support question, not a vulnerability in unreleased
+  code. Rule 1 is about the artifact, not about absolving the operator.
 
 ---
 
