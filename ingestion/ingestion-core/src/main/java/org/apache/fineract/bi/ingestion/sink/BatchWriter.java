@@ -28,4 +28,9 @@ public interface BatchWriter {
     List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
             Collection<PartitionOffset> offsets, String consumerGroup, Collection<SkipCheck> skips)
             throws SQLException;
+
+    default List<WarehouseWriter.Applied> preflight(Connection c, Collection<RoutedEvent> events)
+            throws SQLException {
+        return List.of();
+    }
 }

@@ -21,15 +21,25 @@ package org.apache.fineract.bi.ingestion.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.fineract.bi.ingestion.cdc.DebeziumEnvelopeParser;
@@ -40,6 +50,7 @@ import org.apache.fineract.bi.ingestion.routing.OwnershipSnapshot;
 import org.apache.fineract.bi.ingestion.routing.OwnershipView;
 import org.apache.fineract.bi.ingestion.sink.BatchWriter;
 import org.apache.fineract.bi.ingestion.sink.PartitionOffset;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 import org.apache.fineract.bi.ingestion.sink.SkipCheck;
 import org.apache.fineract.bi.ingestion.sink.WarehouseWriter;
@@ -137,17 +148,80 @@ public class SinkWorkerDeliveryTest {
     }
 
     private SinkWorker worker(View view, Map<String, String> extra) {
+        return worker(view, () -> null, extra);
+    }
+
+    private SinkWorker worker(View view, ConnectionSource connections, Map<String, String> extra) {
         Map<String, String> env = new HashMap<>(Map.of(
                 "SINK_MAX_BACKOFF_MS", "20", "SINK_MAX_BATCH_WAIT_MS", "1", "SINK_HEALTH_STUCK_MS", "50"));
         env.putAll(extra);
         SinkConfig config = SinkConfig.from(Env.of(env), env);
-        SinkWorker w = new SinkWorker(0, config, () -> null, view, new DebeziumEnvelopeParser(contract), writer, letters,
+        SinkWorker w = new SinkWorker(0, config, connections, view, new DebeziumEnvelopeParser(contract), writer, letters,
                 metrics, new ProgressReporter(null, "test"), p -> consumer);
         w.attach(consumer);
         consumer.assign(List.of(P0, P1));
         consumer.updateBeginningOffsets(Map.of(P0, 0L, P1, 0L));
         consumer.updateEndOffsets(Map.of(P0, 1_000L, P1, 1_000L));
         return w;
+    }
+
+    private ConnectionSource fakeConnections(Set<ReplayIdentity> ledger) {
+        return () -> (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[] { Connection.class },
+                (proxy, method, args) -> {
+                    if ("prepareStatement".equals(method.getName())) {
+                        String[] currentTopic = new String[1];
+                        int[] currentPartition = new int[1];
+                        long[] currentOffset = new long[1];
+                        return (PreparedStatement) Proxy.newProxyInstance(
+                                PreparedStatement.class.getClassLoader(),
+                                new Class<?>[] { PreparedStatement.class },
+                                (pProxy, pMethod, pArgs) -> {
+                                    if ("setString".equals(pMethod.getName())) {
+                                        currentTopic[0] = (String) pArgs[1];
+                                        return null;
+                                    }
+                                    if ("setInt".equals(pMethod.getName())) {
+                                        currentPartition[0] = (Integer) pArgs[1];
+                                        return null;
+                                    }
+                                    if ("setLong".equals(pMethod.getName())) {
+                                        currentOffset[0] = (Long) pArgs[1];
+                                        return null;
+                                    }
+                                    if ("executeQuery".equals(pMethod.getName())) {
+                                        boolean exists = ledger.contains(new ReplayIdentity(
+                                                currentTopic[0], currentPartition[0], currentOffset[0]));
+                                        boolean[] returned = {false};
+                                        return (ResultSet) Proxy.newProxyInstance(
+                                                ResultSet.class.getClassLoader(),
+                                                new Class<?>[] { ResultSet.class },
+                                                (rProxy, rMethod, rArgs) -> {
+                                                    if ("next".equals(rMethod.getName())) {
+                                                        if (exists && !returned[0]) {
+                                                            returned[0] = true;
+                                                            return true;
+                                                        }
+                                                        return false;
+                                                    }
+                                                    if ("close".equals(rMethod.getName())) {
+                                                        return null;
+                                                    }
+                                                    return null;
+                                                });
+                                    }
+                                    if ("close".equals(pMethod.getName())) {
+                                        return null;
+                                    }
+                                    return null;
+                                });
+                    }
+                    if ("close".equals(method.getName())) {
+                        return null;
+                    }
+                    return null;
+                });
     }
 
     private static ConsumerRecord<byte[], byte[]> record(TopicPartition tp, long offset, String source, long id) {
@@ -482,5 +556,66 @@ public class SinkWorkerDeliveryTest {
         assertThat(w.buffered()).isEqualTo(37);
         assertThat(w.isAlive()).isTrue();
         assertThat(w.isHealthy(System.currentTimeMillis())).as("the tripped breaker turns health red").isFalse();
+    }
+
+    @Test
+    public void duplicateReplayIsSkippedEvenIfOwnershipChangesToHoldOrUnknownSource() {
+        Set<ReplayIdentity> ledger = new HashSet<>();
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, fakeConnections(ledger), Map.of());
+
+        ReplayIdentity replayId = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 100L);
+        ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r1.headers(), replayId);
+
+        w.enqueue(r1);
+        Map<TopicPartition, OffsetAndMetadata> commit1 = w.processWithRetry(consumer);
+
+        assertThat(writer.allIds()).containsExactly(1L);
+        assertThat(commit1.get(P0).offset()).isEqualTo(1L);
+        assertThat(letters.letters).isEmpty();
+        assertThat(w.heldPartitions()).isEmpty();
+
+        // Mark replay completed in ledger (simulating successful write + ledger claim)
+        ledger.add(replayId);
+
+        // 1. Ownership transitions to PAUSED (HOLD)
+        OwnershipSnapshot holdSnap = new OwnershipSnapshot(
+                Map.of(OwnershipSnapshot.key("bank-a", "batch_job_instance"),
+                        new OwnershipSnapshot.Entry("KAFKA", null, "PAUSED", 8)),
+                Map.of("bank-a", new OwnershipSnapshot.SourceMeta("t-a", 0)),
+                System.currentTimeMillis());
+        view.current.set(holdSnap);
+
+        ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 1);
+        ReplayIdentityHeaders.add(r2.headers(), replayId);
+        w.enqueue(r2);
+
+        Map<TopicPartition, OffsetAndMetadata> commit2 = w.processWithRetry(consumer);
+
+        assertThat(commit2.get(P0).offset()).isEqualTo(2L);
+        assertThat(writer.allIds()).as("duplicate is not re-applied to warehouse").containsExactly(1L);
+        assertThat(w.heldPartitions()).as("duplicate is skipped rather than held").isEmpty();
+        assertThat(letters.letters).as("duplicate is not dead-lettered").isEmpty();
+        assertThat(w.buffered()).isZero();
+
+        // 2. Ownership transitions to UNKNOWN_SOURCE (unregistered source)
+        OwnershipSnapshot unknownSnap = new OwnershipSnapshot(
+                Map.of(),
+                Map.of(),
+                System.currentTimeMillis());
+        view.current.set(unknownSnap);
+
+        ConsumerRecord<byte[], byte[]> r3 = record(P0, 2, "bank-a", 1);
+        ReplayIdentityHeaders.add(r3.headers(), replayId);
+        w.enqueue(r3);
+
+        Map<TopicPartition, OffsetAndMetadata> commit3 = w.processWithRetry(consumer);
+
+        assertThat(commit3.get(P0).offset()).isEqualTo(3L);
+        assertThat(writer.allIds()).as("duplicate is not re-applied to warehouse").containsExactly(1L);
+        assertThat(w.heldPartitions()).as("duplicate is not held").isEmpty();
+        assertThat(letters.letters).as("duplicate is not dead-lettered as UNKNOWN_SOURCE").isEmpty();
+        assertThat(w.buffered()).isZero();
     }
 }
