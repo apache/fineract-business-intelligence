@@ -287,7 +287,8 @@ PostgreSQL database: analytics
 ├── schema: staging      (dbt — materialized as views)
 │     staging.stg_m_loan
 │     staging.stg_m_client     ← retains client_id, account_no, external_id
-│                                 adds client_hash (MD5 pseudonym) and age_band
+│                                 adds client_hash (HMAC-SHA256 pseudonym, see §5)
+│                                 and age_band
 │     staging.stg_m_office
 │     staging.stg_m_product_loan
 │     staging.stg_m_loan_transaction
@@ -349,13 +350,13 @@ PII reduction occurs at the **staging** layer only — staging is not fully PII-
 | Field | Transformation | Carried into analytics layer? |
 |---|---|---|
 | `date_of_birth` | Replaced with `age_band` (5 cohorts: `Unknown`, `18-24`, `25-34`, `35-44`, `45-54`, `55+`) in `stg_m_client` | No — original not exposed |
-| `id` (client) | Added as `client_hash = MD5(tenant_id \|\| '::' \|\| id::text)` in `stg_m_client` | `client_hash` propagates; original `client_id` also propagates |
+| `id` (client) | Added as `client_hash = meta.client_hash(source_id, tenant_id, id)` in `stg_m_client`: hex HMAC-SHA256 of `source_id \|\| '::' \|\| tenant_id \|\| '::' \|\| id`, keyed by `meta.pii_hash_key` | `client_hash` propagates; original `client_id` also propagates |
 | `account_no`, `external_id` | Renamed in staging (`client_account_no`, `client_external_id`) but retained | Present in staging views |
 | Loan fields | Not transformed — `client_id` is retained in `fact_loan_snapshot` | Yes — `client_id` present in fact table |
 | Mart aggregations | `mart_portfolio_health` and `mart_delinquency_par` aggregate at office × product level — no individual rows | N/A |
 | `mart_repayment_behavior` | Keyed at `(tenant_id, reporting_date, office_id, product_id, currency_code, client_hash)` — individual client represented via hash | `client_hash` present |
 
-> **`client_hash` is pseudonymous, not anonymous.** `MD5(tenant_id || '::' || id::text)` is deterministic and unsalted. Given the client ID it is trivially reversible. It is a consistency key, not a privacy control.
+> **`client_hash` is pseudonymous, not anonymous.** It is an HMAC-SHA256 keyed by `meta.pii_hash_key`, a random 32-byte key generated inside each warehouse. Only the warehouse admin and the `fbi_control_plane` group can read the key; `analytics_reader` cannot. Anyone who can read the key can recompute the hash from a client ID and link hashes back to clients, so treat access to the key like access to `client_id`. `fact_loan_snapshot` also carries `client_id` next to `client_hash`, which links the two without the key. Hashes are stable only while the key is: `meta.rotate_pii_hash_key()` (admin only) replaces it and every client gets a new `client_hash`. Run `dbt build --full-refresh` after rotating, or rows that incremental models wrote earlier keep hashes made with the old key.
 
 > **Superset datasets** (`superset/datasets/*.sql`) use `analytics_reader` which does not have access to `raw_views` or `staging` schemas. Superset queries only `analytics.*` models and `meta.*` tables.
 
