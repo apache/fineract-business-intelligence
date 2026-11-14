@@ -349,7 +349,7 @@ PII reduction occurs at the **staging** layer only — staging is not fully PII-
 
 | Field | Transformation | Carried into analytics layer? |
 |---|---|---|
-| `date_of_birth` | Replaced with `age_band` (5 cohorts: `Unknown`, `18-24`, `25-34`, `35-44`, `45-54`, `55+`) in `stg_m_client` | No — original not exposed |
+| `date_of_birth` | Replaced with `age_band` in `stg_m_client`. With `FBI_EXCLUDE_PII=true` (the default), `age_band` is always `'Not collected'` and `date_of_birth` is not read. With `FBI_EXCLUDE_PII=false`, `age_band` is derived from `date_of_birth` (6 values: `Unknown`, `18-24`, `25-34`, `35-44`, `45-54`, `55+`) | No — original not exposed |
 | `id` (client) | Added as `client_hash = meta.client_hash(source_id, tenant_id, id)` in `stg_m_client`: hex HMAC-SHA256 of `source_id \|\| '::' \|\| tenant_id \|\| '::' \|\| id`, keyed by `meta.pii_hash_key` | `client_hash` propagates; original `client_id` also propagates |
 | `account_no`, `external_id` | Renamed in staging (`client_account_no`, `client_external_id`) but retained | Present in staging views |
 | Loan fields | Not transformed — `client_id` is retained in `fact_loan_snapshot` | Yes — `client_id` present in fact table |
