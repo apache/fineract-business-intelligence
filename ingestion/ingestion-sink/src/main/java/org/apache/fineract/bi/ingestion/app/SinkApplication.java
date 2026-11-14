@@ -52,8 +52,12 @@ public final class SinkApplication {
         switch (command) {
             case "provision-topics" -> TopicProvisioner.provision(contract, env);
             case "run" -> run(contract, SinkConfig.from(env, System.getenv()));
+            case "dlt-list" -> DeadLetterListCommand.run(
+                SinkConfig.from(env, System.getenv()), contract);
+            case "dlt-replay" -> DeadLetterReplayCommand.run(
+                SinkConfig.from(env, System.getenv()), contract, args);
             default -> {
-                System.err.println("Usage: SinkApplication [run|provision-topics]");
+                System.err.println("Usage: SinkApplication [run|provision-topics|dlt-list|dlt-replay]");
                 System.exit(2);
             }
         }

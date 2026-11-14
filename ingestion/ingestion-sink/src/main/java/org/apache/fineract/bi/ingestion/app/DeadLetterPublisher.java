@@ -97,6 +97,7 @@ public final class DeadLetterPublisher implements AutoCloseable, DeadLetterSink 
             out.headers().add("fbi.dlt.value_omitted", bytes("true"));
             out.headers().add("fbi.dlt.value_bytes", bytes(Integer.toString(value == null ? 0 : value.length)));
         }
+        ReplayIdentityHeaders.copy(r.headers(), out.headers());
         return out;
     }
 

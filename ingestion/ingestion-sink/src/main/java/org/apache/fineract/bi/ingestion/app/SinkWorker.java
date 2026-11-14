@@ -49,6 +49,7 @@ import org.apache.fineract.bi.ingestion.routing.Route;
 import org.apache.fineract.bi.ingestion.sink.BatchWriter;
 import org.apache.fineract.bi.ingestion.sink.FencedWriteException;
 import org.apache.fineract.bi.ingestion.sink.PartitionOffset;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 import org.apache.fineract.bi.ingestion.sink.SkipCheck;
 import org.apache.fineract.bi.ingestion.sink.SqlFailures;
@@ -539,6 +540,32 @@ public final class SinkWorker implements Runnable {
         Map<TopicPartition, Long> heldFrom = new HashMap<>(alreadyHeld);
         Map<String, long[]> perTable = new HashMap<>();
 
+        // Early completed-replay check before parsing and ownership routing
+        Set<ReplayIdentity> candidates = new HashSet<>();
+        Map<ConsumerRecord<byte[], byte[]>, ReplayIdentity> recordReplays = new IdentityHashMap<>();
+        Map<ConsumerRecord<byte[], byte[]>, String> malformedReplays = new IdentityHashMap<>();
+
+        for (ConsumerRecord<byte[], byte[]> r : batch) {
+            if (ReplayIdentityHeaders.hasReplayHeaders(r.headers())) {
+                try {
+                    Optional<ReplayIdentity> opt = ReplayIdentityHeaders.read(r.headers());
+                    if (opt.isPresent()) {
+                        candidates.add(opt.get());
+                        recordReplays.put(r, opt.get());
+                    }
+                } catch (Exception e) {
+                    malformedReplays.put(r, e.getMessage());
+                }
+            }
+        }
+
+        Set<ReplayIdentity> completedReplays = Set.of();
+        if (!candidates.isEmpty()) {
+            try (Connection conn = connections.get()) {
+                completedReplays = WarehouseWriter.findCompletedReplays(conn, candidates);
+            }
+        }
+
         for (ConsumerRecord<byte[], byte[]> r : batch) {
             TopicPartition tp = partitionOf(r);
             if (heldFrom.containsKey(tp)) {
@@ -546,6 +573,24 @@ public final class SinkWorker implements Runnable {
             }
             String table = r.topic().substring(r.topic().lastIndexOf('.') + 1);
             long[] counts = perTable.computeIfAbsent(table, k -> new long[4]);
+
+            // Early check: if replay identity is already committed in meta.replay_ledger, skip routing
+            ReplayIdentity replayId = recordReplays.get(r);
+            if (replayId != null && completedReplays.contains(replayId)) {
+                counts[0]++;
+                counts[2]++; // skipped
+                next.merge(tp, r.offset() + 1, Math::max);
+                continue;
+            }
+
+            if (malformedReplays.containsKey(r)) {
+                counts[0]++;
+                counts[3]++; // dead-lettered
+                next.merge(tp, r.offset() + 1, Math::max);
+                letters.add(new DeadLetterPublisher.DeadLetter(r, "MALFORMED_REPLAY_IDENTITY", malformedReplays.get(r)));
+                continue;
+            }
+
             Optional<ChangeEvent> parsed;
             try {
                 parsed = parser.parse(r.topic(), r.value());
@@ -575,7 +620,7 @@ public final class SinkWorker implements Runnable {
             }
             switch (route.target()) {
                 case PROD, SHADOW -> {
-                    writes.add(new RoutedEvent(event, route));
+                    writes.add(new RoutedEvent(event, route, replayId));
                     counts[1]++;
                 }
                 case SKIP -> {

@@ -647,6 +647,14 @@ CREATE TABLE IF NOT EXISTS meta.consumer_offsets (
     PRIMARY KEY (consumer_group, topic, kafka_partition)
 );
 
+CREATE TABLE IF NOT EXISTS meta.replay_ledger (
+    dlt_topic TEXT NOT NULL,
+    dlt_partition INTEGER NOT NULL,
+    dlt_offset BIGINT NOT NULL,
+    replayed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (dlt_topic, dlt_partition, dlt_offset)
+);
+
 CREATE TABLE IF NOT EXISTS meta.extract_watermarks (
     source_id TEXT NOT NULL,
     table_name TEXT NOT NULL,

@@ -36,15 +36,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import org.apache.fineract.bi.ingestion.cdc.ChangeEvent;
 import org.apache.fineract.bi.ingestion.cdc.DebeziumEnvelopeParser;
 import org.apache.fineract.bi.ingestion.config.Env;
 import org.apache.fineract.bi.ingestion.contract.Contract;
 import org.apache.fineract.bi.ingestion.contract.ContractLoader;
 import org.apache.fineract.bi.ingestion.contract.ContractVerifier;
 import org.apache.fineract.bi.ingestion.routing.OwnershipCache;
+import org.apache.fineract.bi.ingestion.routing.Route;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
+import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 import org.apache.fineract.bi.ingestion.sink.WarehouseWriter;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.NewTopic;
@@ -52,6 +58,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.testcontainers.DockerClientFactory;
@@ -149,7 +156,7 @@ public class SinkKafkaPostgresTest {
                 + "GRANT SELECT ON ALL TABLES IN SCHEMA meta TO analytics_engine; "
                 + "GRANT INSERT, UPDATE, DELETE ON meta.consumer_offsets, meta.extract_watermarks, "
                 + "meta.ingestion_progress, meta.ingestion_audit, meta.pipeline_state TO analytics_engine; "
-                + "GRANT INSERT ON meta.entity_change_log TO analytics_engine; "
+                + "GRANT INSERT ON meta.entity_change_log, meta.replay_ledger TO analytics_engine; "
                 + "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta TO analytics_engine\"");
         update("INSERT INTO meta.source_registry (source_id, tenant_id, lifecycle_state) VALUES ('" + SOURCE
                 + "', 'tenant-a', 'ACTIVE')");
@@ -287,6 +294,27 @@ public class SinkKafkaPostgresTest {
         return values;
     }
 
+    private ConsumerRecord<byte[], byte[]> awaitDltRecord(
+            java.util.function.Predicate<ConsumerRecord<byte[], byte[]>> predicate, long timeoutMs) throws Exception {
+        Properties p = new Properties();
+        p.put("bootstrap.servers", kafka.getBootstrapServers());
+        p.put("group.id", "dlt-await-" + UUID.randomUUID());
+        p.put("auto.offset.reset", "earliest");
+        try (KafkaConsumer<byte[], byte[]> c =
+                new KafkaConsumer<>(p, new ByteArrayDeserializer(), new ByteArrayDeserializer())) {
+            c.subscribe(List.of(DLT));
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (System.currentTimeMillis() < deadline) {
+                for (ConsumerRecord<byte[], byte[]> r : c.poll(Duration.ofMillis(300))) {
+                    if (predicate.test(r)) {
+                        return r;
+                    }
+                }
+            }
+        }
+        throw new AssertionError("Timed out waiting for matching DLT record");
+    }
+
     @Test
     public void everyEventIsAppliedOnceAndTheOffsetsLiveInTheWarehouse() throws Exception {
         try (Running sink = new Running("g-basic", "w1", true)) {
@@ -395,6 +423,198 @@ public class SinkKafkaPostgresTest {
                 ps.setString(2, TABLE);
                 ps.executeUpdate();
             }
+        }
+    }
+
+    @Test(dependsOnMethods = "aStaleEpochIsFencedByTheDatabaseAndTheBatchIsRetriedWithTheNewOne")
+    public void transactionRollbackAfterWarehouseRejectionAndSuccessfulRetry() throws Exception {
+        long epoch = scalar("SELECT epoch FROM meta.ingestion_ownership WHERE source_id = '" + SOURCE + "' AND table_name = '" + TABLE + "'");
+        Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
+        ReplayIdentity replayId = new ReplayIdentity(DLT, 0, 5555L);
+        WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
+
+        // 1. Rejected event with bad data (overflows bigint)
+        ChangeEvent badEvent = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {"99999999999999999999999999999999999999999999999999", "bad_job", "bad_key"},
+                List.of(), 5001L, System.currentTimeMillis() * 1000L);
+        RoutedEvent badRouted = new RoutedEvent(badEvent, route, replayId);
+
+        try (Connection c = engineSource.getConnection()) {
+            assertThatThrownBy(() -> writer.write(c, List.of(badRouted), List.of(), "g-rb-test", List.of()))
+                    .isInstanceOf(SQLException.class);
+        }
+
+        // Verify replay receipt was rolled back
+        assertThat(scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_topic = '" + DLT + "' AND dlt_offset = 5555")).isZero();
+        assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = 99999999999999999999999999999999999999999999999999")).isZero();
+
+        // 2. Retry with corrected event and SAME replay identity
+        ChangeEvent goodEvent = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {"55555", "fixed_job", "fixed_key"},
+                List.of(), 5002L, System.currentTimeMillis() * 1000L);
+        RoutedEvent goodRouted = new RoutedEvent(goodEvent, route, replayId);
+
+        try (Connection c = engineSource.getConnection()) {
+            writer.write(c, List.of(goodRouted), List.of(), "g-rb-test", List.of());
+        }
+
+        // Verify receipt committed and warehouse mutations applied
+        assertThat(scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_topic = '" + DLT + "' AND dlt_offset = 5555")).isEqualTo(1L);
+        assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = 55555")).isEqualTo(1L);
+    }
+
+    @Test(dependsOnMethods = "transactionRollbackAfterWarehouseRejectionAndSuccessfulRetry")
+    public void concurrentDuplicateReplaysDeduplicateAtDatabaseLevel() throws Exception {
+        long epoch = scalar("SELECT epoch FROM meta.ingestion_ownership WHERE source_id = '" + SOURCE + "' AND table_name = '" + TABLE + "'");
+        Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
+        ReplayIdentity replayId = new ReplayIdentity(DLT, 0, 6666L);
+        WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
+
+        ChangeEvent event = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {"66666", "concurrent_job", "c_key"},
+                List.of(), 6001L, System.currentTimeMillis() * 1000L);
+        RoutedEvent routed = new RoutedEvent(event, route, replayId);
+
+        int threads = 4;
+        ExecutorService exec = Executors.newFixedThreadPool(threads);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            futures.add(exec.submit(() -> {
+                try (Connection c = engineSource.getConnection()) {
+                    writer.write(c, List.of(routed), List.of(), "g-concurrent", List.of());
+                    return null;
+                } catch (SQLException e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+        for (Future<?> f : futures) {
+            f.get(10, TimeUnit.SECONDS);
+        }
+        exec.shutdown();
+
+        assertThat(scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_topic = '" + DLT + "' AND dlt_offset = 6666")).isEqualTo(1L);
+        assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = 66666")).isEqualTo(1L);
+    }
+
+    @Test(dependsOnMethods = "concurrentDuplicateReplaysDeduplicateAtDatabaseLevel")
+    public void sequentialDuplicateReplayAdvancesKafkaOffsetsWithoutDoubleApplying() throws Exception {
+        long eventId = 77777L;
+        ReplayIdentity replayId = new ReplayIdentity(DLT, 0, 7777L);
+
+        try (Running sink = new Running("g-seq-replay", "w-seq", true)) {
+            // First replay
+            ProducerRecord<byte[], byte[]> pr1 = new ProducerRecord<>(TOPIC, 0, null, event(eventId).getBytes(StandardCharsets.UTF_8));
+            ReplayIdentityHeaders.add(pr1.headers(), replayId);
+            producer.send(pr1).get();
+
+            await("first replay row applied", () -> scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + eventId) == 1L);
+            await("first replay receipt recorded", () -> scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_offset = 7777") == 1L);
+            await("stored offset exists", () -> storedOffsets("g-seq-replay") >= 1);
+            long off1 = storedOffsets("g-seq-replay");
+
+            // Duplicate replay with SAME replay identity
+            ProducerRecord<byte[], byte[]> pr2 = new ProducerRecord<>(TOPIC, 0, null, event(eventId).getBytes(StandardCharsets.UTF_8));
+            ReplayIdentityHeaders.add(pr2.headers(), replayId);
+            producer.send(pr2).get();
+
+            await("offset advanced past duplicate", () -> storedOffsets("g-seq-replay") == off1 + 1);
+
+            // Verify row count did not duplicate
+            assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + eventId)).isEqualTo(1L);
+            assertThat(scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_offset = 7777")).isEqualTo(1L);
+        }
+    }
+
+    @Test(dependsOnMethods = "sequentialDuplicateReplayAdvancesKafkaOffsetsWithoutDoubleApplying")
+    public void replayIdentitySurvivesMultipleDltCyclesWithKeyAndPartitionPreserved() throws Exception {
+        try (Running sink = new Running("g-dlt-cycle", "w-cycle", true)) {
+            // 1. Poison event to partition 1 with Kafka key
+            byte[] key = "test-key-cycle".getBytes(StandardCharsets.UTF_8);
+            producer.send(new ProducerRecord<>(TOPIC, 1, key, "{not_valid_json_cycle_1".getBytes(StandardCharsets.UTF_8))).get();
+
+            ConsumerRecord<byte[], byte[]> dlt1 = awaitDltRecord(
+                    r -> r.value() != null && new String(r.value(), StandardCharsets.UTF_8).contains("not_valid_json_cycle_1"), 15_000);
+
+            assertThat(dlt1.key()).isEqualTo(key);
+            assertThat(new String(dlt1.headers().lastHeader("fbi.source.partition").value(), StandardCharsets.UTF_8)).isEqualTo("1");
+            assertThat(ReplayIdentityHeaders.read(dlt1.headers())).isEmpty();
+
+            ReplayIdentity replayId = new ReplayIdentity(DLT, dlt1.partition(), dlt1.offset());
+
+            // 2. Replay with original key, partition 1, and replay identity headers, but still poison
+            ProducerRecord<byte[], byte[]> pr2 = new ProducerRecord<>(TOPIC, 1, key, "{not_valid_json_cycle_2".getBytes(StandardCharsets.UTF_8));
+            ReplayIdentityHeaders.add(pr2.headers(), replayId);
+            producer.send(pr2).get();
+
+            ConsumerRecord<byte[], byte[]> dlt2 = awaitDltRecord(
+                    r -> r.value() != null && new String(r.value(), StandardCharsets.UTF_8).contains("not_valid_json_cycle_2"), 15_000);
+
+            assertThat(dlt2.key()).as("key preserved across cycles").isEqualTo(key);
+            assertThat(new String(dlt2.headers().lastHeader("fbi.source.partition").value(), StandardCharsets.UTF_8))
+                    .as("original partition preserved").isEqualTo("1");
+            assertThat(ReplayIdentityHeaders.read(dlt2.headers()))
+                    .as("replay identity survived second DLT cycle")
+                    .contains(replayId);
+        }
+    }
+
+    @Test(dependsOnMethods = "replayIdentitySurvivesMultipleDltCyclesWithKeyAndPartitionPreserved")
+    public void dltReplayCommandEndToEndWithPreflight() throws Exception {
+        String unregSource = "bank-unregistered-replay";
+        long cmdJobId = 88001L;
+        String json = "{\"after\":{\"job_instance_id\":" + cmdJobId + ",\"job_name\":\"cmd_job\",\"job_key\":\"k\"},"
+                + "\"source\":{\"name\":\"" + unregSource + "\",\"table\":\"" + TABLE + "\",\"lsn\":8001,\"ts_ms\":1767261600000},\"op\":\"c\"}";
+
+        try (Running sink = new Running("g-cmd-replay", "w-cmd", true)) {
+            // Produce event with unregistered source; sink will dead-letter it with UNKNOWN_SOURCE
+            org.apache.kafka.clients.producer.RecordMetadata rm = producer.send(
+                    new ProducerRecord<>(TOPIC, 0, "k-cmd".getBytes(StandardCharsets.UTF_8), json.getBytes(StandardCharsets.UTF_8))).get();
+            long origOffset = rm.offset();
+
+            ConsumerRecord<byte[], byte[]> dltRecord = awaitDltRecord(
+                    r -> r.value() != null && new String(r.value(), StandardCharsets.UTF_8).contains("bank-unregistered-replay"), 15_000);
+
+            assertThat(new String(dltRecord.headers().lastHeader("fbi.dlt.reason").value(), StandardCharsets.UTF_8)).isEqualTo("UNKNOWN_SOURCE");
+            long dltOffset = dltRecord.offset();
+
+            Map<String, String> env = new HashMap<>();
+            env.put("SINK_BOOTSTRAP_SERVERS", kafka.getBootstrapServers());
+            env.put("SINK_DB_URL", postgres.getJdbcUrl());
+            env.put("SINK_DB_USER", "analytics_engine");
+            env.put("SINK_DB_PASSWORD", "engine-only");
+            env.put("SINK_DLT_TOPIC", DLT);
+            SinkConfig cmdConfig = SinkConfig.from(Env.of(env), env);
+
+            // Preflight dry-run should detect preflight failure because source is unregistered
+            DeadLetterReplayCommand.run(cmdConfig, contract, new String[] {
+                    "--reason=UNKNOWN_SOURCE",
+                    "--source=" + unregSource,
+                    "--table=" + TABLE,
+                    "--offset-range=" + TOPIC + "[0]:" + origOffset + ".." + origOffset,
+                    "--dry-run"
+            });
+
+            // Register the source now
+            update("INSERT INTO meta.source_registry (source_id, tenant_id, lifecycle_state) VALUES ('" + unregSource + "', 'tenant-cmd', 'ACTIVE')");
+            update("INSERT INTO meta.ingestion_ownership (source_id, table_name, engine) VALUES ('" + unregSource + "', '" + TABLE + "', 'KAFKA')");
+            sink.ownership.refresh(true);
+
+            // Now run live dlt-replay
+            DeadLetterReplayCommand.run(cmdConfig, contract, new String[] {
+                    "--reason=UNKNOWN_SOURCE",
+                    "--source=" + unregSource,
+                    "--table=" + TABLE,
+                    "--offset-range=" + TOPIC + "[0]:" + origOffset + ".." + origOffset,
+                    "--execute"
+            });
+
+            // Sink consumes the replayed event and writes to warehouse
+            await("replayed row in warehouse", () -> scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + cmdJobId) == 1L);
+            await("replay receipt in ledger", () -> scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_offset = " + dltOffset) == 1L);
         }
     }
 }

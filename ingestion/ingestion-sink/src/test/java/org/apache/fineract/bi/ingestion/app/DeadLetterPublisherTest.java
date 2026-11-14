@@ -87,4 +87,35 @@ public class DeadLetterPublisherTest {
         assertThat(producer.history().get(0).value()).isNull();
         assertThat(header(producer.history().get(0), "fbi.dlt.value_omitted")).isEqualTo("true");
     }
+
+    @Test
+    public void preservesReplayIdentityHeadersWhenReDeadLettering() throws Exception {
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        ConsumerRecord<byte[], byte[]> r = new ConsumerRecord<>("fineract.cdc.m_loan", 2, 9L, null, "{}".getBytes(StandardCharsets.UTF_8));
+        r.headers().add("fbi.replay.dlt.topic", "orig.dlt".getBytes(StandardCharsets.UTF_8));
+        r.headers().add("fbi.replay.dlt.partition", "1".getBytes(StandardCharsets.UTF_8));
+        r.headers().add("fbi.replay.dlt.offset", "42".getBytes(StandardCharsets.UTF_8));
+
+        new DeadLetterPublisher(producer, "dlt", 100).publish(List.of(new DeadLetterPublisher.DeadLetter(r, "WAREHOUSE_REJECTED", "err")));
+
+        ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        assertThat(header(sent, "fbi.replay.dlt.topic")).isEqualTo("orig.dlt");
+        assertThat(header(sent, "fbi.replay.dlt.partition")).isEqualTo("1");
+        assertThat(header(sent, "fbi.replay.dlt.offset")).isEqualTo("42");
+    }
+
+    @Test
+    public void preservesRawMalformedReplayHeadersWithoutFailingPublishing() throws Exception {
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        ConsumerRecord<byte[], byte[]> r = new ConsumerRecord<>("fineract.cdc.m_loan", 2, 9L, null, "{}".getBytes(StandardCharsets.UTF_8));
+        byte[] malformedBytes = new byte[] {(byte) 0xC3, (byte) 0x28};
+        r.headers().add("fbi.replay.dlt.topic", malformedBytes);
+        r.headers().add("fbi.replay.dlt.partition", "invalid".getBytes(StandardCharsets.UTF_8));
+
+        new DeadLetterPublisher(producer, "dlt", 100).publish(List.of(new DeadLetterPublisher.DeadLetter(r, "MALFORMED_REPLAY_IDENTITY", "err")));
+
+        ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        assertThat(sent.headers().lastHeader("fbi.replay.dlt.topic").value()).isEqualTo(malformedBytes);
+        assertThat(header(sent, "fbi.replay.dlt.partition")).isEqualTo("invalid");
+    }
 }
