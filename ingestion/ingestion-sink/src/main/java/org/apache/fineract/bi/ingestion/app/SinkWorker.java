@@ -36,6 +36,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
@@ -50,6 +51,7 @@ import org.apache.fineract.bi.ingestion.sink.BatchWriter;
 import org.apache.fineract.bi.ingestion.sink.FencedWriteException;
 import org.apache.fineract.bi.ingestion.sink.PartitionOffset;
 import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
+import org.apache.fineract.bi.ingestion.sink.ReplayOutcome;
 import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 import org.apache.fineract.bi.ingestion.sink.SkipCheck;
 import org.apache.fineract.bi.ingestion.sink.SqlFailures;
@@ -539,6 +541,7 @@ public final class SinkWorker implements Runnable {
         Map<TopicPartition, Long> next = new HashMap<>();
         Map<TopicPartition, Long> heldFrom = new HashMap<>(alreadyHeld);
         Map<String, long[]> perTable = new HashMap<>();
+        Map<String, Long> alreadyCompletedReplays = new HashMap<>();
 
         // Early completed-replay check before parsing and ownership routing
         Set<ReplayIdentity> candidates = new HashSet<>();
@@ -559,10 +562,12 @@ public final class SinkWorker implements Runnable {
             }
         }
 
-        Set<ReplayIdentity> completedReplays = Set.of();
+        Set<UUID> completedReplayIds = new HashSet<>();
         if (!candidates.isEmpty()) {
             try (Connection conn = connections.get()) {
-                completedReplays = WarehouseWriter.findCompletedReplays(conn, candidates);
+                for (ReplayIdentity completed : WarehouseWriter.findCompletedReplays(conn, candidates)) {
+                    completedReplayIds.add(completed.replayId());
+                }
             }
         }
 
@@ -576,10 +581,11 @@ public final class SinkWorker implements Runnable {
 
             // Early check: if replay identity is already committed in meta.replay_ledger, skip routing
             ReplayIdentity replayId = recordReplays.get(r);
-            if (replayId != null && completedReplays.contains(replayId)) {
+            if (replayId != null && completedReplayIds.contains(replayId.replayId())) {
                 counts[0]++;
                 counts[2]++; // skipped
                 next.merge(tp, r.offset() + 1, Math::max);
+                alreadyCompletedReplays.merge(table, 1L, Long::sum);
                 continue;
             }
 
@@ -646,9 +652,11 @@ public final class SinkWorker implements Runnable {
         List<PartitionOffset> offsets = new ArrayList<>(next.size());
         next.forEach((tp, off) -> offsets.add(new PartitionOffset(tp.topic(), tp.partition(), off)));
         List<WarehouseWriter.Applied> applied = List.of();
+        BatchWriter.WriteResult writeResult = null;
         if (!offsets.isEmpty()) {
             try (Connection conn = connections.get()) {
-                applied = writer.write(conn, writes, offsets, config.groupId(), skips);
+                writeResult = writer.write(conn, writes, offsets, config.groupId(), skips);
+                applied = writeResult.applied();
             }
         }
         long nowMicros = System.currentTimeMillis() * 1_000L;
@@ -679,6 +687,30 @@ public final class SinkWorker implements Runnable {
         }
         for (WarehouseWriter.Applied a : applied) {
             metrics.rowsWritten(a.table(), a.target(), a.rows());
+        }
+        alreadyCompletedReplays.forEach((tbl, cnt) ->
+                metrics.replayOutcome(tbl, SinkMetrics.ReplayOutcomeLabel.ALREADY_COMPLETED, cnt));
+        if (writeResult != null && !writeResult.replayOutcomes().isEmpty()) {
+            Map<ReplayIdentity, String> replayTables = new HashMap<>();
+            for (RoutedEvent w : writes) {
+                if (w.replayIdentity() != null) {
+                    replayTables.put(w.replayIdentity(), w.event().table());
+                }
+            }
+            writeResult.replayOutcomes().forEach((id, outcome) -> {
+                String table = replayTables.get(id);
+                if (table == null) {
+                    LOG.warn("No routed table associated with replay outcome for {}", id.replayId());
+                    return;
+                }
+                switch (outcome) {
+                    case APPLIED -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.APPLIED);
+                    case SKIPPED_STALE -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.SKIPPED_STALE);
+                    case SKIPPED_SUPERSEDED -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.SKIPPED_SUPERSEDED);
+                    case LEGACY_UNKNOWN -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.LEGACY_UNKNOWN);
+                    case CLAIMED -> LOG.warn("Unexpected in-flight CLAIMED outcome for replay {} on table {}", id.replayId(), table);
+                }
+            });
         }
         metrics.batch(System.nanoTime() - started);
         Map<TopicPartition, OffsetAndMetadata> commit = new HashMap<>();

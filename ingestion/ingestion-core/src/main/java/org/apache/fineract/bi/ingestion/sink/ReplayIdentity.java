@@ -18,21 +18,20 @@
  */
 package org.apache.fineract.bi.ingestion.sink;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Objects;
+import java.util.UUID;
 
-/**
- * Identifies the original dead-letter record that initiated a replay.
- *
- * The identity remains stable when a replayed event is published again
- * or dead-lettered again at a different Kafka offset.
- */
-public record ReplayIdentity(String dltTopic, int dltPartition, long dltOffset) {
+public record ReplayIdentity(UUID replayId, String dltTopic, int dltPartition, long dltOffset) {
 
+    public static final String ID_HEADER = "fbi.replay.id";
+    public static final String DLT_ID_HEADER = "fbi.dlt.id";
     public static final String TOPIC_HEADER = "fbi.replay.dlt.topic";
     public static final String PARTITION_HEADER = "fbi.replay.dlt.partition";
     public static final String OFFSET_HEADER = "fbi.replay.dlt.offset";
 
     public ReplayIdentity {
+        Objects.requireNonNull(replayId, "replayId");
         Objects.requireNonNull(dltTopic, "dltTopic");
         if (dltTopic.isBlank()) {
             throw new IllegalArgumentException("DLT topic must not be blank");
@@ -43,5 +42,70 @@ public record ReplayIdentity(String dltTopic, int dltPartition, long dltOffset) 
         if (dltOffset < 0) {
             throw new IllegalArgumentException("DLT offset must not be negative");
         }
+    }
+
+    public ReplayIdentity(String dltTopic, int dltPartition, long dltOffset) {
+        this(legacyLineageId(dltTopic, dltPartition, dltOffset), dltTopic, dltPartition, dltOffset);
+    }
+
+    public ReplayIdentity(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            long dltTimestamp,
+            String originalTopic,
+            int originalPartition,
+            long originalOffset) {
+        this(
+                legacyFallbackId(
+                        dltTopic,
+                        dltPartition,
+                        dltOffset,
+                        dltTimestamp,
+                        originalTopic,
+                        originalPartition,
+                        originalOffset),
+                dltTopic,
+                dltPartition,
+                dltOffset);
+    }
+
+    public static UUID legacyLineageId(String topic, int partition, long offset) {
+        Objects.requireNonNull(topic, "topic");
+        String key = "fbi:replay:" + topic + ":" + partition + ":" + offset;
+        return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static UUID legacyFallbackId(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            long dltTimestamp,
+            String originalTopic,
+            int originalPartition,
+            long originalOffset) {
+        Objects.requireNonNull(dltTopic, "dltTopic");
+        String key = "fbi:dlt:" + dltTopic + ":" + dltPartition + ":" + dltOffset
+                + ":" + dltTimestamp
+                + ":" + (originalTopic == null ? "" : originalTopic)
+                + ":" + originalPartition
+                + ":" + originalOffset;
+        return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (!(o instanceof ReplayIdentity that)) {
+            return false;
+        }
+        return Objects.equals(replayId, that.replayId);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(replayId);
     }
 }

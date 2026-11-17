@@ -23,6 +23,7 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
+import java.util.UUID;
 import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.Headers;
@@ -36,7 +37,8 @@ final class ReplayIdentityHeaders {
         if (headers == null) {
             return false;
         }
-        return headers.lastHeader(ReplayIdentity.TOPIC_HEADER) != null
+        return headers.lastHeader(ReplayIdentity.ID_HEADER) != null
+                || headers.lastHeader(ReplayIdentity.TOPIC_HEADER) != null
                 || headers.lastHeader(ReplayIdentity.PARTITION_HEADER) != null
                 || headers.lastHeader(ReplayIdentity.OFFSET_HEADER) != null;
     }
@@ -45,36 +47,54 @@ final class ReplayIdentityHeaders {
         if (headers == null) {
             return Optional.empty();
         }
+        Header id = single(headers, ReplayIdentity.ID_HEADER);
         Header topic = single(headers, ReplayIdentity.TOPIC_HEADER);
         Header partition = single(headers, ReplayIdentity.PARTITION_HEADER);
         Header offset = single(headers, ReplayIdentity.OFFSET_HEADER);
 
-        int present = (topic == null ? 0 : 1)
+        int coordsPresent = (topic == null ? 0 : 1)
                 + (partition == null ? 0 : 1)
                 + (offset == null ? 0 : 1);
 
-        if (present == 0) {
+        if (id == null && coordsPresent == 0) {
             return Optional.empty();
         }
-        if (present != 3) {
+        if (coordsPresent > 0 && coordsPresent != 3) {
             throw new IllegalArgumentException("Incomplete replay identity headers");
+        }
+        if (id != null && coordsPresent == 0) {
+            throw new IllegalArgumentException("Incomplete replay identity headers: missing DLT coordinates");
         }
 
         try {
             String topicValue = text(topic);
             int partitionValue = Integer.parseInt(text(partition));
             long offsetValue = Long.parseLong(text(offset));
-            return Optional.of(new ReplayIdentity(topicValue, partitionValue, offsetValue));
+
+            if (id != null) {
+                UUID replayId;
+                try {
+                    replayId = UUID.fromString(text(id));
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalArgumentException("Invalid UUID in replay identity header " + ReplayIdentity.ID_HEADER, e);
+                }
+                return Optional.of(new ReplayIdentity(replayId, topicValue, partitionValue, offsetValue));
+            } else {
+                UUID lineageId = ReplayIdentity.legacyLineageId(topicValue, partitionValue, offsetValue);
+                return Optional.of(new ReplayIdentity(lineageId, topicValue, partitionValue, offsetValue));
+            }
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("Invalid numeric replay identity header", e);
         }
     }
 
     static void add(Headers headers, ReplayIdentity identity) {
+        headers.remove(ReplayIdentity.ID_HEADER);
         headers.remove(ReplayIdentity.TOPIC_HEADER);
         headers.remove(ReplayIdentity.PARTITION_HEADER);
         headers.remove(ReplayIdentity.OFFSET_HEADER);
 
+        headers.add(ReplayIdentity.ID_HEADER, bytes(identity.replayId().toString()));
         headers.add(ReplayIdentity.TOPIC_HEADER, bytes(identity.dltTopic()));
         headers.add(ReplayIdentity.PARTITION_HEADER, bytes(Integer.toString(identity.dltPartition())));
         headers.add(ReplayIdentity.OFFSET_HEADER, bytes(Long.toString(identity.dltOffset())));
@@ -84,10 +104,14 @@ final class ReplayIdentityHeaders {
         if (source == null || target == null) {
             return;
         }
+        target.remove(ReplayIdentity.ID_HEADER);
         target.remove(ReplayIdentity.TOPIC_HEADER);
         target.remove(ReplayIdentity.PARTITION_HEADER);
         target.remove(ReplayIdentity.OFFSET_HEADER);
 
+        for (Header h : source.headers(ReplayIdentity.ID_HEADER)) {
+            target.add(h.key(), h.value());
+        }
         for (Header h : source.headers(ReplayIdentity.TOPIC_HEADER)) {
             target.add(h.key(), h.value());
         }

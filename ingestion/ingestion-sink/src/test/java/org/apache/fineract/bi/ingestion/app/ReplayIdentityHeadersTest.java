@@ -24,6 +24,7 @@ import static org.testng.Assert.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
+import java.util.UUID;
 import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.testng.annotations.Test;
@@ -36,18 +37,36 @@ public class ReplayIdentityHeadersTest {
     }
 
     @Test
-    public void addsAndReadsIdentity() {
-        ReplayIdentity identity = new ReplayIdentity("fineract.cdc.dlt", 2, 91);
+    public void addsAndReadsIdentityWithExplicitUuid() {
+        UUID id = UUID.randomUUID();
+        ReplayIdentity identity = new ReplayIdentity(id, "fineract.cdc.dlt", 2, 91);
         RecordHeaders headers = new RecordHeaders();
 
         ReplayIdentityHeaders.add(headers, identity);
 
         assertEquals(ReplayIdentityHeaders.read(headers), Optional.of(identity));
+        assertEquals(ReplayIdentityHeaders.read(headers).get().replayId(), id);
     }
 
     @Test
-    public void copyPreservesIdentity() {
-        ReplayIdentity identity = new ReplayIdentity("fineract.cdc.dlt", 1, 42);
+    public void readsLegacyThreeHeaderFormatWithSynthesizedLineageUuid() {
+        RecordHeaders headers = new RecordHeaders();
+        headers.add(ReplayIdentity.TOPIC_HEADER, bytes("fineract.cdc.dlt"));
+        headers.add(ReplayIdentity.PARTITION_HEADER, bytes("2"));
+        headers.add(ReplayIdentity.OFFSET_HEADER, bytes("91"));
+
+        Optional<ReplayIdentity> read = ReplayIdentityHeaders.read(headers);
+        assertTrue(read.isPresent());
+        assertEquals(read.get().dltTopic(), "fineract.cdc.dlt");
+        assertEquals(read.get().dltPartition(), 2);
+        assertEquals(read.get().dltOffset(), 91L);
+        assertEquals(read.get().replayId(), ReplayIdentity.legacyLineageId("fineract.cdc.dlt", 2, 91L));
+    }
+
+    @Test
+    public void copyPreservesIdentityAndUuid() {
+        UUID id = UUID.randomUUID();
+        ReplayIdentity identity = new ReplayIdentity(id, "fineract.cdc.dlt", 1, 42);
         RecordHeaders source = new RecordHeaders();
         RecordHeaders target = new RecordHeaders();
 
@@ -55,6 +74,7 @@ public class ReplayIdentityHeadersTest {
         ReplayIdentityHeaders.copy(source, target);
 
         assertEquals(ReplayIdentityHeaders.read(target), Optional.of(identity));
+        assertEquals(ReplayIdentityHeaders.read(target).get().replayId(), id);
     }
 
     @Test
@@ -73,6 +93,25 @@ public class ReplayIdentityHeadersTest {
     public void rejectsIncompleteIdentity() {
         RecordHeaders headers = new RecordHeaders();
         headers.add(ReplayIdentity.TOPIC_HEADER, bytes("fineract.cdc.dlt"));
+
+        ReplayIdentityHeaders.read(headers);
+    }
+
+    @Test(expectedExceptions = IllegalArgumentException.class)
+    public void rejectsMissingCoordinatesWhenIdPresent() {
+        RecordHeaders headers = new RecordHeaders();
+        headers.add(ReplayIdentity.ID_HEADER, bytes(UUID.randomUUID().toString()));
+
+        ReplayIdentityHeaders.read(headers);
+    }
+
+    @Test(expectedExceptions = IllegalArgumentException.class)
+    public void rejectsInvalidUuidInIdHeader() {
+        RecordHeaders headers = new RecordHeaders();
+        headers.add(ReplayIdentity.ID_HEADER, bytes("not-a-uuid"));
+        headers.add(ReplayIdentity.TOPIC_HEADER, bytes("fineract.cdc.dlt"));
+        headers.add(ReplayIdentity.PARTITION_HEADER, bytes("0"));
+        headers.add(ReplayIdentity.OFFSET_HEADER, bytes("10"));
 
         ReplayIdentityHeaders.read(headers);
     }
@@ -140,7 +179,6 @@ public class ReplayIdentityHeadersTest {
     @Test(expectedExceptions = IllegalArgumentException.class)
     public void rejectsMalformedUtf8InTopicHeader() {
         RecordHeaders headers = new RecordHeaders();
-        // Invalid UTF-8 byte sequence: 0xC3 followed by 0x28 is illegal UTF-8
         byte[] invalidUtf8 = new byte[] {(byte) 0xC3, (byte) 0x28};
         headers.add(ReplayIdentity.TOPIC_HEADER, invalidUtf8);
         headers.add(ReplayIdentity.PARTITION_HEADER, bytes("0"));
@@ -153,6 +191,7 @@ public class ReplayIdentityHeadersTest {
     public void copyPreservesRawMalformedHeadersByteForByteWithoutThrowing() {
         RecordHeaders source = new RecordHeaders();
         byte[] invalidUtf8 = new byte[] {(byte) 0xC3, (byte) 0x28};
+        source.add(ReplayIdentity.ID_HEADER, bytes("not-a-uuid"));
         source.add(ReplayIdentity.TOPIC_HEADER, invalidUtf8);
         source.add(ReplayIdentity.PARTITION_HEADER, bytes("not-a-num"));
         source.add(ReplayIdentity.OFFSET_HEADER, bytes("-99"));
@@ -160,6 +199,8 @@ public class ReplayIdentityHeadersTest {
         RecordHeaders target = new RecordHeaders();
         ReplayIdentityHeaders.copy(source, target);
 
+        assertNotNull(target.lastHeader(ReplayIdentity.ID_HEADER));
+        assertEquals(target.lastHeader(ReplayIdentity.ID_HEADER).value(), bytes("not-a-uuid"));
         assertNotNull(target.lastHeader(ReplayIdentity.TOPIC_HEADER));
         assertEquals(target.lastHeader(ReplayIdentity.TOPIC_HEADER).value(), invalidUtf8);
         assertEquals(target.lastHeader(ReplayIdentity.PARTITION_HEADER).value(), bytes("not-a-num"));

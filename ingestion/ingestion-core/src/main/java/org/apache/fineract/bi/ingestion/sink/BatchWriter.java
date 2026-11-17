@@ -22,15 +22,35 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 
 public interface BatchWriter {
 
-    List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+    record WriteResult(List<WarehouseWriter.Applied> applied, Map<ReplayIdentity, ReplayOutcome> replayOutcomes) {
+        public WriteResult {
+            applied = applied == null ? List.of() : List.copyOf(applied);
+            replayOutcomes = replayOutcomes == null ? Map.of() : Map.copyOf(replayOutcomes);
+        }
+    }
+
+    /**
+     * Point-in-time warehouse preflight staging and apply simulation result.
+     * <p>
+     * NOTE: The outcomes in {@link #predictedOutcomes()} are point-in-time predictions evaluated
+     * inside a preflight transaction that is unconditionally rolled back. They are NOT committed
+     * warehouse outcomes.
+     */
+    record PreflightResult(List<WarehouseWriter.Applied> applied, Map<ReplayIdentity, ReplayOutcome> predictedOutcomes) {
+        public PreflightResult {
+            applied = applied == null ? List.of() : List.copyOf(applied);
+            predictedOutcomes = predictedOutcomes == null ? Map.of() : Map.copyOf(predictedOutcomes);
+        }
+    }
+
+    WriteResult write(Connection c, Collection<RoutedEvent> events,
             Collection<PartitionOffset> offsets, String consumerGroup, Collection<SkipCheck> skips)
             throws SQLException;
 
-    default List<WarehouseWriter.Applied> preflight(Connection c, Collection<RoutedEvent> events)
-            throws SQLException {
-        return List.of();
-    }
+    PreflightResult preflight(Connection c, Collection<RoutedEvent> events)
+            throws SQLException;
 }

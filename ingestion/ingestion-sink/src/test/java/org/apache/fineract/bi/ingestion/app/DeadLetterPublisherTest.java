@@ -22,8 +22,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -46,6 +48,25 @@ public class DeadLetterPublisherTest {
     }
 
     @Test
+    public void generatesFreshDltIdForEveryPhysicalRecord() throws Exception {
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        DeadLetterPublisher publisher = new DeadLetterPublisher(producer, "dlt", 100);
+
+        publisher.publish(List.of(letter("{}".getBytes(StandardCharsets.UTF_8))));
+        publisher.publish(List.of(letter("{}".getBytes(StandardCharsets.UTF_8))));
+
+        assertThat(producer.history()).hasSize(2);
+        String id1 = header(producer.history().get(0), ReplayIdentity.DLT_ID_HEADER);
+        String id2 = header(producer.history().get(1), ReplayIdentity.DLT_ID_HEADER);
+
+        assertThat(id1).isNotNull();
+        assertThat(id2).isNotNull();
+        assertThat(UUID.fromString(id1)).isNotNull();
+        assertThat(UUID.fromString(id2)).isNotNull();
+        assertThat(id1).isNotEqualTo(id2);
+    }
+
+    @Test
     public void aValueLargerThanTheLimitIsReplacedByAMetadataOnlyRecord() throws Exception {
         MockProducer<byte[], byte[]> producer = new MockProducer<byte[], byte[]>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
         new DeadLetterPublisher(producer, "dlt", 100).publish(List.of(letter(new byte[500])));
@@ -54,6 +75,7 @@ public class DeadLetterPublisherTest {
         assertThat(header(sent, "fbi.dlt.value_omitted")).isEqualTo("true");
         assertThat(header(sent, "fbi.dlt.value_bytes")).isEqualTo("500");
         assertThat(header(sent, "fbi.source.offset")).isEqualTo("9");
+        assertThat(header(sent, ReplayIdentity.DLT_ID_HEADER)).isNotNull();
     }
 
     @Test
@@ -64,6 +86,7 @@ public class DeadLetterPublisherTest {
         assertThat(new String(sent.value(), StandardCharsets.UTF_8)).isEqualTo("{}");
         assertThat(header(sent, "fbi.dlt.reason")).isEqualTo("TYPE_MISMATCH");
         assertThat(header(sent, "fbi.dlt.value_omitted")).isNull();
+        assertThat(header(sent, ReplayIdentity.DLT_ID_HEADER)).isNotNull();
     }
 
     @Test
@@ -92,6 +115,8 @@ public class DeadLetterPublisherTest {
     public void preservesReplayIdentityHeadersWhenReDeadLettering() throws Exception {
         MockProducer<byte[], byte[]> producer = new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
         ConsumerRecord<byte[], byte[]> r = new ConsumerRecord<>("fineract.cdc.m_loan", 2, 9L, null, "{}".getBytes(StandardCharsets.UTF_8));
+        UUID replayId = UUID.randomUUID();
+        r.headers().add("fbi.replay.id", replayId.toString().getBytes(StandardCharsets.UTF_8));
         r.headers().add("fbi.replay.dlt.topic", "orig.dlt".getBytes(StandardCharsets.UTF_8));
         r.headers().add("fbi.replay.dlt.partition", "1".getBytes(StandardCharsets.UTF_8));
         r.headers().add("fbi.replay.dlt.offset", "42".getBytes(StandardCharsets.UTF_8));
@@ -99,6 +124,27 @@ public class DeadLetterPublisherTest {
         new DeadLetterPublisher(producer, "dlt", 100).publish(List.of(new DeadLetterPublisher.DeadLetter(r, "WAREHOUSE_REJECTED", "err")));
 
         ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        assertThat(header(sent, "fbi.replay.id")).isEqualTo(replayId.toString());
+        assertThat(header(sent, "fbi.replay.dlt.topic")).isEqualTo("orig.dlt");
+        assertThat(header(sent, "fbi.replay.dlt.partition")).isEqualTo("1");
+        assertThat(header(sent, "fbi.replay.dlt.offset")).isEqualTo("42");
+        assertThat(header(sent, ReplayIdentity.DLT_ID_HEADER)).isNotNull();
+        assertThat(header(sent, ReplayIdentity.DLT_ID_HEADER)).isNotEqualTo(replayId.toString());
+    }
+
+    @Test
+    public void synthesizesAndPropagatesReplayIdForLegacyThreeHeaderReplay() throws Exception {
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        ConsumerRecord<byte[], byte[]> r = new ConsumerRecord<>("fineract.cdc.m_loan", 2, 9L, null, "{}".getBytes(StandardCharsets.UTF_8));
+        r.headers().add("fbi.replay.dlt.topic", "orig.dlt".getBytes(StandardCharsets.UTF_8));
+        r.headers().add("fbi.replay.dlt.partition", "1".getBytes(StandardCharsets.UTF_8));
+        r.headers().add("fbi.replay.dlt.offset", "42".getBytes(StandardCharsets.UTF_8));
+
+        new DeadLetterPublisher(producer, "dlt", 100).publish(List.of(new DeadLetterPublisher.DeadLetter(r, "WAREHOUSE_REJECTED", "err")));
+
+        ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        UUID expectedId = ReplayIdentity.legacyLineageId("orig.dlt", 1, 42L);
+        assertThat(header(sent, "fbi.replay.id")).isEqualTo(expectedId.toString());
         assertThat(header(sent, "fbi.replay.dlt.topic")).isEqualTo("orig.dlt");
         assertThat(header(sent, "fbi.replay.dlt.partition")).isEqualTo("1");
         assertThat(header(sent, "fbi.replay.dlt.offset")).isEqualTo("42");

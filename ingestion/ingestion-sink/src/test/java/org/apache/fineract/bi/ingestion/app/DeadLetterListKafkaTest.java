@@ -134,7 +134,10 @@ public class DeadLetterListKafkaTest {
         DeadLetterReader.ScanResult scan;
 
         try (DeadLetterReader reader = new DeadLetterReader(config, contract)) {
-            scan = reader.scan(accumulator::add);
+            scan = reader.scan(record -> {
+                accumulator.add(record);
+                return new DeadLetterReader.VisitResult(true, false);
+            });
         }
 
         List<DeadLetterSummary.Group> groups = accumulator.snapshot();

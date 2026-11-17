@@ -19,44 +19,79 @@
 package org.apache.fineract.bi.ingestion.sink;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotEquals;
 
+import java.util.UUID;
 import org.testng.annotations.Test;
 
 public class ReplayIdentityTest {
 
     @Test
-    public void sameDltCoordinatesProduceEqualIdentities() {
-        ReplayIdentity first = new ReplayIdentity("fineract.cdc.dlt", 1, 42);
-        ReplayIdentity second = new ReplayIdentity("fineract.cdc.dlt", 1, 42);
+    public void sameUuidProducesEqualIdentitiesRegardlessOfCoordinates() {
+        UUID id = UUID.randomUUID();
+        ReplayIdentity first = new ReplayIdentity(id, "fineract.cdc.dlt", 1, 42);
+        ReplayIdentity second = new ReplayIdentity(id, "fineract.cdc.dlt", 2, 99);
 
         assertEquals(first, second);
+        assertEquals(first.hashCode(), second.hashCode());
     }
 
     @Test
-    public void differentDltCoordinatesProduceDifferentIdentities() {
-        ReplayIdentity first = new ReplayIdentity("fineract.cdc.dlt", 1, 42);
-        ReplayIdentity second = new ReplayIdentity("fineract.cdc.dlt", 1, 43);
+    public void differentUuidProducesUnequalIdentitiesEvenWithIdenticalCoordinates() {
+        ReplayIdentity first = new ReplayIdentity(UUID.randomUUID(), "fineract.cdc.dlt", 1, 42);
+        ReplayIdentity second = new ReplayIdentity(UUID.randomUUID(), "fineract.cdc.dlt", 1, 42);
 
-        assertEquals(first.equals(second), false);
+        assertNotEquals(first, second);
+        assertNotEquals(first.hashCode(), second.hashCode());
+    }
+
+    @Test
+    public void legacyFallbackProducesDeterministicLineageId() {
+        ReplayIdentity first = new ReplayIdentity("fineract.cdc.dlt", 1, 42);
+        ReplayIdentity second = new ReplayIdentity("fineract.cdc.dlt", 1, 42);
+        ReplayIdentity different = new ReplayIdentity("fineract.cdc.dlt", 1, 43);
+
+        assertEquals(first, second);
+        assertEquals(first.hashCode(), second.hashCode());
+        assertNotEquals(first, different);
+    }
+
+    @Test
+    public void legacyTimestampMetadataFallbackProducesDeterministicId() {
+        ReplayIdentity first = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 1000L, "fineract.cdc.m_loan", 0, 50L);
+        ReplayIdentity second = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 1000L, "fineract.cdc.m_loan", 0, 50L);
+        ReplayIdentity differentTimestamp = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 2000L, "fineract.cdc.m_loan", 0, 50L);
+
+        assertEquals(first, second);
+        assertEquals(first.hashCode(), second.hashCode());
+        assertNotEquals(first, differentTimestamp);
+    }
+
+    @Test(expectedExceptions = NullPointerException.class)
+    public void rejectsNullUuid() {
+        new ReplayIdentity(null, "fineract.cdc.dlt", 0, 0);
     }
 
     @Test(expectedExceptions = IllegalArgumentException.class)
     public void rejectsBlankDltTopic() {
-        new ReplayIdentity(" ", 0, 0);
+        new ReplayIdentity(UUID.randomUUID(), " ", 0, 0);
     }
 
     @Test(expectedExceptions = IllegalArgumentException.class)
     public void rejectsNegativePartition() {
-        new ReplayIdentity("fineract.cdc.dlt", -1, 0);
+        new ReplayIdentity(UUID.randomUUID(), "fineract.cdc.dlt", -1, 0);
     }
 
     @Test(expectedExceptions = IllegalArgumentException.class)
     public void rejectsNegativeOffset() {
-        new ReplayIdentity("fineract.cdc.dlt", 0, -1);
+        new ReplayIdentity(UUID.randomUUID(), "fineract.cdc.dlt", 0, -1);
     }
 
     @Test(expectedExceptions = NullPointerException.class)
     public void rejectsNullTopic() {
-        new ReplayIdentity(null, 0, 0);
+        new ReplayIdentity(UUID.randomUUID(), null, 0, 0);
     }
 }

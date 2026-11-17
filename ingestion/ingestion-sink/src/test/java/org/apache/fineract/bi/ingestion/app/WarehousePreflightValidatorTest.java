@@ -36,6 +36,8 @@ import org.apache.fineract.bi.ingestion.routing.Route;
 import org.apache.fineract.bi.ingestion.sink.BatchWriter;
 import org.apache.fineract.bi.ingestion.sink.PartitionOffset;
 import org.apache.fineract.bi.ingestion.sink.PreflightRollbackException;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
+import org.apache.fineract.bi.ingestion.sink.ReplayOutcome;
 import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 import org.apache.fineract.bi.ingestion.sink.SkipCheck;
 import org.apache.fineract.bi.ingestion.sink.WarehouseWriter;
@@ -93,21 +95,28 @@ public class WarehousePreflightValidatorTest {
     static class MockWriter implements BatchWriter {
         boolean preflightCalled = false;
         SQLException failureToThrow = null;
+        RuntimeException runtimeFailureToThrow = null;
+        Map<ReplayIdentity, ReplayOutcome> predictedOutcomes = Map.of();
 
         @Override
-        public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+        public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                 Collection<PartitionOffset> offsets, String consumerGroup, Collection<SkipCheck> skips) {
-            return List.of();
+            return new BatchWriter.WriteResult(List.of(), java.util.Map.of());
         }
 
         @Override
-        public List<WarehouseWriter.Applied> preflight(Connection c, Collection<RoutedEvent> events)
+        public BatchWriter.PreflightResult preflight(Connection c, Collection<RoutedEvent> events)
                 throws SQLException {
             preflightCalled = true;
+            if (runtimeFailureToThrow != null) {
+                throw runtimeFailureToThrow;
+            }
             if (failureToThrow != null) {
                 throw failureToThrow;
             }
-            return List.of(new WarehouseWriter.Applied("batch_job_instance", "prod", events.size(), 0));
+            return new BatchWriter.PreflightResult(
+                    List.of(new WarehouseWriter.Applied("batch_job_instance", "prod", events.size(), 0)),
+                    predictedOutcomes);
         }
     }
 
@@ -212,6 +221,63 @@ public class WarehousePreflightValidatorTest {
 
         assertThat(result.passed()).isTrue();
         assertThat(result.reason()).isNull();
+        assertThat(writer.preflightCalled).isTrue();
+    }
+
+    @Test
+    public void validateWarehouseBatchExecutesOnceForBatch() throws Exception {
+        MockWriter writer = new MockWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        RecordHeaders h = headers("batch_job_instance");
+        byte[] p1 = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
+        byte[] p2 = bytes("{\"after\":{\"job_instance_id\":2},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
+        DeadLetterRecord r1 = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, p1, contract);
+        DeadLetterRecord r2 = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 2L, h, p2, contract);
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        RoutedEvent e1 = validator.validateRoute(os, r1).routedEvent();
+        RoutedEvent e2 = validator.validateRoute(os, r2).routedEvent();
+
+        WarehousePreflightValidator.BatchValidationResult batchResult =
+                validator.validateWarehouse(mockConnection(), List.of(e1, e2));
+
+        assertThat(batchResult.passed()).isTrue();
+        assertThat(batchResult.reason()).isNull();
+        assertThat(batchResult.routedEvents()).containsExactly(e1, e2);
+        assertThat(writer.preflightCalled).isTrue();
+    }
+
+    @Test
+    public void validateWarehouseBatchEmptyCollectionSucceedsWithoutCallingWriter() throws Exception {
+        MockWriter writer = new MockWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        WarehousePreflightValidator.BatchValidationResult result =
+                validator.validateWarehouse(mockConnection(), List.of());
+
+        assertThat(result.passed()).isTrue();
+        assertThat(result.reason()).isNull();
+        assertThat(result.routedEvents()).isEmpty();
+        assertThat(writer.preflightCalled).isFalse();
+    }
+
+    @Test
+    public void validateWarehouseBatchCapturesWarehouseRejectionDetails() throws Exception {
+        MockWriter writer = new MockWriter();
+        writer.failureToThrow = new SQLException("unique constraint violation", "23505");
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        RecordHeaders h = headers("batch_job_instance");
+        byte[] p1 = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
+        DeadLetterRecord r1 = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, p1, contract);
+        RoutedEvent e1 = validator.validateRoute(ownership("bank-a", "batch_job_instance", Route.Target.PROD), r1).routedEvent();
+
+        WarehousePreflightValidator.BatchValidationResult batchResult =
+                validator.validateWarehouse(mockConnection(), List.of(e1));
+
+        assertThat(batchResult.passed()).isFalse();
+        assertThat(batchResult.reason()).contains("23505").contains("unique constraint violation");
         assertThat(writer.preflightCalled).isTrue();
     }
 
@@ -355,9 +421,18 @@ public class WarehousePreflightValidatorTest {
     public void validateWarehouseRejectsNullRoutedEvent() {
         MockWriter writer = new MockWriter();
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), null))
+        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), (RoutedEvent) null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("RoutedEvent is required for warehouse preflight");
+    }
+
+    @Test
+    public void validateWarehouseRejectsNullRoutedEventsCollection() {
+        MockWriter writer = new MockWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), (Collection<RoutedEvent>) null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("RoutedEvents collection is required for warehouse preflight");
     }
 
     @Test
@@ -376,5 +451,75 @@ public class WarehousePreflightValidatorTest {
         assertThatThrownBy(() -> validator.validateRoute(os, null))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("DeadLetterRecord is required for route validation");
+    }
+
+    @Test
+    public void validateWarehouseReturnsPredictedOutcomesForReplayEvents() throws Exception {
+        MockWriter writer = new MockWriter();
+        ReplayIdentity id1 = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 100L);
+        ReplayIdentity id2 = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 101L);
+        writer.predictedOutcomes = Map.of(
+                id1, ReplayOutcome.APPLIED,
+                id2, ReplayOutcome.SKIPPED_STALE);
+
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+        RoutedEvent e1 = new RoutedEvent(
+                new org.apache.fineract.bi.ingestion.cdc.ChangeEvent("bank-a", "batch_job_instance",
+                        org.apache.fineract.bi.ingestion.cdc.ChangeEvent.Op.UPSERT, new String[] {"1", "j1", null},
+                        List.of(), 100L, 1000L),
+                new Route(Route.Target.PROD, 1, "t-a", 1, null),
+                id1);
+        RoutedEvent e2 = new RoutedEvent(
+                new org.apache.fineract.bi.ingestion.cdc.ChangeEvent("bank-a", "batch_job_instance",
+                        org.apache.fineract.bi.ingestion.cdc.ChangeEvent.Op.UPSERT, new String[] {"2", "j2", null},
+                        List.of(), 100L, 1000L),
+                new Route(Route.Target.PROD, 1, "t-a", 1, null),
+                id2);
+
+        WarehousePreflightValidator.BatchValidationResult result =
+                validator.validateWarehouse(mockConnection(), List.of(e1, e2));
+
+        assertThat(result.passed()).isTrue();
+        assertThat(result.reason()).isNull();
+        assertThat(result.predictedOutcomes()).containsEntry(id1, ReplayOutcome.APPLIED);
+        assertThat(result.predictedOutcomes()).containsEntry(id2, ReplayOutcome.SKIPPED_STALE);
+    }
+
+    @Test
+    public void validateWarehouseReturnsEmptyPredictedOutcomesForOrdinaryEvents() throws Exception {
+        MockWriter writer = new MockWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+        RoutedEvent e1 = new RoutedEvent(
+                new org.apache.fineract.bi.ingestion.cdc.ChangeEvent("bank-a", "batch_job_instance",
+                        org.apache.fineract.bi.ingestion.cdc.ChangeEvent.Op.UPSERT, new String[] {"1", "j1", null},
+                        List.of(), 100L, 1000L),
+                new Route(Route.Target.PROD, 1, "t-a", 1, null),
+                null);
+
+        WarehousePreflightValidator.BatchValidationResult result =
+                validator.validateWarehouse(mockConnection(), List.of(e1));
+
+        assertThat(result.passed()).isTrue();
+        assertThat(result.predictedOutcomes()).isEmpty();
+    }
+
+    @Test
+    public void validateWarehouseFailsClosedWhenWriterThrowsRuntimeException() throws Exception {
+        MockWriter writer = new MockWriter();
+        writer.runtimeFailureToThrow = new IllegalStateException("Replay identity did not receive a terminal predicted outcome");
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+        RoutedEvent e1 = new RoutedEvent(
+                new org.apache.fineract.bi.ingestion.cdc.ChangeEvent("bank-a", "batch_job_instance",
+                        org.apache.fineract.bi.ingestion.cdc.ChangeEvent.Op.UPSERT, new String[] {"1", "j1", null},
+                        List.of(), 100L, 1000L),
+                new Route(Route.Target.PROD, 1, "t-a", 1, null),
+                null);
+
+        WarehousePreflightValidator.BatchValidationResult result =
+                validator.validateWarehouse(mockConnection(), List.of(e1));
+
+        assertThat(result.passed()).isFalse();
+        assertThat(result.reason()).contains("Replay identity did not receive a terminal predicted outcome");
+        assertThat(result.predictedOutcomes()).isEmpty();
     }
 }

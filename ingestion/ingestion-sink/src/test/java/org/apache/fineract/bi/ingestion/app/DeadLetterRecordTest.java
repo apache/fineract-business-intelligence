@@ -283,4 +283,99 @@ public class DeadLetterRecordTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Incomplete replay identity headers");
     }
+
+    @Test
+    public void prefersReplayIdOverDltId() {
+        java.util.UUID replayUuid = java.util.UUID.randomUUID();
+        java.util.UUID dltUuid = java.util.UUID.randomUUID();
+
+        RecordHeaders headers = validHeaders();
+        headers.add("fbi.replay.id", bytes(replayUuid.toString()));
+        headers.add("fbi.replay.dlt.topic", bytes("orig.dlt"));
+        headers.add("fbi.replay.dlt.partition", bytes("3"));
+        headers.add("fbi.replay.dlt.offset", bytes("77"));
+        headers.add("fbi.dlt.id", bytes(dltUuid.toString()));
+
+        DeadLetterRecord record = parse(headers, bytes("{}"));
+
+        assertThat(record.hasReplayHeaders()).isTrue();
+        assertThat(record.hasInvalidReplayIdentity()).isFalse();
+        assertThat(record.replayIdentity().replayId()).isEqualTo(replayUuid);
+        assertThat(record.replayIdentity().dltTopic()).isEqualTo("orig.dlt");
+        assertThat(record.replayIdentity().dltPartition()).isEqualTo(3);
+        assertThat(record.replayIdentity().dltOffset()).isEqualTo(77L);
+    }
+
+    @Test
+    public void usesDltIdWhenReplayIdAbsent() {
+        java.util.UUID dltUuid = java.util.UUID.randomUUID();
+
+        RecordHeaders headers = validHeaders();
+        headers.add("fbi.dlt.id", bytes(dltUuid.toString()));
+
+        DeadLetterRecord record = parse(headers, bytes("{}"));
+
+        assertThat(record.hasReplayHeaders()).isTrue();
+        assertThat(record.hasInvalidReplayIdentity()).isFalse();
+        assertThat(record.replayIdentity().replayId()).isEqualTo(dltUuid);
+        assertThat(record.replayIdentity().dltTopic()).isEqualTo("fineract.cdc.dlt");
+        assertThat(record.replayIdentity().dltPartition()).isEqualTo(1);
+        assertThat(record.replayIdentity().dltOffset()).isEqualTo(25L);
+    }
+
+    @Test
+    public void legacyFallbackIncludesTimestampAndSourceMetadata() {
+        long timestamp = 1700000000123L;
+        DeadLetterRecord record = DeadLetterRecord.parse(
+                "fineract.cdc.dlt", 1, 25L, timestamp, validHeaders(), null, bytes("{}"), CONTRACT);
+
+        assertThat(record.dltTimestamp()).isEqualTo(timestamp);
+        assertThat(record.hasReplayHeaders()).isFalse();
+        assertThat(record.hasInvalidReplayIdentity()).isFalse();
+
+        org.apache.fineract.bi.ingestion.sink.ReplayIdentity expected =
+                new org.apache.fineract.bi.ingestion.sink.ReplayIdentity(
+                        "fineract.cdc.dlt", 1, 25L, timestamp, "fineract.cdc.batch_job_instance", 2, 91L);
+
+        assertThat(record.replayIdentity()).isEqualTo(expected);
+        assertThat(record.replayIdentity().replayId()).isEqualTo(expected.replayId());
+    }
+
+    @Test
+    public void rejectsMalformedDltIdHeader() {
+        RecordHeaders headers = validHeaders();
+        headers.add("fbi.dlt.id", bytes("not-a-valid-uuid"));
+
+        DeadLetterRecord record = parse(headers, bytes("{}"));
+
+        assertThat(record.hasInvalidReplayIdentity()).isTrue();
+        assertThat(record.isReplayEligible()).isFalse();
+        assertThat(record.replayIdentityError()).contains("Invalid UUID in fbi.dlt.id");
+
+        assertThatThrownBy(record::replayIdentity)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Invalid UUID in fbi.dlt.id");
+    }
+
+    @Test
+    public void passesTimestampFromConsumerRecord() {
+        org.apache.kafka.clients.consumer.ConsumerRecord<byte[], byte[]> consumerRecord =
+                new org.apache.kafka.clients.consumer.ConsumerRecord<>(
+                        "fineract.cdc.dlt",
+                        1,
+                        25L,
+                        1700000000456L,
+                        org.apache.kafka.common.record.TimestampType.CREATE_TIME,
+                        0,
+                        0,
+                        bytes("key"),
+                        bytes("{}"),
+                        validHeaders(),
+                        java.util.Optional.empty());
+
+        DeadLetterRecord record = DeadLetterRecord.parse(consumerRecord, CONTRACT);
+
+        assertThat(record.dltTimestamp()).isEqualTo(1700000000456L);
+        assertThat(record.key()).isEqualTo(bytes("key"));
+    }
 }

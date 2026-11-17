@@ -33,9 +33,11 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import org.apache.fineract.bi.ingestion.sink.ReplayOutcome;
 
 public final class SinkMetrics implements AutoCloseable {
 
@@ -84,6 +86,58 @@ public final class SinkMetrics implements AutoCloseable {
 
     public void rowsWritten(String table, String target, long rows) {
         registry.counter("fbi_sink_rows_written_total", "table", table, "target", target).increment(rows);
+    }
+
+    public enum ReplayOutcomeLabel {
+        APPLIED("applied"),
+        SKIPPED_STALE("skipped_stale"),
+        SKIPPED_SUPERSEDED("skipped_superseded"),
+        ALREADY_COMPLETED("already_completed"),
+        LEGACY_UNKNOWN("legacy_unknown");
+
+        private final String tag;
+
+        ReplayOutcomeLabel(String tag) {
+            this.tag = tag;
+        }
+
+        public String tag() {
+            return tag;
+        }
+
+        public static Optional<ReplayOutcomeLabel> from(ReplayOutcome outcome) {
+            if (outcome == null) {
+                return Optional.empty();
+            }
+            return switch (outcome) {
+                case APPLIED -> Optional.of(APPLIED);
+                case SKIPPED_STALE -> Optional.of(SKIPPED_STALE);
+                case SKIPPED_SUPERSEDED -> Optional.of(SKIPPED_SUPERSEDED);
+                case LEGACY_UNKNOWN -> Optional.of(LEGACY_UNKNOWN);
+                case CLAIMED -> Optional.empty();
+            };
+        }
+    }
+
+    public void replayOutcome(String table, ReplayOutcomeLabel outcome, long count) {
+        if (count > 0 && table != null && outcome != null) {
+            registry.counter("fbi_sink_replay_outcomes_total", "table", table, "outcome", outcome.tag()).increment(count);
+        }
+    }
+
+    public void replayOutcome(String table, ReplayOutcomeLabel outcome) {
+        replayOutcome(table, outcome, 1);
+    }
+
+    public double replayOutcomeCount(String table, ReplayOutcomeLabel outcome) {
+        if (table == null || outcome == null) {
+            return 0.0;
+        }
+        Counter counter = registry.find("fbi_sink_replay_outcomes_total")
+                .tag("table", table)
+                .tag("outcome", outcome.tag())
+                .counter();
+        return counter != null ? counter.count() : 0.0;
     }
 
     public void batch(long nanos) {

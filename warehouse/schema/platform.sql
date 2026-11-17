@@ -69,6 +69,8 @@ VALUES
      'Upper bound for the settle window a shadow reconciliation may exclude from the comparison.'),
     ('reconciliation_retention_days', '180', FALSE,
      'reconciliation_run rows older than this are purged by meta.purge_reconciliation_runs().'),
+    ('replay_ledger_retention_days', '90', FALSE,
+     'meta.replay_ledger rows older than this are purged by meta.purge_replay_ledger().'),
     ('change_log_lock_timeout_ms', '2000', FALSE,
      'How long partition maintenance waits for the change-log lock before giving up until the next run.'),
     ('dbt_run_lease_minutes', '360', FALSE,
@@ -647,13 +649,188 @@ CREATE TABLE IF NOT EXISTS meta.consumer_offsets (
     PRIMARY KEY (consumer_group, topic, kafka_partition)
 );
 
+-- Note for existing installations:
+-- Reapply platform.sql as an administrator to provision meta.replay_ledger, its indices, and meta.purge_replay_ledger().
+-- To grant ingestion engine permissions on existing installations, run:
+--   GRANT SELECT, INSERT ON meta.replay_ledger TO <warehouse_engine_user>;
+--   GRANT UPDATE (outcome) ON meta.replay_ledger TO <warehouse_engine_user>;
+-- (e.g. analytics_engine as configured in docker/postgres-warehouse/initdb/002_create_warehouse_roles.sh).
+--
+-- Retention Note:
+-- The default retention of 90 days in meta.platform_settings (replay_ledger_retention_days) assumes
+-- the default 14-day Kafka DLT retention (TOPIC_DLT_RETENTION_MS). Operators who increase Kafka DLT retention
+-- must increase replay_ledger_retention_days correspondingly so that the ledger outlives Kafka DLT messages.
+-- If cold-archived DLT records are restored to Kafka after their ledger entry has expired and been purged,
+-- the LSN/generation guard only protects newer warehouse rows that still exist in the warehouse raw table.
+-- Rows deleted and purged from change logs or never inserted would be reapplied if re-injected after ledger expiry.
+DO $$
+DECLARE
+    v_has_replay_id BOOLEAN;
+    v_any_nullable BOOLEAN;
+    v_needs_backfill BOOLEAN;
+    v_pk_is_sole_replay_id BOOLEAN;
+    v_existing_pk_name TEXT;
+    v_has_outcome BOOLEAN;
+BEGIN
+    IF to_regclass('meta.replay_ledger') IS NOT NULL THEN
+        -- 1. Ensure missing columns exist
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'replay_id'
+        ) INTO v_has_replay_id;
+
+        IF NOT v_has_replay_id THEN
+            ALTER TABLE meta.replay_ledger ADD COLUMN replay_id UUID;
+        END IF;
+
+        ALTER TABLE meta.replay_ledger ADD COLUMN IF NOT EXISTS source_id TEXT;
+        ALTER TABLE meta.replay_ledger ADD COLUMN IF NOT EXISTS table_name TEXT;
+
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'outcome'
+        ) INTO v_has_outcome;
+
+        IF NOT v_has_outcome THEN
+            ALTER TABLE meta.replay_ledger ADD COLUMN outcome TEXT;
+            UPDATE meta.replay_ledger SET outcome = 'LEGACY_UNKNOWN' WHERE outcome IS NULL;
+            ALTER TABLE meta.replay_ledger ALTER COLUMN outcome SET NOT NULL;
+            ALTER TABLE meta.replay_ledger ADD CONSTRAINT chk_replay_outcome
+                CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED', 'LEGACY_UNKNOWN'));
+        ELSE
+            UPDATE meta.replay_ledger SET outcome = 'LEGACY_UNKNOWN' WHERE outcome IS NULL;
+            ALTER TABLE meta.replay_ledger ALTER COLUMN outcome SET NOT NULL;
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND constraint_name = 'chk_replay_outcome'
+            ) THEN
+                ALTER TABLE meta.replay_ledger ADD CONSTRAINT chk_replay_outcome
+                    CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED', 'LEGACY_UNKNOWN'));
+            END IF;
+        END IF;
+
+        -- 2. Inspect column nullability via metadata before checking table rows
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'meta'
+              AND table_name = 'replay_ledger'
+              AND column_name IN ('replay_id', 'source_id', 'table_name', 'outcome')
+              AND is_nullable = 'YES'
+        ) INTO v_any_nullable;
+
+        -- When all four columns are already NOT NULL, skip the NULL-detection query and backfill entirely
+        IF v_any_nullable THEN
+            SELECT EXISTS (
+                SELECT 1 FROM meta.replay_ledger
+                WHERE replay_id IS NULL OR source_id IS NULL OR table_name IS NULL OR outcome IS NULL
+            ) INTO v_needs_backfill;
+
+            IF v_needs_backfill THEN
+                UPDATE meta.replay_ledger
+                SET replay_id = COALESCE(replay_id, (
+                        SELECT (
+                            substring(h from 1 for 8) || '-' ||
+                            substring(h from 9 for 4) || '-' ||
+                            '3' || substring(h from 14 for 3) || '-' ||
+                            substr('89ab89ab89ab89ab', strpos('0123456789abcdef', substring(h from 17 for 1)), 1) || substring(h from 18 for 3) || '-' ||
+                            substring(h from 21 for 12)
+                        )::uuid
+                        FROM (
+                            SELECT md5('fbi:replay:' || meta.replay_ledger.dlt_topic || ':' || meta.replay_ledger.dlt_partition || ':' || meta.replay_ledger.dlt_offset) AS h
+                        ) sub
+                    )),
+                    source_id = COALESCE(source_id, '<legacy>'),
+                    table_name = COALESCE(table_name, '<legacy>'),
+                    outcome = COALESCE(outcome, 'LEGACY_UNKNOWN')
+                WHERE replay_id IS NULL OR source_id IS NULL OR table_name IS NULL OR outcome IS NULL;
+            END IF;
+
+            -- 3. Enforce NOT NULL constraints on any columns still nullable
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'replay_id' AND is_nullable = 'YES'
+            ) THEN
+                ALTER TABLE meta.replay_ledger ALTER COLUMN replay_id SET NOT NULL;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'source_id' AND is_nullable = 'YES'
+            ) THEN
+                ALTER TABLE meta.replay_ledger ALTER COLUMN source_id SET NOT NULL;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'table_name' AND is_nullable = 'YES'
+            ) THEN
+                ALTER TABLE meta.replay_ledger ALTER COLUMN table_name SET NOT NULL;
+            END IF;
+
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'outcome' AND is_nullable = 'YES'
+            ) THEN
+                ALTER TABLE meta.replay_ledger ALTER COLUMN outcome SET NOT NULL;
+            END IF;
+        END IF;
+
+        -- 4. Check if the current primary key is solely on replay_id
+        SELECT
+            COALESCE(count(*) = 1 AND bool_and(kcu.column_name = 'replay_id'), FALSE)
+        INTO v_pk_is_sole_replay_id
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+         AND tc.table_name = kcu.table_name
+        WHERE tc.table_schema = 'meta'
+          AND tc.table_name = 'replay_ledger'
+          AND tc.constraint_type = 'PRIMARY KEY';
+
+        IF NOT v_pk_is_sole_replay_id THEN
+            -- Find the existing primary key constraint name, if one exists
+            SELECT tc.constraint_name
+            INTO v_existing_pk_name
+            FROM information_schema.table_constraints tc
+            WHERE tc.table_schema = 'meta'
+              AND tc.table_name = 'replay_ledger'
+              AND tc.constraint_type = 'PRIMARY KEY';
+
+            IF v_existing_pk_name IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE meta.replay_ledger DROP CONSTRAINT %I', v_existing_pk_name);
+            END IF;
+
+            ALTER TABLE meta.replay_ledger ADD PRIMARY KEY (replay_id);
+        END IF;
+    END IF;
+END
+$$;
+
 CREATE TABLE IF NOT EXISTS meta.replay_ledger (
+    replay_id UUID PRIMARY KEY,
     dlt_topic TEXT NOT NULL,
     dlt_partition INTEGER NOT NULL,
     dlt_offset BIGINT NOT NULL,
+    source_id TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    outcome TEXT NOT NULL,
     replayed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (dlt_topic, dlt_partition, dlt_offset)
+    CONSTRAINT chk_replay_outcome CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED', 'LEGACY_UNKNOWN'))
 );
+
+CREATE INDEX IF NOT EXISTS replay_ledger_source_id_idx ON meta.replay_ledger (source_id);
+CREATE INDEX IF NOT EXISTS replay_ledger_dlt_coords_idx ON meta.replay_ledger (dlt_topic, dlt_partition, dlt_offset);
+CREATE INDEX IF NOT EXISTS replay_ledger_replayed_at_idx ON meta.replay_ledger (replayed_at);
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'analytics_engine') THEN
+        GRANT SELECT, INSERT ON meta.replay_ledger TO analytics_engine;
+        GRANT UPDATE (outcome) ON meta.replay_ledger TO analytics_engine;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS meta.extract_watermarks (
     source_id TEXT NOT NULL,
@@ -993,6 +1170,22 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION meta.purge_replay_ledger(p_days INTEGER DEFAULT NULL)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = meta, pg_temp
+AS $$
+DECLARE
+    v_days INTEGER := GREATEST(COALESCE(p_days, 0), meta.setting('replay_ledger_retention_days', '90')::INTEGER);
+    v_n BIGINT;
+BEGIN
+    DELETE FROM meta.replay_ledger WHERE replayed_at < NOW() - make_interval(days => v_days);
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS meta.connector_state (
     source_id TEXT PRIMARY KEY,
     connector_name TEXT NOT NULL,
@@ -1053,6 +1246,7 @@ BEGIN
             || ', _owner_epoch BIGINT NOT NULL'
             || ', _target TEXT NOT NULL'
             || ', _stage_seq BIGINT GENERATED ALWAYS AS IDENTITY'
+            || ', _replay_id UUID'
             || ') ON COMMIT DELETE ROWS';
         EXECUTE ddl;
     END IF;
@@ -1097,11 +1291,15 @@ DECLARE
     v_deleted2 BIGINT;
     v_merge_cols TEXT;
     v_unavail_expr TEXT;
+    v_contrib_replay_expr TEXT;
     v_hist TEXT;
     v_changed TEXT;
     v_old TEXT := '';
     v_old_sql TEXT;
     v_use_log BOOLEAN;
+    v_has_replays BOOLEAN;
+    v_replay_upd TEXT := '';
+    v_replay_upd_unavail TEXT := '';
 BEGIN
     IF p_engine NOT IN ('PYTHON', 'KAFKA') THEN
         RAISE EXCEPTION 'Unknown engine %', p_engine USING ERRCODE = '22023';
@@ -1173,8 +1371,13 @@ BEGIN
                string_agg(
                    format('CASE WHEN NOT bool_or(%1$L <> ALL(COALESCE(_unavailable, ARRAY[]::TEXT[]))) THEN %1$L END',
                           col ->> 'name'),
+                   ', ' ORDER BY ord) FILTER (WHERE col ->> 'name' <> c.primary_key),
+               string_agg(
+                   format('(array_agg(_replay_id ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC) '
+                          || 'FILTER (WHERE _replay_id IS NOT NULL AND %1$L <> ALL(COALESCE(_unavailable, ARRAY[]::TEXT[]))))[1]',
+                          col ->> 'name'),
                    ', ' ORDER BY ord) FILTER (WHERE col ->> 'name' <> c.primary_key)
-          INTO v_merge_cols, v_unavail_expr
+          INTO v_merge_cols, v_unavail_expr, v_contrib_replay_expr
           FROM jsonb_array_elements(c.columns) WITH ORDINALITY AS x(col, ord);
 
         v_dedup := format(
@@ -1183,13 +1386,18 @@ BEGIN
             || '(array_agg(_source_lsn ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC))[1] AS _source_lsn, '
             || '(array_agg(_source_ts ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC))[1] AS _source_ts, '
             || '(array_agg(_op ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC))[1] AS _op, '
-            || 'array_remove(ARRAY[%3$s]::TEXT[], NULL) AS _unavailable '
+            || '(array_agg(_stage_seq ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC))[1] AS _stage_seq, '
+            || '(array_agg(_replay_id ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC))[1] AS _replay_id, '
+            || 'array_remove(ARRAY[%3$s]::TEXT[], NULL) AS _unavailable, '
+            || 'array_remove(ARRAY[(array_agg(_replay_id ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC))[1], %5$s]::UUID[], NULL) AS _contributing_replay_ids '
             || 'FROM pg_temp.%4$I WHERE _target = $2 GROUP BY source_id, tenant_id, %1$s',
-            v_pk, v_merge_cols, v_unavail_expr, v_stage
+            v_pk, v_merge_cols, v_unavail_expr, v_stage, COALESCE(NULLIF(v_contrib_replay_expr, ''), 'NULL::UUID')
         );
     ELSE
         v_dedup := format(
-            'SELECT DISTINCT ON (source_id, tenant_id, %1$s) * FROM pg_temp.%2$I WHERE _target = $2 '
+            'SELECT DISTINCT ON (source_id, tenant_id, %1$s) *, '
+            || 'array_remove(ARRAY[_replay_id]::UUID[], NULL) AS _contributing_replay_ids '
+            || 'FROM pg_temp.%2$I WHERE _target = $2 '
             || 'ORDER BY source_id, tenant_id, %1$s, _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC',
             v_pk, v_stage
         );
@@ -1238,13 +1446,84 @@ BEGIN
         v_log := NULL;
     END IF;
 
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_temp.%I WHERE _replay_id IS NOT NULL)', v_stage)
+        INTO v_has_replays;
+
     FOREACH v_target IN ARRAY ARRAY['prod', 'shadow'] LOOP
         v_schema := CASE v_target WHEN 'prod' THEN 'raw' ELSE 'raw_shadow' END;
         v_use_log := v_log IS NOT NULL AND v_target = 'prod';
         v_old_sql := CASE WHEN v_use_log AND v_old <> '' THEN format(v_old, v_schema, c.raw_table) ELSE '' END;
 
+        IF p_engine = 'KAFKA' AND v_has_replays THEN
+            v_replay_upd := format($upd$
+                , upd_applied AS (
+                    UPDATE meta.replay_ledger r
+                    SET outcome = 'APPLIED'
+                    FROM (
+                        SELECT DISTINCT unnest(d._contributing_replay_ids) AS replay_id
+                        FROM eligible d
+                        JOIN applied a ON a.source_id = d.source_id AND a.tenant_id = d.tenant_id AND a.%1$s = d.%1$s
+                    ) a_rep
+                    WHERE r.replay_id = a_rep.replay_id
+                      AND r.outcome = 'CLAIMED'
+                ),
+                upd_stale AS (
+                    UPDATE meta.replay_ledger r
+                    SET outcome = 'SKIPPED_STALE'
+                    FROM (
+                        SELECT DISTINCT unnest(d._contributing_replay_ids) AS replay_id
+                        FROM eligible d
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM applied a
+                            WHERE a.source_id = d.source_id AND a.tenant_id = d.tenant_id AND a.%1$s = d.%1$s
+                        )
+                    ) s_rep
+                    WHERE r.replay_id = s_rep.replay_id
+                      AND r.outcome = 'CLAIMED'
+                )
+            $upd$, v_pk);
+
+            v_replay_upd_unavail := format($upd$
+                , upd_applied_unavail AS (
+                    UPDATE meta.replay_ledger r
+                    SET outcome = 'APPLIED'
+                    FROM (
+                        SELECT DISTINCT unnest(d._contributing_replay_ids) AS replay_id
+                        FROM dedup d
+                        JOIN applied a ON a.source_id = d.source_id AND a.tenant_id = d.tenant_id AND a.%1$s = d.%1$s
+                        WHERE cardinality(d._unavailable) > 0
+                    ) a_rep
+                    WHERE r.replay_id = a_rep.replay_id
+                      AND r.outcome = 'CLAIMED'
+                ),
+                upd_stale_unavail AS (
+                    UPDATE meta.replay_ledger r
+                    SET outcome = 'SKIPPED_STALE'
+                    FROM (
+                        SELECT DISTINCT unnest(d._contributing_replay_ids) AS replay_id
+                        FROM dedup d
+                        JOIN %2$I.%3$I t ON t.source_id = d.source_id AND t.tenant_id = d.tenant_id AND t.%1$s = d.%1$s
+                        WHERE cardinality(d._unavailable) > 0
+                          AND NOT EXISTS (
+                              SELECT 1 FROM applied a
+                              WHERE a.source_id = d.source_id AND a.tenant_id = d.tenant_id AND a.%1$s = d.%1$s
+                          )
+                    ) s_rep
+                    WHERE r.replay_id = s_rep.replay_id
+                      AND r.outcome = 'CLAIMED'
+                )
+            $upd$, v_pk, v_schema, c.raw_table);
+        ELSE
+            v_replay_upd := '';
+            v_replay_upd_unavail := '';
+        END IF;
+
         EXECUTE format($q$
             WITH dedup AS (%1$s)%10$s,
+            eligible AS (
+                SELECT * FROM dedup
+                WHERE COALESCE(cardinality(_unavailable), 0) = 0
+            ),
             applied AS (
                 INSERT INTO %2$I.%3$I AS t (
                     source_id, tenant_id, %4$s,
@@ -1252,8 +1531,7 @@ BEGIN
                 )
                 SELECT d.source_id, d.tenant_id, %5$s,
                        d._source_generation, d._source_lsn, d._source_ts, NOW(), $1, d._op = 'd'
-                FROM dedup d
-                WHERE COALESCE(cardinality(d._unavailable), 0) = 0
+                FROM eligible d
                 ON CONFLICT (source_id, tenant_id, %6$s) DO UPDATE
                 SET %7$s,
                     _source_generation = EXCLUDED._source_generation,
@@ -1264,13 +1542,14 @@ BEGIN
                     _is_deleted = EXCLUDED._is_deleted
                 WHERE %8$s
                 RETURNING t.*
-            )%9$s
+            )%11$s%9$s
             SELECT COUNT(*), COUNT(*) FILTER (WHERE _is_deleted) FROM applied
         $q$,
             v_dedup, v_schema, c.raw_table, v_cols, v_sel_cols, v_pk, v_set,
             format(v_guard, 'EXCLUDED'),
             CASE WHEN v_use_log THEN ', logged AS (' || v_log || ')' ELSE '' END,
-            v_old_sql
+            v_old_sql,
+            v_replay_upd
         ) INTO v_applied, v_deleted USING p_engine, v_target;
 
         IF v_has_unavailable THEN
@@ -1303,16 +1582,54 @@ BEGIN
                       AND %8$s
                     RETURNING t.*
                 ),
-                applied AS (SELECT * FROM ins UNION ALL SELECT * FROM upd)%9$s
+                applied AS (SELECT * FROM ins UNION ALL SELECT * FROM upd)%11$s%9$s
                 SELECT COUNT(*), COUNT(*) FILTER (WHERE _is_deleted) FROM applied
             $q$,
                 v_dedup, v_schema, c.raw_table, v_cols, v_sel_cols, v_pk, v_set_unavailable,
                 format(v_guard, 'd'),
                 CASE WHEN v_use_log THEN ', logged AS (' || v_log || ')' ELSE '' END,
-                v_old_sql
+                v_old_sql,
+                v_replay_upd_unavail
             ) INTO v_rc, v_deleted2 USING p_engine, v_target;
             v_applied := v_applied + v_rc;
             v_deleted := v_deleted + v_deleted2;
+        END IF;
+
+        IF p_engine = 'KAFKA' AND v_has_replays THEN
+            IF NOT v_has_unavailable THEN
+                EXECUTE format($q$
+                    WITH dedup AS (%1$s)
+                    UPDATE meta.replay_ledger r
+                    SET outcome = 'SKIPPED_SUPERSEDED'
+                    FROM (
+                        SELECT DISTINCT s._replay_id
+                        FROM pg_temp.%2$I s
+                        JOIN dedup d ON d.source_id = s.source_id AND d.tenant_id = s.tenant_id AND d.%3$s = s.%3$s
+                        WHERE s._target = $2
+                          AND s._replay_id IS NOT NULL
+                          AND s._stage_seq <> d._stage_seq
+                          AND (d._replay_id IS NULL OR s._replay_id <> d._replay_id)
+                    ) sup
+                    WHERE r.replay_id = sup._replay_id
+                      AND r.outcome = 'CLAIMED'
+                $q$, v_dedup, v_stage, v_pk) USING p_engine, v_target;
+            ELSE
+                EXECUTE format($q$
+                    WITH dedup AS (%1$s)
+                    UPDATE meta.replay_ledger r
+                    SET outcome = 'SKIPPED_SUPERSEDED'
+                    FROM (
+                        SELECT DISTINCT s._replay_id
+                        FROM pg_temp.%2$I s
+                        JOIN dedup d ON d.source_id = s.source_id AND d.tenant_id = s.tenant_id AND d.%3$s = s.%3$s
+                        WHERE s._target = $2
+                          AND s._replay_id IS NOT NULL
+                          AND NOT (s._replay_id = ANY(COALESCE(d._contributing_replay_ids, ARRAY[]::UUID[])))
+                    ) sup
+                    WHERE r.replay_id = sup._replay_id
+                      AND r.outcome = 'CLAIMED'
+                $q$, v_dedup, v_stage, v_pk) USING p_engine, v_target;
+            END IF;
         END IF;
 
         IF v_applied > 0 THEN
@@ -1547,6 +1864,7 @@ REVOKE ALL ON FUNCTION
     meta.purge_ownership_audit(INTEGER),
     meta.record_source_reconciliation(TEXT, TEXT, TEXT, BIGINT, BIGINT, BIGINT, BIGINT, JSONB),
     meta.purge_reconciliation_runs(INTEGER),
+    meta.purge_replay_ledger(INTEGER),
     meta.run_shadow_reconciliation(TEXT, TEXT, INTEGER)
 FROM PUBLIC;
 
@@ -1560,5 +1878,6 @@ GRANT EXECUTE ON FUNCTION
     meta.purge_ownership_audit(INTEGER),
     meta.record_source_reconciliation(TEXT, TEXT, TEXT, BIGINT, BIGINT, BIGINT, BIGINT, JSONB),
     meta.purge_reconciliation_runs(INTEGER),
+    meta.purge_replay_ledger(INTEGER),
     meta.run_shadow_reconciliation(TEXT, TEXT, INTEGER)
 TO fbi_control_plane;

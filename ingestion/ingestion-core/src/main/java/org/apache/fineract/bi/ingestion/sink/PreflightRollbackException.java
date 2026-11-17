@@ -41,8 +41,16 @@ public final class PreflightRollbackException extends SQLException {
     public PreflightRollbackException(String reason, Throwable cause, Throwable validationFailure) {
         super(reason, SQLSTATE, cause);
         this.validationFailure = validationFailure;
-        if (validationFailure != null && validationFailure != cause) {
+        if (validationFailure != null
+                && cause != null
+                && validationFailure != this
+                && cause != this
+                && validationFailure != cause) {
             addSuppressed(validationFailure);
+            try {
+                validationFailure.addSuppressed(cause);
+            } catch (Exception ignored) {
+            }
         }
     }
 

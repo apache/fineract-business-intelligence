@@ -20,7 +20,9 @@ package org.apache.fineract.bi.ingestion.app;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import org.apache.fineract.bi.ingestion.cdc.ChangeEvent;
@@ -31,11 +33,38 @@ import org.apache.fineract.bi.ingestion.routing.OwnershipSnapshot;
 import org.apache.fineract.bi.ingestion.routing.Route;
 import org.apache.fineract.bi.ingestion.sink.BatchWriter;
 import org.apache.fineract.bi.ingestion.sink.PreflightRollbackException;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
+import org.apache.fineract.bi.ingestion.sink.ReplayOutcome;
 import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 
 public final class WarehousePreflightValidator {
 
     public record ValidationResult(boolean passed, String reason, RoutedEvent routedEvent) {
+    }
+
+    /**
+     * Point-in-time predicted replay outcomes for replayed candidate events evaluated
+     * against current warehouse staging semantics and LSN ordering guards.
+     * <p>
+     * NOTE: These outcomes are dry-run point-in-time predictions, NOT committed warehouse outcomes.
+     * Downstream warehouse application is asynchronous and live publication does not guarantee
+     * that these predicted outcomes will match the eventual committed outcomes.
+     * Ordinary non-replay events do not acquire replay outcomes and will not be present in this map.
+     */
+    public record BatchValidationResult(
+            boolean passed,
+            String reason,
+            Collection<RoutedEvent> routedEvents,
+            Map<ReplayIdentity, ReplayOutcome> predictedOutcomes) {
+
+        public BatchValidationResult(boolean passed, String reason, Collection<RoutedEvent> routedEvents) {
+            this(passed, reason, routedEvents, Map.of());
+        }
+
+        public BatchValidationResult {
+            routedEvents = routedEvents == null ? List.of() : List.copyOf(routedEvents);
+            predictedOutcomes = predictedOutcomes == null ? Map.of() : Map.copyOf(predictedOutcomes);
+        }
     }
 
     private final Contract contract;
@@ -106,25 +135,42 @@ public final class WarehousePreflightValidator {
 
     /**
      * Executes warehouse preflight staging and apply_staged_batch validation inside a transaction
-     * that is unconditionally rolled back.
+     * that is unconditionally rolled back for a batch of routed events.
      * <p>
-     * Ordinary warehouse validation rejections return a failed {@link ValidationResult}.
+     * Ordinary warehouse validation rejections return a failed {@link BatchValidationResult}.
      * If preflight setup, rollback, or connection restoration fails, {@link PreflightRollbackException}
      * is propagated immediately to abort the replay operation and prevent connection reuse.
      */
-    public ValidationResult validateWarehouse(Connection connection, RoutedEvent routed)
+    public BatchValidationResult validateWarehouse(Connection connection, Collection<RoutedEvent> routedEvents)
             throws PreflightRollbackException {
         Objects.requireNonNull(connection, "Database connection is required for warehouse preflight");
-        Objects.requireNonNull(routed, "RoutedEvent is required for warehouse preflight");
+        Objects.requireNonNull(routedEvents, "RoutedEvents collection is required for warehouse preflight");
+        if (routedEvents.isEmpty()) {
+            return new BatchValidationResult(true, null, List.of(), Map.of());
+        }
         try {
-            writer.preflight(connection, List.of(routed));
-            return new ValidationResult(true, null, routed);
+            BatchWriter.PreflightResult preflightResult = writer.preflight(connection, routedEvents);
+            return new BatchValidationResult(true, null, routedEvents, preflightResult.predictedOutcomes());
         } catch (PreflightRollbackException e) {
             throw e;
         } catch (SQLException e) {
-            return new ValidationResult(
-                    false, "Warehouse validation failed: [" + e.getSQLState() + "] " + e.getMessage(), routed);
+            return new BatchValidationResult(
+                    false, "Warehouse validation failed: [" + e.getSQLState() + "] " + e.getMessage(), routedEvents, Map.of());
+        } catch (Exception e) {
+            return new BatchValidationResult(
+                    false, "Warehouse validation failed: " + e.getMessage(), routedEvents, Map.of());
         }
+    }
+
+    /**
+     * Executes warehouse preflight staging for a single routed event inside a transaction
+     * that is unconditionally rolled back.
+     */
+    public ValidationResult validateWarehouse(Connection connection, RoutedEvent routed)
+            throws PreflightRollbackException {
+        Objects.requireNonNull(routed, "RoutedEvent is required for warehouse preflight");
+        BatchValidationResult batchResult = validateWarehouse(connection, List.of(routed));
+        return new ValidationResult(batchResult.passed(), batchResult.reason(), routed);
     }
 
     /**

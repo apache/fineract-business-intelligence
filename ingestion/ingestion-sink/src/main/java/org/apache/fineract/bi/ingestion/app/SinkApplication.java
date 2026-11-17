@@ -23,6 +23,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import io.micrometer.core.instrument.Gauge;
 import java.sql.Connection;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -53,9 +54,11 @@ public final class SinkApplication {
             case "provision-topics" -> TopicProvisioner.provision(contract, env);
             case "run" -> run(contract, SinkConfig.from(env, System.getenv()));
             case "dlt-list" -> DeadLetterListCommand.run(
-                SinkConfig.from(env, System.getenv()), contract);
+                SinkConfig.from(env, System.getenv()), contract,
+                args.length > 1 ? Arrays.copyOfRange(args, 1, args.length) : new String[0]);
             case "dlt-replay" -> DeadLetterReplayCommand.run(
-                SinkConfig.from(env, System.getenv()), contract, args);
+                SinkConfig.from(env, System.getenv()), contract,
+                args.length > 1 ? Arrays.copyOfRange(args, 1, args.length) : new String[0]);
             default -> {
                 System.err.println("Usage: SinkApplication [run|provision-topics|dlt-list|dlt-replay]");
                 System.exit(2);

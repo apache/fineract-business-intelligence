@@ -163,9 +163,10 @@ public class WarehouseWriterPreflightTest {
         AtomicInteger rollbacks = new AtomicInteger();
         Connection c = mockConnection(true, null, null, autoCommit, rollbacks);
 
-        List<WarehouseWriter.Applied> applied = writer.preflight(c, List.of());
+        BatchWriter.PreflightResult preflightResult = writer.preflight(c, List.of());
 
-        assertThat(applied).isEmpty();
+        assertThat(preflightResult.applied()).isEmpty();
+        assertThat(preflightResult.predictedOutcomes()).isEmpty();
         assertThat(rollbacks.get()).isEqualTo(1);
         assertThat(autoCommit.get()).isTrue();
     }
@@ -228,6 +229,7 @@ public class WarehouseWriterPreflightTest {
                 .hasCause(autoCommitError)
                 .satisfies(e -> {
                     assertThat(e.getSuppressed()).contains(unwrapError);
+                    assertThat(unwrapError.getSuppressed()).contains(autoCommitError);
                 });
 
         assertThat(rollbacks.get()).isEqualTo(1);
@@ -246,6 +248,7 @@ public class WarehouseWriterPreflightTest {
                 .hasCause(rollbackError)
                 .satisfies(e -> {
                     assertThat(e.getSuppressed()).contains(unwrapError);
+                    assertThat(unwrapError.getSuppressed()).contains(rollbackError);
                 });
 
         assertThat(rollbacks.get()).isEqualTo(1);

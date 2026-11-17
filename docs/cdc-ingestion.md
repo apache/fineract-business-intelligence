@@ -744,12 +744,20 @@ To inspect dead letters without consuming or mutating offsets, run the `dlt-list
 docker compose --profile cdc exec sink java -cp /app/sink.jar org.apache.fineract.bi.ingestion.app.SinkApplication dlt-list
 ```
 
+To cross-reference dead-letter records against durable outcomes in `meta.replay_ledger`, pass `--with-ledger`:
+
+```powershell
+docker compose --profile cdc exec sink java -cp /app/sink.jar org.apache.fineract.bi.ingestion.app.SinkApplication dlt-list --with-ledger
+```
+
 The output displays:
 - Overall summary: total records on DLT, available payloads vs. omitted payloads (`fbi.dlt.value_omitted`).
 - Counts grouped by rejection reason (e.g. `UNKNOWN_SOURCE`, `WAREHOUSE_REJECTED`, `MALFORMED_JSON`).
 - Counts grouped by source ID and table.
 - Detailed record coordinate breakdown (`DLT[partition]@offset -> original topic[partition]@offset`).
 - A warning if any records contain invalid or malformed replay identity headers.
+- When `--with-ledger` is specified: historical outcome counts (`APPLIED`, `SKIPPED_STALE`, `SKIPPED_SUPERSEDED`, `LEGACY_UNKNOWN`, `CLAIMED`, `No ledger entry`, `Identity unavailable`) and individual record ledger statuses.
+  - *Distinction between missing ledger entries and confirmed unprocessed records:* A status of `No ledger entry` indicates that no row matching the record's logical replay UUID is present in `meta.replay_ledger`. Records may be un-replayed, or earlier ledger entries may have been purged by retention policies; a missing ledger entry is not cryptographic proof that an event was never processed.
 
 #### 2. Replaying dead letters (`dlt-replay`)
 
@@ -783,9 +791,10 @@ docker compose --profile cdc exec sink java -cp /app/sink.jar org.apache.finerac
 | `--source=<source-id>` | Replay only events belonging to this source ID. |
 | `--table=<table>` | Replay only events belonging to this logical table. |
 | `--offset-range=<range>` | Partition-aware original offset range filter (inclusive bounds). |
-| `--dry-run` or `--preflight-only` | Force preflight / dry-run mode (default). |
+| `--dry-run` | Force preflight / dry-run mode (default). |
 | `--skip-preflight` | Bypass database warehouse staging and apply validation during `--execute`. *Note:* CDC payload parsing and ownership routing (strictly requiring `PROD` or `SHADOW`) are always enforced and cannot be bypassed. Events routed to `HOLD`, `SKIP`, or `UNKNOWN_SOURCE` will never be replayed. |
 | `--limit=<n>` | Maximum number of matched records to process. |
+| `--max-bytes=<bytes>` | Maximum cumulative bytes of dead-letter records to scan before stopping (defaults to 64 MiB / 67,108,864 bytes). Accounting tracks logical record bytes (key, value, and header bytes), not exact Kafka wire transport bytes or a strict JVM consumer-memory bound. Records across DLT partitions are scanned without guaranteed global chronological ordering. |
 | `--confirm-all` | Required when using `--execute` without filters or bounded limit, to prevent accidental mass replay. |
 
 ##### Partition-aware offset filter syntax
@@ -798,17 +807,17 @@ Offset bounds are **inclusive** (`min..max` or `min-max`). The original Kafka pa
 
 #### 3. Idempotency and replay safety guarantees
 
-The replay pipeline provides end-to-end exactly-once delivery guarantees:
+The replay pipeline provides **effectively-once / idempotent replay processing**. PostgreSQL ledger deduplication (`meta.replay_ledger`) and transaction atomicity protect warehouse application from duplicate writes. However, Kafka publication and PostgreSQL warehouse mutations do not form a single distributed atomic transaction; if a failure occurs between Kafka publication and warehouse consumption, duplicate delivery to Kafka is safely deduplicated during warehouse batch application via the replay ledger:
 
 1. **Atomic PostgreSQL Claim:**
-   When replaying, each event carries a `ReplayIdentity` (`dlt_topic`, `dlt_partition`, `dlt_offset`). In `WarehouseWriter`, the receipt is claimed within the **same PostgreSQL transaction** as the staging and `meta.apply_staged_batch` warehouse mutations:
+   When replaying, each event carries a logical `ReplayIdentity` (`replay_id`, `dlt_topic`, `dlt_partition`, `dlt_offset`). In `WarehouseWriter`, the receipt is claimed within the **same PostgreSQL transaction** as the staging and `meta.apply_staged_batch` warehouse mutations using the logical UUID as conflict key:
    ```sql
-   INSERT INTO meta.replay_ledger (dlt_topic, dlt_partition, dlt_offset)
-   VALUES (?, ?, ?)
-   ON CONFLICT DO NOTHING
-   RETURNING dlt_topic;
+   INSERT INTO meta.replay_ledger (replay_id, dlt_topic, dlt_partition, dlt_offset, source_id, table_name)
+   VALUES (?, ?, ?, ?, ?, ?)
+   ON CONFLICT (replay_id) DO NOTHING
+   RETURNING replay_id;
    ```
-   If no row is returned, the event was already applied and is excluded from warehouse staging.
+   If no row is returned, the event was already applied and is excluded from warehouse staging. Duplicate replay IDs within the same batch are staged at most once.
 2. **Transaction Atomicity:**
    If the warehouse transaction fails or rolls back, the replay claim in `meta.replay_ledger` is rolled back as well. Correcting the event and replaying it again remains possible.
 3. **Kafka Partition and Key Preservation:**
@@ -819,37 +828,54 @@ The replay pipeline provides end-to-end exactly-once delivery guarantees:
    Before parsing Debezium JSON envelopes or checking ownership routing, `SinkWorker` checks `meta.replay_ledger` for already-applied replay identities. Duplicates are immediately skipped and their Kafka consumer offsets advanced normally, even if ownership for that source/table has transitioned to `HOLD` or `UNKNOWN_SOURCE`.
 6. **Payload Availability Enforcement:**
    Records whose payload is unavailable or omitted (`fbi.dlt.value_omitted = true`) are rejected by `dlt-replay` and cannot be replayed.
+7. **Pre-Publication Outcome-Aware Replay Ledger Lookup:**
+   Before publishing to Kafka or running warehouse preflight, `dlt-replay` queries `meta.replay_ledger` using `WarehouseWriter.findCompletedReplayOutcomes()`. Candidate records whose `replay_id` is already recorded in the ledger are excluded from publication and reported explicitly with their stored outcome (`APPLIED`, `SKIPPED_STALE`, `SKIPPED_SUPERSEDED`, `LEGACY_UNKNOWN`, or non-terminal `CLAIMED`). An outcome breakdown is included in the summary report.
 
-#### 4. Warehouse preflight validation and ownership enforcement
+#### 4. Warehouse preflight validation, prediction semantics, and asynchronous live execution
 
 Before republishing events to Kafka, `dlt-replay` performs payload parsing, envelope verification, and live ownership routing checks:
 - Verifies Debezium JSON envelope syntax, structure, and required columns.
 - Enforces live ownership routing: records must be currently routed to `PROD` or `SHADOW`. Records routed to `HOLD`, `SKIP`, or `UNKNOWN_SOURCE` fail validation and are never published to Kafka, even if `--skip-preflight` is specified.
 - When preflight is enabled (default), candidate rows are staged and evaluated against actual warehouse write semantics via `meta.apply_staged_batch`.
 - Preflight executes inside a PostgreSQL transaction that is **unconditionally rolled back**.
+- **Dry-run predicted warehouse outcomes**: When running in dry-run mode with preflight enabled, `dlt-replay` reports point-in-time predicted outcomes:
+  ```text
+  Predicted warehouse outcomes (point-in-time estimate; not committed):
+    - APPLIED: N
+    - SKIPPED_STALE: N
+    - SKIPPED_SUPERSEDED: N
+  ```
+  These counts reflect how candidate events would resolve against current warehouse state and LSN ordering guards. They are point-in-time estimates and not committed outcomes. Predictions are not displayed if preflight is bypassed via `--skip-preflight` or if preflight validation fails.
+- **Live execution and asynchronous warehouse ingestion clarity**: When executing live replay with `--execute`:
+  - Records reported as `Acknowledged` have been successfully accepted and acknowledged by the Kafka broker.
+  - The warehouse sink consumes Kafka asynchronously. Broker acknowledgement confirms topic publication, but does not prove warehouse application.
+  - Acknowledged Kafka messages are never reported as warehouse `APPLIED`.
+  - Operators can inspect durable warehouse outcomes later using `dlt-list --with-ledger` once the sink processes the replayed events.
 - **Preflight connection lifecycle failure safety guarantee**: If transaction setup (reading or establishing initial `autoCommit=false`), transaction rollback, or autocommit restoration fails, a `PreflightRollbackException` is propagated immediately, the entire replay operation is aborted, and the database connection is closed/discarded rather than returned to the pool or reused. Ordinary warehouse validation rejections (e.g. data type mismatch or constraint violation where rollback and restoration succeed) remain per-record rejections.
 - *Note:* Preflight is a point-in-time check. When replayed events are subsequently consumed from Kafka, the sink independently rechecks ownership and enforces epoch fencing.
 
 #### 5. Database upgrade instructions
 
-##### Fresh installations
-The replay ledger table and role permissions are automatically provisioned during initialization by:
-- `warehouse/schema/platform.sql` (defines `meta.replay_ledger`)
-- `docker/postgres-warehouse/initdb/002_create_warehouse_roles.sh` (grants `INSERT` on `meta.replay_ledger` to `analytics_engine`)
+##### Fresh and existing installations
+The replay ledger table and role permissions are provisioned by `warehouse/schema/platform.sql`:
+```sql
+CREATE TABLE IF NOT EXISTS meta.replay_ledger (
+    replay_id UUID PRIMARY KEY,
+    dlt_topic TEXT NOT NULL,
+    dlt_partition INTEGER NOT NULL,
+    dlt_offset BIGINT NOT NULL,
+    source_id TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    replayed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-##### Existing installations
-For existing warehouse databases, apply the idempotent migration script `warehouse/schema/127_replay_ledger.sql` as `analytics_admin`:
-
-```bash
-# Default engine role (analytics_engine):
-docker exec -i fineract-bi-warehouse psql -U analytics_admin -d analytics < warehouse/schema/127_replay_ledger.sql
-
-# Custom WAREHOUSE_ENGINE_USER:
-docker exec -i fineract-bi-warehouse psql -U analytics_admin -d analytics \
-  -c "SET fbi.warehouse_engine_user = 'custom_engine_user';" \
-  -f /warehouse/schema/127_replay_ledger.sql
+-- Note: Existing warehouse installations reapply warehouse/schema/platform.sql as an administrator
+-- to execute the idempotent migration, add missing columns, backfill legacy entries, and swap the primary key.
+-- To grant ingestion engine permissions on existing installations:
+GRANT SELECT, INSERT ON meta.replay_ledger TO <warehouse_engine_user>;
 ```
-This creates `meta.replay_ledger` if not present and grants minimum required privileges (`INSERT` only) to the configured engine role.
+
+Existing warehouse installations apply regular schema updates via `warehouse/schema/platform.sql`, which automatically upgrades `meta.replay_ledger` from the legacy composite-primary-key schema if present, backfills RFC 4122 v3 UUIDs, and conditionally grants `SELECT, INSERT` permissions to `analytics_engine`.
 
 ---
 

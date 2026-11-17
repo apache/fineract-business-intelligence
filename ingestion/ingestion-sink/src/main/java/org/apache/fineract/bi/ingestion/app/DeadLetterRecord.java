@@ -25,6 +25,7 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
+import java.util.UUID;
 import org.apache.fineract.bi.ingestion.contract.Contract;
 import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -35,6 +36,7 @@ public record DeadLetterRecord(
         String dltTopic,
         int dltPartition,
         long dltOffset,
+        long dltTimestamp,
         String originalTopic,
         int originalPartition,
         long originalOffset,
@@ -46,6 +48,7 @@ public record DeadLetterRecord(
         Integer valueBytes,
         byte[] value,
         byte[] key,
+        UUID dltId,
         ReplayIdentity replayIdentityHeader,
         boolean hasInvalidReplayIdentity,
         String replayIdentityError) {
@@ -85,6 +88,7 @@ public record DeadLetterRecord(
                 dltTopic,
                 dltPartition,
                 dltOffset,
+                0L,
                 originalTopic,
                 originalPartition,
                 originalOffset,
@@ -95,6 +99,7 @@ public record DeadLetterRecord(
                 valueOmitted,
                 valueBytes,
                 value,
+                null,
                 null,
                 null,
                 false,
@@ -121,6 +126,7 @@ public record DeadLetterRecord(
                 dltTopic,
                 dltPartition,
                 dltOffset,
+                0L,
                 originalTopic,
                 originalPartition,
                 originalOffset,
@@ -132,6 +138,7 @@ public record DeadLetterRecord(
                 valueBytes,
                 value,
                 key,
+                null,
                 replayIdentityHeader,
                 false,
                 null);
@@ -156,7 +163,7 @@ public record DeadLetterRecord(
     }
 
     public boolean hasReplayHeaders() {
-        return replayIdentityHeader != null || hasInvalidReplayIdentity;
+        return replayIdentityHeader != null || dltId != null || hasInvalidReplayIdentity;
     }
 
     public boolean isReplayEligible() {
@@ -167,9 +174,20 @@ public record DeadLetterRecord(
         if (hasInvalidReplayIdentity) {
             throw new IllegalStateException("DLT record has invalid replay identity: " + replayIdentityError);
         }
-        return replayIdentityHeader != null
-                ? replayIdentityHeader
-                : new ReplayIdentity(dltTopic, dltPartition, dltOffset);
+        if (replayIdentityHeader != null) {
+            return replayIdentityHeader;
+        }
+        if (dltId != null) {
+            return new ReplayIdentity(dltId, dltTopic, dltPartition, dltOffset);
+        }
+        return new ReplayIdentity(
+                dltTopic,
+                dltPartition,
+                dltOffset,
+                dltTimestamp,
+                originalTopic,
+                originalPartition,
+                originalOffset);
     }
 
     public static DeadLetterRecord parse(ConsumerRecord<byte[], byte[]> record, Contract contract) {
@@ -177,6 +195,7 @@ public record DeadLetterRecord(
                 record.topic(),
                 record.partition(),
                 record.offset(),
+                record.timestamp(),
                 record.headers(),
                 record.key(),
                 record.value(),
@@ -190,13 +209,25 @@ public record DeadLetterRecord(
             Headers headers,
             byte[] value,
             Contract contract) {
-        return parse(dltTopic, dltPartition, dltOffset, headers, null, value, contract);
+        return parse(dltTopic, dltPartition, dltOffset, 0L, headers, null, value, contract);
     }
 
     public static DeadLetterRecord parse(
             String dltTopic,
             int dltPartition,
             long dltOffset,
+            Headers headers,
+            byte[] key,
+            byte[] value,
+            Contract contract) {
+        return parse(dltTopic, dltPartition, dltOffset, 0L, headers, key, value, contract);
+    }
+
+    public static DeadLetterRecord parse(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            long dltTimestamp,
             Headers headers,
             byte[] key,
             byte[] value,
@@ -239,6 +270,35 @@ public record DeadLetterRecord(
                 .map(t -> t.tableName())
                 .orElse(UNKNOWN_TABLE);
 
+        UUID dltId = null;
+        String dltIdHeader = optionalHeader(headers, ReplayIdentity.DLT_ID_HEADER);
+        if (dltIdHeader != null) {
+            try {
+                dltId = UUID.fromString(dltIdHeader);
+            } catch (Exception e) {
+                return new DeadLetterRecord(
+                        dltTopic,
+                        dltPartition,
+                        dltOffset,
+                        dltTimestamp,
+                        originalTopic,
+                        originalPartition,
+                        originalOffset,
+                        reason,
+                        message,
+                        table,
+                        extractSourceId(value),
+                        valueOmitted,
+                        valueBytes,
+                        value,
+                        key,
+                        null,
+                        null,
+                        true,
+                        "Invalid UUID in " + ReplayIdentity.DLT_ID_HEADER + ": " + dltIdHeader);
+            }
+        }
+
         ReplayIdentity replayId = null;
         boolean invalidReplay = false;
         String replayError = null;
@@ -256,6 +316,7 @@ public record DeadLetterRecord(
                 dltTopic,
                 dltPartition,
                 dltOffset,
+                dltTimestamp,
                 originalTopic,
                 originalPartition,
                 originalOffset,
@@ -267,6 +328,7 @@ public record DeadLetterRecord(
                 valueBytes,
                 value,
                 key,
+                dltId,
                 replayId,
                 invalidReplay,
                 replayError);

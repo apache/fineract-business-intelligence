@@ -97,7 +97,16 @@ public final class DeadLetterPublisher implements AutoCloseable, DeadLetterSink 
             out.headers().add("fbi.dlt.value_omitted", bytes("true"));
             out.headers().add("fbi.dlt.value_bytes", bytes(Integer.toString(value == null ? 0 : value.length)));
         }
+        out.headers().add(org.apache.fineract.bi.ingestion.sink.ReplayIdentity.DLT_ID_HEADER, bytes(java.util.UUID.randomUUID().toString()));
         ReplayIdentityHeaders.copy(r.headers(), out.headers());
+        if (out.headers().lastHeader(org.apache.fineract.bi.ingestion.sink.ReplayIdentity.ID_HEADER) == null
+                && ReplayIdentityHeaders.hasReplayHeaders(r.headers())) {
+            try {
+                ReplayIdentityHeaders.read(r.headers())
+                        .ifPresent(id -> out.headers().add(org.apache.fineract.bi.ingestion.sink.ReplayIdentity.ID_HEADER, bytes(id.replayId().toString())));
+            } catch (Exception ignored) {
+            }
+        }
         return out;
     }
 
