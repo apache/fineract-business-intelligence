@@ -365,7 +365,6 @@ public final class DeadLetterReplayCommand {
         List<Candidate> routeValidCandidates = new ArrayList<>();
 
         for (DeadLetterRecord r : matched) {
-            // Payload parsing and ownership routing checks must NEVER be bypassed
             WarehousePreflightValidator.ValidationResult routeResult = preflightValidator.validateRoute(ownership, r);
 
             if (!routeResult.passed()) {
@@ -383,7 +382,6 @@ public final class DeadLetterReplayCommand {
             routeValidCandidates.add(new Candidate(r, routeResult.routedEvent()));
         }
 
-        // Filter already-completed replays before publishing or preflighting
         List<Candidate> eligibleCandidates = new ArrayList<>();
         Map<DeadLetterRecord, ReplayOutcome> alreadyCompletedOutcomes = new LinkedHashMap<>();
         LedgerCheckStatus ledgerCheckStatus;
@@ -426,7 +424,6 @@ public final class DeadLetterReplayCommand {
 
         Map<ReplayIdentity, ReplayOutcome> predictedOutcomes = null;
 
-        // Batch warehouse preflight validation against actual write semantics
         if (!skipPreflight && !eligibleCandidates.isEmpty()) {
             List<RoutedEvent> routedEvents = eligibleCandidates.stream()
                     .map(Candidate::routedEvent)
@@ -533,7 +530,6 @@ public final class DeadLetterReplayCommand {
                     continue;
                 }
 
-                // If flush failed and this future is not done, do not call blocking future.get()
                 if (flushError != null && !attempt.future.isDone()) {
                     attempt.status = PublicationStatus.UNCONFIRMED;
                     attempt.errorMessage = "Producer flush failed with unfinished future: " + flushError.getMessage();

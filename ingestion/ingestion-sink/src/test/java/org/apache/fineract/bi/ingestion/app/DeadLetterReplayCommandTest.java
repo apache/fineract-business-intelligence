@@ -229,7 +229,6 @@ public class DeadLetterReplayCommandTest {
                 List.of(r1, r2), List.of(), List.of(), List.of(), List.of(r1, r2), 2, Map.of(),
                 new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Test publication manually to verify partition and headers
         ProducerRecord<byte[], byte[]> pr1 = new ProducerRecord<>(
                 r1.originalTopic(), r1.originalPartition(), r1.key(), r1.value());
         ReplayIdentityHeaders.add(pr1.headers(), r1.replayIdentity());
@@ -255,7 +254,7 @@ public class DeadLetterReplayCommandTest {
         DeadLetterRecord omitted = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, true, bytes("k"));
 
         RecordHeaders badHeaders = headers("WAREHOUSE_REJECTED", "bank-a", "fineract.cdc.batch_job_instance", 0, 20L);
-        badHeaders.add("fbi.replay.dlt.topic", bytes("dlt")); // Missing partition & offset
+        badHeaders.add("fbi.replay.dlt.topic", bytes("dlt"));
         byte[] payload = bytes("{\"after\":{\"job_instance_id\":20},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
         DeadLetterRecord badReplay = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 20L, badHeaders, bytes("k"), payload, contract);
 
@@ -313,7 +312,6 @@ public class DeadLetterReplayCommandTest {
         DeadLetterReplayCommand.ReplayFilter filter =
                 new DeadLetterReplayCommand.ReplayFilter("WAREHOUSE_REJECTED", null, null, null);
 
-        // When execute is not set, dryRun is true
         DeadLetterReplayCommand.renderReport(
                 new DeadLetterReader.ScanResult(1, Collections.emptyMap()), filter, true, false,
                 List.of(r), List.of(), List.of(), List.of(), List.of(r), 0,
@@ -342,11 +340,9 @@ public class DeadLetterReplayCommandTest {
             }
         }).isInstanceOf(IllegalArgumentException.class).hasMessageContaining("Refusing broad replay without filters");
 
-        // Allowed with bounded limit
         int boundedLimit = 100;
         assertThat(execute && !hasFilter && boundedLimit == Integer.MAX_VALUE && !confirmAll).isFalse();
 
-        // Allowed with confirm-all
         boolean confirmed = true;
         assertThat(execute && !hasFilter && limit == Integer.MAX_VALUE && !confirmed).isFalse();
     }
@@ -571,7 +567,7 @@ public class DeadLetterReplayCommandTest {
             preflightCalls.add(events);
             if (nextException != null) {
                 SQLException toThrow = nextException;
-                nextException = null; // Clear so subsequent calls succeed
+                nextException = null;
                 throw toThrow;
             }
             return new BatchWriter.PreflightResult(
@@ -606,11 +602,8 @@ public class DeadLetterReplayCommandTest {
                 .isInstanceOf(PreflightRollbackException.class)
                 .hasMessageContaining("rollback exploded");
 
-        // Operation was aborted: second record was never evaluated by preflight writer
         assertThat(writer.preflightCalls).hasSize(1);
-        // Producer published zero records
         assertThat(producer.history()).isEmpty();
-        // Borrowed connection must NOT be closed or aborted by processMatchedRecords
         assertThat(closed.get()).isFalse();
         assertThat(aborts.get()).isEqualTo(0);
     }
@@ -618,7 +611,6 @@ public class DeadLetterReplayCommandTest {
     @Test
     public void ordinaryValidationFailureFailsEntireBatchClosedAndPreservesConnection() throws Exception {
         StubWriter writer = new StubWriter();
-        // Batch preflight fails with ordinary warehouse validation failure
         writer.nextException = new SQLException("22003: numeric field overflow", "22003");
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
 
@@ -640,13 +632,10 @@ public class DeadLetterReplayCommandTest {
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Warehouse preflight was invoked once with the entire candidate batch
         assertThat(writer.preflightCalls).hasSize(1);
         assertThat(writer.preflightCalls.get(0)).hasSize(2);
-        // Connection remained open and was NOT aborted
         assertThat(closed.get()).isFalse();
         assertThat(aborts.get()).isEqualTo(0);
-        // Failed batch preflight prevents publication of the entire candidate batch (fail-closed)
         assertThat(producer.history()).isEmpty();
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report).contains("Preflight failed: 2").contains("numeric field overflow");
@@ -679,11 +668,8 @@ public class DeadLetterReplayCommandTest {
                 .hasMessageContaining("Failed to restore connection autoCommit state")
                 .hasCause(autoCommitErr);
 
-        // Operation was aborted: second record was never evaluated by preflight writer
         assertThat(writer.preflightCalls).hasSize(1);
-        // Producer published zero records
         assertThat(producer.history()).isEmpty();
-        // Borrowed connection must NOT be closed or aborted by processMatchedRecords
         assertThat(closed.get()).isFalse();
         assertThat(aborts.get()).isEqualTo(0);
     }
@@ -715,11 +701,8 @@ public class DeadLetterReplayCommandTest {
                 .hasMessageContaining("Failed to initialize connection transaction state")
                 .hasCause(getAutoCommitErr);
 
-        // First record failed setup; second record was never evaluated by preflight
         assertThat(getAutoCommitCalls.get()).isEqualTo(1);
-        // Producer published zero records
         assertThat(producer.history()).isEmpty();
-        // Borrowed connection must NOT be closed or aborted by processMatchedRecords
         assertThat(closed.get()).isFalse();
         assertThat(aborts.get()).isEqualTo(0);
     }
@@ -751,11 +734,8 @@ public class DeadLetterReplayCommandTest {
                 .hasMessageContaining("Failed to initialize connection transaction state")
                 .hasCause(setAutoCommitFalseErr);
 
-        // First record failed setup; second record was never evaluated by preflight
         assertThat(getAutoCommitCalls.get()).isEqualTo(1);
-        // Producer published zero records
         assertThat(producer.history()).isEmpty();
-        // Borrowed connection must NOT be closed or aborted by processMatchedRecords
         assertThat(closed.get()).isFalse();
         assertThat(aborts.get()).isEqualTo(0);
     }
@@ -775,13 +755,10 @@ public class DeadLetterReplayCommandTest {
             throw ex;
         })).isSameAs(ex);
 
-        // Connection must be evicted from pool exactly once
         assertThat(ds.evictCalls.get()).isEqualTo(1);
         assertThat(ds.evictedConn.get()).isSameAs(conn);
-        // Connection must be aborted exactly once
         assertThat(aborts.get()).isEqualTo(1);
         assertThat(closed.get()).isTrue();
-        // Connection must NEVER be returned to pool via conn.close()
         assertThat(closeCalls.get()).isEqualTo(0);
     }
 
@@ -803,12 +780,9 @@ public class DeadLetterReplayCommandTest {
         })).isSameAs(ex)
            .satisfies(e -> assertThat(e.getSuppressed()).contains(evictErr));
 
-        // Eviction was attempted
         assertThat(ds.evictCalls.get()).isEqualTo(1);
-        // Abort must STILL be called even when eviction fails
         assertThat(aborts.get()).isEqualTo(1);
         assertThat(closed.get()).isTrue();
-        // Connection must NEVER be returned to pool via conn.close()
         assertThat(closeCalls.get()).isEqualTo(0);
     }
 
@@ -829,11 +803,8 @@ public class DeadLetterReplayCommandTest {
         })).isSameAs(ex)
            .satisfies(e -> assertThat(e.getSuppressed()).contains(abortErr));
 
-        // Eviction was called
         assertThat(ds.evictCalls.get()).isEqualTo(1);
-        // Abort was called
         assertThat(aborts.get()).isEqualTo(1);
-        // Connection must NEVER be returned to pool via conn.close()
         assertThat(closeCalls.get()).isEqualTo(0);
     }
 
@@ -852,9 +823,7 @@ public class DeadLetterReplayCommandTest {
         });
 
         assertThat(executed.get()).isTrue();
-        // Clean connection is returned to pool via close() exactly once
         assertThat(closeCalls.get()).isEqualTo(1);
-        // Must NOT be evicted or aborted
         assertThat(ds.evictCalls.get()).isEqualTo(0);
         assertThat(aborts.get()).isEqualTo(0);
     }
@@ -997,7 +966,6 @@ public class DeadLetterReplayCommandTest {
         StubWriter writer = new StubWriter();
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
 
-        // Record with omitted payload cannot be route-validated
         DeadLetterRecord rOmitted = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, true, bytes("k1"));
 
         MockProducer<byte[], byte[]> producer =
@@ -1057,14 +1025,13 @@ public class DeadLetterReplayCommandTest {
 
         Map<String, OwnershipSnapshot.Entry> entries = new HashMap<>();
         entries.put(OwnershipSnapshot.key("bank-prod", "batch_job_instance"),
-                new OwnershipSnapshot.Entry("KAFKA", null, "STEADY", 1L)); // PROD
+                new OwnershipSnapshot.Entry("KAFKA", null, "STEADY", 1L));
         entries.put(OwnershipSnapshot.key("bank-shadow", "batch_job_instance"),
-                new OwnershipSnapshot.Entry("PYTHON", "KAFKA", "STEADY", 1L)); // SHADOW
+                new OwnershipSnapshot.Entry("PYTHON", "KAFKA", "STEADY", 1L));
         entries.put(OwnershipSnapshot.key("bank-hold", "batch_job_instance"),
-                new OwnershipSnapshot.Entry("KAFKA", null, "PAUSED", 1L)); // HOLD
+                new OwnershipSnapshot.Entry("KAFKA", null, "PAUSED", 1L));
         entries.put(OwnershipSnapshot.key("bank-skip", "batch_job_instance"),
-                new OwnershipSnapshot.Entry("PYTHON", null, "STEADY", 1L)); // SKIP
-        // bank-unknown is omitted from sourceMeta and entries, so it routes to UNKNOWN_SOURCE
+                new OwnershipSnapshot.Entry("PYTHON", null, "STEADY", 1L));
 
         Map<String, OwnershipSnapshot.SourceMeta> sourceMeta = Map.of(
                 "bank-prod", new OwnershipSnapshot.SourceMeta("tenant-a", 0),
@@ -1080,16 +1047,13 @@ public class DeadLetterReplayCommandTest {
         DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(5, Map.of());
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        // Run with execute=true (dryRun=false) and skipPreflight=true
         DeadLetterReplayCommand.processMatchedRecords(
                 scan, List.of(rProd, rShadow, rHold, rSkip, rUnknown), contract,
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 false, true, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Warehouse writer preflight staging was skipped as requested
         assertThat(writer.preflightCalls).isEmpty();
 
-        // ONLY PROD and SHADOW records were published to Kafka; HOLD, SKIP, and UNKNOWN_SOURCE were NOT published!
         assertThat(producer.history()).hasSize(2);
         List<String> replayedValues = producer.history().stream()
                 .map(p -> new String(p.value(), StandardCharsets.UTF_8))
@@ -1139,12 +1103,10 @@ public class DeadLetterReplayCommandTest {
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Warehouse preflight was invoked ONLY for the eligible (non-completed) record
         assertThat(writer.preflightCalls).hasSize(1);
         assertThat(writer.preflightCalls.get(0)).hasSize(1);
         assertThat(writer.preflightCalls.get(0).iterator().next().replayIdentity().replayId()).isEqualTo(newUuid);
 
-        // ONLY the non-completed record was published to Kafka
         assertThat(producer.history()).hasSize(1);
         ProducerRecord<byte[], byte[]> published = producer.history().get(0);
         assertThat(published.key()).isEqualTo(bytes("k2"));
@@ -1164,7 +1126,6 @@ public class DeadLetterReplayCommandTest {
 
         UUID sharedUuid = UUID.randomUUID();
 
-        // Two distinct DLT records (different DLT partition and offset) sharing the same replay UUID
         RecordHeaders h1 = headers("WAREHOUSE_REJECTED", "bank-a", "fineract.cdc.batch_job_instance", 0, 10L);
         ReplayIdentityHeaders.add(h1, new ReplayIdentity(sharedUuid, "fineract.cdc.dlt", 0, 10L));
         byte[] payload1 = bytes("{\"after\":{\"job_instance_id\":10},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
@@ -1188,7 +1149,6 @@ public class DeadLetterReplayCommandTest {
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Both records are excluded based on UUID equality regardless of physical coordinates
         assertThat(writer.preflightCalls).isEmpty();
         assertThat(producer.history()).isEmpty();
 
@@ -1229,7 +1189,6 @@ public class DeadLetterReplayCommandTest {
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Warehouse preflight was invoked once with both records
         assertThat(writer.preflightCalls).hasSize(1);
         assertThat(writer.preflightCalls.get(0)).hasSize(2);
         assertThat(producer.history()).hasSize(2);
@@ -1262,11 +1221,9 @@ public class DeadLetterReplayCommandTest {
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
-        // Exactly one preflight call for the entire batch
         assertThat(writer.preflightCalls).hasSize(1);
         assertThat(writer.preflightCalls.get(0)).hasSize(3);
 
-        // All 3 published to Kafka
         assertThat(producer.history()).hasSize(3);
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
@@ -1549,7 +1506,6 @@ public class DeadLetterReplayCommandTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Cannot specify --dry-run=false without --execute");
 
-        // Compatible explicit combinations should succeed
         Map<String, String> validLive = DeadLetterReplayCommand.parseArgs(new String[] {"--execute=true", "--dry-run=false"});
         assertThat(validLive.get("execute")).isEqualTo("true");
         assertThat(validLive.get("dry-run")).isEqualTo("false");
@@ -1606,9 +1562,6 @@ public class DeadLetterReplayCommandTest {
 
     @Test
     public void runPreservesDryRunAsDefaultWhenExecuteAbsent() throws Exception {
-        // Broad replay without filters is rejected in execute mode, but in dry-run mode (default),
-        // it proceeds without throwing the broad replay error.
-        // With null config, it will proceed past arg parsing and filter creation, then fail on HikariConfig dbUrl (null)
         assertThatThrownBy(() -> DeadLetterReplayCommand.run(null, contract, new String[] {"--reason=WAREHOUSE_REJECTED"}))
                 .isNotInstanceOf(IllegalArgumentException.class)
                 .isInstanceOf(NullPointerException.class);
@@ -1810,7 +1763,6 @@ public class DeadLetterReplayCommandTest {
                 .hasCause(syncErr);
 
         String report = out.toString(StandardCharsets.UTF_8);
-        // Verify second record was still attempted
         assertThat(producer.history()).hasSize(2);
         assertThat(report)
                 .contains("- Acknowledged: 1")
@@ -1857,7 +1809,6 @@ public class DeadLetterReplayCommandTest {
                     assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
-        // Only valid record was passed to producer.send
         assertThat(producer.history()).hasSize(1);
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
@@ -1924,12 +1875,11 @@ public class DeadLetterReplayCommandTest {
                     }
                 };
             } else {
-                return new CompletableFuture<>(); // Uncompleted future
+                return new CompletableFuture<>();
             }
         });
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        // Clear interrupted status before starting
         Thread.interrupted();
 
         try {
@@ -1943,10 +1893,8 @@ public class DeadLetterReplayCommandTest {
                         assertThat(rpe.unconfirmedCount()).isEqualTo(2);
                     });
 
-            // Verify thread interrupt flag was restored
             assertThat(Thread.currentThread().isInterrupted()).isTrue();
         } finally {
-            // Clear interrupt status so test runner is not impacted
             Thread.interrupted();
         }
 
@@ -1995,10 +1943,8 @@ public class DeadLetterReplayCommandTest {
         TestProducer producer = new TestProducer();
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        // dryRun = true
         runReplayTest(List.of(r1, r2), true, false, producer, out);
 
-        // Zero records published
         assertThat(producer.history()).isEmpty();
 
         String report = out.toString(StandardCharsets.UTF_8);
@@ -2016,7 +1962,6 @@ public class DeadLetterReplayCommandTest {
         DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(1, Map.of());
         DeadLetterReplayCommand.ReplayFilter filter = new DeadLetterReplayCommand.ReplayFilter(null, null, null, null);
 
-        // 12-parameter overload
         ByteArrayOutputStream out12 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
@@ -2027,7 +1972,6 @@ public class DeadLetterReplayCommandTest {
                 .contains("Records replayed to Kafka: 1")
                 .contains("- Acknowledged: 1");
 
-        // 13-parameter overload
         ByteArrayOutputStream out13 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
@@ -2037,7 +1981,6 @@ public class DeadLetterReplayCommandTest {
                 .contains("LIVE REPLAY (--execute)")
                 .contains("Records replayed to Kafka: 1");
 
-        // 14-parameter overload
         ByteArrayOutputStream out14 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
@@ -2047,7 +1990,6 @@ public class DeadLetterReplayCommandTest {
         assertThat(out14.toString(StandardCharsets.UTF_8))
                 .contains("Already completed (in ledger): 0 (ledger check performed)");
 
-        // 17-parameter overload with flush error
         ByteArrayOutputStream out17 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
@@ -2103,7 +2045,6 @@ public class DeadLetterReplayCommandTest {
                     assertThat(rpe.unconfirmedCount()).isEqualTo(1);
                 });
 
-        // Verify blocking get() was never called
         assertThat(getCalled.get()).isFalse();
 
         String report = out.toString(StandardCharsets.UTF_8);
@@ -2223,7 +2164,7 @@ public class DeadLetterReplayCommandTest {
         );
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        Thread.interrupted(); // Clear interrupt before test
+        Thread.interrupted();
 
         try {
             assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
@@ -2238,7 +2179,7 @@ public class DeadLetterReplayCommandTest {
 
             assertThat(Thread.currentThread().isInterrupted()).isTrue();
         } finally {
-            Thread.interrupted(); // Clear interrupt flag
+            Thread.interrupted();
         }
 
         String report = out.toString(StandardCharsets.UTF_8);

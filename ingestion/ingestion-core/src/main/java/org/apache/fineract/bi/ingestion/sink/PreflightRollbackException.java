@@ -20,14 +20,6 @@ package org.apache.fineract.bi.ingestion.sink;
 
 import java.sql.SQLException;
 
-/**
- * Thrown during warehouse preflight validation when transaction setup (reading or configuring
- * initial autoCommit state), transaction rollback, or connection state restoration fails.
- * <p>
- * Because transaction boundaries or initial connection states could not be reliably established
- * or rolled back, the underlying database connection is in an indeterminate or unusable state and
- * must be closed/discarded rather than returned to the pool or reused for subsequent preflight checks.
- */
 public final class PreflightRollbackException extends SQLException {
 
     public static final String SQLSTATE = "08006";

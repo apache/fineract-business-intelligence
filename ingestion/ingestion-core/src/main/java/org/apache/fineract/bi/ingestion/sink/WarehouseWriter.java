@@ -157,24 +157,6 @@ public final class WarehouseWriter implements BatchWriter {
         return applied;
     }
 
-    /**
-     * Executes warehouse preflight staging and apply simulation inside an isolated transaction
-     * that is unconditionally rolled back.
-     * <p>
-     * Transaction ownership rules:
-     * 1. The connection must have {@code autoCommit == true} before entering preflight. If autoCommit is
-     *    already false, {@link IllegalStateException} is thrown immediately to ensure that caller-owned
-     *    transaction boundaries are never mutated or rolled back.
-     * 2. Transient replay ledger claims are inserted with {@link #claimReplays(Connection, Collection)}
-     *    for any replay identities in the candidate batch.
-     * 3. Candidate events are staged and evaluated against warehouse ordering guards and deduplication.
-     * 4. Point-in-time predicted outcomes are queried via {@link #findCompletedReplayOutcomes(Connection, Collection)}.
-     * 5. Every claimed replay identity is verified to have a terminal predicted outcome (not null, not CLAIMED).
-     *    Any non-terminal outcome fails closed with an {@link IllegalStateException}.
-     * 6. The preflight transaction is rolled back unconditionally (on both success and failure), guaranteeing
-     *    that zero transient replay claims or warehouse mutations persist in the database.
-     * 7. The original connection autoCommit state is restored to {@code true}.
-     */
     @Override
     public PreflightResult preflight(Connection c, Collection<RoutedEvent> events) throws SQLException {
         boolean origAutoCommit;
@@ -247,8 +229,6 @@ public final class WarehouseWriter implements BatchWriter {
             throw new PreflightRollbackException(msg, rollbackEx, validationFailure);
         }
 
-        // Restore the original autoCommit state immediately after successful rollback,
-        // before rethrowing an ordinary validation failure. If restoring fails, treat as fatal cleanup failure.
         if (origAutoCommit && rollbackSucceeded) {
             try {
                 c.setAutoCommit(true);

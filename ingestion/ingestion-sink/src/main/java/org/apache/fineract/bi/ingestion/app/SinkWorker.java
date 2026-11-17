@@ -543,7 +543,6 @@ public final class SinkWorker implements Runnable {
         Map<String, long[]> perTable = new HashMap<>();
         Map<String, Long> alreadyCompletedReplays = new HashMap<>();
 
-        // Early completed-replay check before parsing and ownership routing
         Set<ReplayIdentity> candidates = new HashSet<>();
         Map<ConsumerRecord<byte[], byte[]>, ReplayIdentity> recordReplays = new IdentityHashMap<>();
         Map<ConsumerRecord<byte[], byte[]>, String> malformedReplays = new IdentityHashMap<>();
@@ -579,11 +578,10 @@ public final class SinkWorker implements Runnable {
             String table = r.topic().substring(r.topic().lastIndexOf('.') + 1);
             long[] counts = perTable.computeIfAbsent(table, k -> new long[4]);
 
-            // Early check: if replay identity is already committed in meta.replay_ledger, skip routing
             ReplayIdentity replayId = recordReplays.get(r);
             if (replayId != null && completedReplayIds.contains(replayId.replayId())) {
                 counts[0]++;
-                counts[2]++; // skipped
+                counts[2]++;
                 next.merge(tp, r.offset() + 1, Math::max);
                 alreadyCompletedReplays.merge(table, 1L, Long::sum);
                 continue;
@@ -591,7 +589,7 @@ public final class SinkWorker implements Runnable {
 
             if (malformedReplays.containsKey(r)) {
                 counts[0]++;
-                counts[3]++; // dead-lettered
+                counts[3]++;
                 next.merge(tp, r.offset() + 1, Math::max);
                 letters.add(new DeadLetterPublisher.DeadLetter(r, "MALFORMED_REPLAY_IDENTITY", malformedReplays.get(r)));
                 continue;

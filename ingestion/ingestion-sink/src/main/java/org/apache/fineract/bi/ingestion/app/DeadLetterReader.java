@@ -37,28 +37,6 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 
-/**
- * Reads a bounded snapshot of the Dead Letter Topic (DLT) sequentially partition-by-partition.
- *
- * <p>Scanning semantics:
- * <ul>
- *   <li><b>Sequential partition traversal:</b> Partitions are discovered and sorted in ascending order by
- *       partition number. Partitions are assigned and scanned one at a time. This guarantees deterministic
- *       traversal within each partition, but does not provide globally oldest-first ordering across partitions.</li>
- *   <li><b>Snapshot offset bounds:</b> Beginning and end offsets for all partitions are captured before scanning
- *       begins. Records appended after this snapshot are ignored.</li>
- *   <li><b>Match-limit semantics:</b> Scanning terminates when the number of records reported as matched by the
- *       visitor reaches {@link ScanOptions#maxMatches()}. Non-matching records do not consume this limit.</li>
- *   <li><b>Logical byte-budget semantics:</b> Enforced against the cumulative logical record content
- *       (key bytes, value bytes, and UTF-8 header key and value bytes) before parsing or visiting a record.
- *       If a record would exceed the remaining budget, scanning stops immediately with
- *       {@link StopReason#BYTE_BUDGET_REACHED} without parsing or visiting that record.
- *       This is a logical record-content budget, not an exact wire-level network byte counter, nor a strict
- *       bound on Kafka's internal fetch buffers.</li>
- * </ul>
- *
- * <p>The reader never commits consumer offsets or joins the sink consumer group.
- */
 public final class DeadLetterReader implements AutoCloseable {
 
     public static final long DEFAULT_MAX_BYTES = 64L * 1024 * 1024;
@@ -151,24 +129,16 @@ public final class DeadLetterReader implements AutoCloseable {
         properties.put(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG, 5 * 1024 * 1024);
         properties.putAll(config.consumerOverrides());
 
-        // A DLT inspection consumer must never commit offsets or join the sink group.
         properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
         properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");
 
         return new KafkaConsumer<>(properties, new ByteArrayDeserializer(), new ByteArrayDeserializer());
     }
 
-    /**
-     * Scans using default options and a stoppable Visitor.
-     */
     public ScanResult scan(Visitor visitor) {
         return scan(DEFAULT_OPTIONS, visitor);
     }
 
-    /**
-     * Reads a bounded snapshot of the DLT sequentially partition-by-partition.
-     * Enforces the record match limit and record-content byte budget from ScanOptions.
-     */
     public ScanResult scan(ScanOptions options, Visitor visitor) {
         Objects.requireNonNull(options, "options");
         Objects.requireNonNull(visitor, "visitor");

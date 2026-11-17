@@ -33,13 +33,6 @@ public interface BatchWriter {
         }
     }
 
-    /**
-     * Point-in-time warehouse preflight staging and apply simulation result.
-     * <p>
-     * NOTE: The outcomes in {@link #predictedOutcomes()} are point-in-time predictions evaluated
-     * inside a preflight transaction that is unconditionally rolled back. They are NOT committed
-     * warehouse outcomes.
-     */
     record PreflightResult(List<WarehouseWriter.Applied> applied, Map<ReplayIdentity, ReplayOutcome> predictedOutcomes) {
         public PreflightResult {
             applied = applied == null ? List.of() : List.copyOf(applied);

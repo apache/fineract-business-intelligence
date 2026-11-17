@@ -269,7 +269,6 @@ public class DeadLetterRecordTest {
     @Test
     public void parsesRecordWithMalformedReplayHeadersWithoutFailingInspection() {
         RecordHeaders headers = validHeaders();
-        // Incomplete replay header (only topic, missing partition and offset)
         headers.add("fbi.replay.dlt.topic", bytes("orig.dlt"));
 
         DeadLetterRecord record = parse(headers, bytes("{}"));

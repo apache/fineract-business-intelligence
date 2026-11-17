@@ -107,7 +107,6 @@ public class DeadLetterReaderTest {
             consumer.addRecord(record(1, 20L, "bank-b", 200L));
             consumer.addRecord(record(1, 21L, "bank-c", 201L));
 
-            // This record is beyond the captured end offset and must be ignored.
             consumer.addRecord(record(1, 22L, "bank-d", 202L));
         });
 
@@ -143,7 +142,6 @@ public class DeadLetterReaderTest {
         TopicPartition p1 = new TopicPartition(DLT, 1);
         TopicPartition p2 = new TopicPartition(DLT, 2);
 
-        // Metadata returned in non-ascending order: 2, 0, 1
         consumer.updatePartitions(DLT, List.of(
                 new PartitionInfo(DLT, 2, null, null, null),
                 new PartitionInfo(DLT, 0, null, null, null),
@@ -152,7 +150,6 @@ public class DeadLetterReaderTest {
         consumer.updateBeginningOffsets(Map.of(p0, 0L, p1, 0L, p2, 0L));
         consumer.updateEndOffsets(Map.of(p0, 1L, p1, 1L, p2, 1L));
 
-        // Tasks executed in sequential partition order (0, then 1, then 2)
         consumer.schedulePollTask(() -> consumer.addRecord(record(0, 0L, "bank-0", 100L)));
         consumer.schedulePollTask(() -> consumer.addRecord(record(1, 0L, "bank-1", 150L)));
         consumer.schedulePollTask(() -> consumer.addRecord(record(2, 0L, "bank-2", 200L)));
@@ -254,7 +251,6 @@ public class DeadLetterReaderTest {
             assertThat(visited.get(0).dltPartition()).isEqualTo(0);
             assertThat(visited.get(0).dltOffset()).isEqualTo(0L);
 
-            // Verify later partition 1 was never assigned or visited
             assertThat(consumer.assignment()).doesNotContain(p1);
         }
     }
@@ -285,7 +281,6 @@ public class DeadLetterReaderTest {
         });
 
         List<DeadLetterRecord> matched = new ArrayList<>();
-        // Max 2 matches allowed
         DeadLetterReader.ScanOptions options = new DeadLetterReader.ScanOptions(2, DeadLetterReader.DEFAULT_MAX_BYTES);
 
         try (DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT)) {
@@ -299,7 +294,7 @@ public class DeadLetterReaderTest {
             });
 
             assertThat(result.stopReason()).isEqualTo(DeadLetterReader.StopReason.RECORD_LIMIT_REACHED);
-            assertThat(result.recordsScanned()).isEqualTo(4); // skip-1, skip-2, match-1, match-2
+            assertThat(result.recordsScanned()).isEqualTo(4);
             assertThat(result.recordsMatched()).isEqualTo(2);
             assertThat(matched).hasSize(2);
             assertThat(matched).extracting(DeadLetterRecord::sourceId).containsExactly("match-1", "match-2");
@@ -332,7 +327,6 @@ public class DeadLetterReaderTest {
         });
 
         List<DeadLetterRecord> visited = new ArrayList<>();
-        // Set maxBytes exactly equal to r1Bytes so r2 cannot fit
         DeadLetterReader.ScanOptions options = new DeadLetterReader.ScanOptions(Long.MAX_VALUE, r1Bytes);
 
         try (DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT)) {
@@ -347,7 +341,6 @@ public class DeadLetterReaderTest {
             assertThat(visited).hasSize(1);
             assertThat(visited.get(0).dltOffset()).isEqualTo(0L);
 
-            // Partition 1 was never assigned
             assertThat(consumer.assignment()).doesNotContain(p1);
         }
     }
@@ -366,7 +359,6 @@ public class DeadLetterReaderTest {
         consumer.updateEndOffsets(Map.of(p0, 2L));
 
         ConsumerRecord<byte[], byte[]> r1 = record(0, 0L, "bank-valid", 100L);
-        // r2 has broken payload that would throw during parsing if DeadLetterRecord.parse was invoked
         ConsumerRecord<byte[], byte[]> r2 = new ConsumerRecord<>(DLT, 0, 1L, null, bytes("{invalid_json_payload"));
         r2.headers().add("fbi.dlt.reason", bytes("UNKNOWN"));
 
@@ -459,7 +451,6 @@ public class DeadLetterReaderTest {
         try (DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT)) {
             DeadLetterReader.ScanResult result = reader.scan(record -> {
                 visited.add(record);
-                // Visitor requests immediate stop after first record
                 return new DeadLetterReader.VisitResult(true, true);
             });
 
@@ -482,7 +473,7 @@ public class DeadLetterReaderTest {
                 new PartitionInfo(DLT, 0, null, null, null)));
 
         consumer.updateBeginningOffsets(Map.of(p0, 10L));
-        consumer.updateEndOffsets(Map.of(p0, 11L)); // Captured end is 11
+        consumer.updateEndOffsets(Map.of(p0, 11L));
 
         consumer.schedulePollTask(() -> {
             consumer.addRecord(record(0, 10L, "bank-within", 100L));

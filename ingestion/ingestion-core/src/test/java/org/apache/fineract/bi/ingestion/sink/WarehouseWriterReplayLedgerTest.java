@@ -419,7 +419,6 @@ public class WarehouseWriterReplayLedgerTest {
         assertThat(inserted.dltTopic).isEqualTo("fineract.cdc.dlt");
         assertThat(inserted.dltPartition).isEqualTo(2);
         assertThat(inserted.dltOffset).isEqualTo(75L);
-        // Requirement 4: source_id and table_name taken directly from RoutedEvent
         assertThat(inserted.sourceId).isEqualTo("bank-xyz");
         assertThat(inserted.tableName).isEqualTo("batch_job_instance");
     }
@@ -439,7 +438,6 @@ public class WarehouseWriterReplayLedgerTest {
         assertThat(completed).contains(queryId);
         assertThat(db.selectQueries).contains(completedUuid);
 
-        // Attempting to claim the completed UUID fails (conflict, returns empty set)
         RoutedEvent event = createReplayEvent("bank-a", "batch_job_instance", "11", queryId);
         Set<ReplayIdentity> claimed = WarehouseWriter.claimReplays(c, List.of(event));
         assertThat(claimed).isEmpty();
@@ -461,7 +459,7 @@ public class WarehouseWriterReplayLedgerTest {
 
         assertThat(claimed).hasSize(1);
         assertThat(claimed).contains(id1);
-        assertThat(claimed).contains(id2); // UUID equality ensures id2 matches
+        assertThat(claimed).contains(id2);
         assertThat(db.insertExecutionCount.get()).isEqualTo(1);
         assertThat(db.insertedParams).hasSize(1);
         assertThat(db.insertedParams.get(0).replayId).isEqualTo(sharedUuid);
@@ -482,18 +480,15 @@ public class WarehouseWriterReplayLedgerTest {
                 .isInstanceOf(SQLException.class);
 
         assertThat(db.rollbackCount.get()).isEqualTo(1);
-        // Uncommitted ledger entry must be rolled back
         assertThat(db.committedLedger).doesNotContainKey(retryUuid);
         assertThat(db.txLedger).isEmpty();
 
-        // Retry with same replay UUID
         db.failStaging.set(false);
         RoutedEvent fixedEvent = createReplayEvent("bank-a", "batch_job_instance", "1", id);
 
         writer.write(c, List.of(fixedEvent), List.of(), "test-group", List.of());
 
         assertThat(db.commitCount.get()).isEqualTo(1);
-        // Ledger entry is now committed
         assertThat(db.committedLedger).containsKey(retryUuid);
         assertThat(db.committedLedger.get(retryUuid).sourceId).isEqualTo("bank-a");
     }
@@ -513,7 +508,6 @@ public class WarehouseWriterReplayLedgerTest {
         writer.write(c, List.of(ordinaryEvent), List.of(), "test-group", List.of());
 
         assertThat(db.commitCount.get()).isEqualTo(1);
-        // Ledger was never touched
         assertThat(db.insertExecutionCount.get()).isZero();
         assertThat(db.selectQueries).isEmpty();
         assertThat(db.committedLedger).isEmpty();
@@ -529,7 +523,6 @@ public class WarehouseWriterReplayLedgerTest {
         ReplayIdentity id = new ReplayIdentity(unresolvedUuid, "fineract.cdc.dlt", 0, 50L);
         RoutedEvent event = createReplayEvent("bank-a", "batch_job_instance", "1", id);
 
-        // Simulate that outcome remained CLAIMED
         db.outcomeOverrides.put(unresolvedUuid, ReplayOutcome.CLAIMED);
 
         assertThatThrownBy(() -> writer.write(c, List.of(event), List.of(), "test-group", List.of()))
@@ -556,7 +549,6 @@ public class WarehouseWriterReplayLedgerTest {
         assertThat(result.predictedOutcomes()).containsEntry(id, ReplayOutcome.APPLIED);
         assertThat(result.applied()).isNotEmpty();
 
-        // Rolled back, never committed
         assertThat(db.rollbackCount.get()).isEqualTo(1);
         assertThat(db.commitCount.get()).isZero();
         assertThat(db.txLedger).isEmpty();
@@ -672,7 +664,6 @@ public class WarehouseWriterReplayLedgerTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Connection must have autoCommit enabled before entering preflight");
 
-        // Staging was not executed, rollback was not executed, transaction state unchanged
         assertThat(db.rollbackCount.get()).isZero();
         assertThat(db.commitCount.get()).isZero();
         assertThat(c.getAutoCommit()).isFalse();

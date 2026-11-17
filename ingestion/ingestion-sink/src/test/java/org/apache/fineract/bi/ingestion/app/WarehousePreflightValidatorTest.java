@@ -143,7 +143,7 @@ public class WarehousePreflightValidatorTest {
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
 
         RecordHeaders h = headers("batch_job_instance");
-        h.add("fbi.replay.dlt.topic", bytes("orig.dlt")); // Incomplete! Missing partition and offset
+        h.add("fbi.replay.dlt.topic", bytes("orig.dlt"));
 
         byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
         DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
@@ -318,7 +318,6 @@ public class WarehousePreflightValidatorTest {
         assertThat(shadowResult.passed()).isTrue();
         assertThat(shadowResult.routedEvent().route().target()).isEqualTo(Route.Target.SHADOW);
 
-        // Preflight writer should not have been called for route validation only
         assertThat(writer.preflightCalled).isFalse();
     }
 
@@ -369,7 +368,6 @@ public class WarehousePreflightValidatorTest {
                 .hasMessageContaining("rollback exploded")
                 .hasCause(cause);
 
-        // Also test through validate()
         assertThatThrownBy(() -> validator.validate(mockConnection(), ownership("bank-a", "batch_job_instance", Route.Target.PROD), record))
                 .isInstanceOf(PreflightRollbackException.class)
                 .hasMessageContaining("rollback exploded");
@@ -395,7 +393,6 @@ public class WarehousePreflightValidatorTest {
                 .hasMessageContaining("Failed to initialize connection transaction state")
                 .hasCause(cause);
 
-        // Also test through validate()
         assertThatThrownBy(() -> validator.validate(mockConnection(), ownership("bank-a", "batch_job_instance", Route.Target.PROD), record))
                 .isInstanceOf(PreflightRollbackException.class)
                 .hasMessageContaining("Failed to initialize connection transaction state")

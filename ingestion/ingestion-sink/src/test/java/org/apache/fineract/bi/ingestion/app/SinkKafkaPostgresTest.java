@@ -446,7 +446,6 @@ public class SinkKafkaPostgresTest {
         ReplayIdentity replayId = new ReplayIdentity(replayUuid, DLT, 0, 5555L);
         WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
 
-        // 1. Rejected event with bad data (overflows bigint)
         ChangeEvent badEvent = new ChangeEvent(
                 SOURCE, TABLE, ChangeEvent.Op.UPSERT,
                 new String[] {"99999999999999999999999999999999999999999999999999", "bad_job", "bad_key"},
@@ -458,7 +457,6 @@ public class SinkKafkaPostgresTest {
                     .isInstanceOf(SQLException.class);
         }
 
-        // Verify replay receipt was rolled back
         try (Connection c = postgres.createConnection("");
                 PreparedStatement ps = c.prepareStatement("SELECT count(*) FROM meta.replay_ledger WHERE replay_id = ?")) {
             ps.setObject(1, replayUuid);
@@ -469,7 +467,6 @@ public class SinkKafkaPostgresTest {
         }
         assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = 99999999999999999999999999999999999999999999999999")).isZero();
 
-        // 2. Retry with corrected event and SAME replay identity
         ChangeEvent goodEvent = new ChangeEvent(
                 SOURCE, TABLE, ChangeEvent.Op.UPSERT,
                 new String[] {"55555", "fixed_job", "fixed_key"},
@@ -480,7 +477,6 @@ public class SinkKafkaPostgresTest {
             writer.write(c, List.of(goodRouted), List.of(), "g-rb-test", List.of());
         }
 
-        // Verify receipt committed and warehouse mutations applied
         try (Connection c = postgres.createConnection("");
                 PreparedStatement ps = c.prepareStatement(
                         "SELECT dlt_topic, dlt_partition, dlt_offset, source_id, table_name, outcome FROM meta.replay_ledger WHERE replay_id = ?")) {
@@ -589,7 +585,6 @@ public class SinkKafkaPostgresTest {
         ReplayIdentity replayId = new ReplayIdentity(DLT, 0, 7777L);
 
         try (Running sink = new Running("g-seq-replay", "w-seq", true)) {
-            // First replay
             ProducerRecord<byte[], byte[]> pr1 = new ProducerRecord<>(TOPIC, 0, null, event(eventId).getBytes(StandardCharsets.UTF_8));
             ReplayIdentityHeaders.add(pr1.headers(), replayId);
             producer.send(pr1).get();
@@ -599,14 +594,12 @@ public class SinkKafkaPostgresTest {
             await("stored offset exists", () -> storedOffsets("g-seq-replay") >= 1);
             long off1 = storedOffsets("g-seq-replay");
 
-            // Duplicate replay with SAME replay identity
             ProducerRecord<byte[], byte[]> pr2 = new ProducerRecord<>(TOPIC, 0, null, event(eventId).getBytes(StandardCharsets.UTF_8));
             ReplayIdentityHeaders.add(pr2.headers(), replayId);
             producer.send(pr2).get();
 
             await("offset advanced past duplicate", () -> storedOffsets("g-seq-replay") == off1 + 1);
 
-            // Verify row count did not duplicate
             assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + eventId)).isEqualTo(1L);
             assertThat(scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_offset = 7777")).isEqualTo(1L);
         }
@@ -615,7 +608,6 @@ public class SinkKafkaPostgresTest {
     @Test(dependsOnMethods = "sequentialDuplicateReplayAdvancesKafkaOffsetsWithoutDoubleApplying")
     public void replayIdentitySurvivesMultipleDltCyclesWithKeyAndPartitionPreserved() throws Exception {
         try (Running sink = new Running("g-dlt-cycle", "w-cycle", true)) {
-            // 1. Poison event to partition 1 with Kafka key
             byte[] key = "test-key-cycle".getBytes(StandardCharsets.UTF_8);
             producer.send(new ProducerRecord<>(TOPIC, 1, key, "{not_valid_json_cycle_1".getBytes(StandardCharsets.UTF_8))).get();
 
@@ -628,7 +620,6 @@ public class SinkKafkaPostgresTest {
 
             ReplayIdentity replayId = new ReplayIdentity(DLT, dlt1.partition(), dlt1.offset());
 
-            // 2. Replay with original key, partition 1, and replay identity headers, but still poison
             ProducerRecord<byte[], byte[]> pr2 = new ProducerRecord<>(TOPIC, 1, key, "{not_valid_json_cycle_2".getBytes(StandardCharsets.UTF_8));
             ReplayIdentityHeaders.add(pr2.headers(), replayId);
             producer.send(pr2).get();
@@ -653,7 +644,6 @@ public class SinkKafkaPostgresTest {
                 + "\"source\":{\"name\":\"" + unregSource + "\",\"table\":\"" + TABLE + "\",\"lsn\":8001,\"ts_ms\":1767261600000},\"op\":\"c\"}";
 
         try (Running sink = new Running("g-cmd-replay", "w-cmd", true)) {
-            // Produce event with unregistered source; sink will dead-letter it with UNKNOWN_SOURCE
             org.apache.kafka.clients.producer.RecordMetadata rm = producer.send(
                     new ProducerRecord<>(TOPIC, 0, "k-cmd".getBytes(StandardCharsets.UTF_8), json.getBytes(StandardCharsets.UTF_8))).get();
             long origOffset = rm.offset();
@@ -672,7 +662,6 @@ public class SinkKafkaPostgresTest {
             env.put("SINK_DLT_TOPIC", DLT);
             SinkConfig cmdConfig = SinkConfig.from(Env.of(env), env);
 
-            // Preflight dry-run should detect preflight failure because source is unregistered
             DeadLetterReplayCommand.run(cmdConfig, contract, new String[] {
                     "--reason=UNKNOWN_SOURCE",
                     "--source=" + unregSource,
@@ -681,12 +670,10 @@ public class SinkKafkaPostgresTest {
                     "--dry-run"
             });
 
-            // Register the source now
             update("INSERT INTO meta.source_registry (source_id, tenant_id, lifecycle_state) VALUES ('" + unregSource + "', 'tenant-cmd', 'ACTIVE')");
             update("INSERT INTO meta.ingestion_ownership (source_id, table_name, engine) VALUES ('" + unregSource + "', '" + TABLE + "', 'KAFKA')");
             sink.ownership.refresh(true);
 
-            // Now run live dlt-replay
             DeadLetterReplayCommand.run(cmdConfig, contract, new String[] {
                     "--reason=UNKNOWN_SOURCE",
                     "--source=" + unregSource,
@@ -695,7 +682,6 @@ public class SinkKafkaPostgresTest {
                     "--execute"
             });
 
-            // Sink consumes the replayed event and writes to warehouse
             await("replayed row in warehouse", () -> scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + cmdJobId) == 1L);
             await("replay receipt in ledger", () -> scalar("SELECT count(*) FROM meta.replay_ledger WHERE dlt_offset = " + dltOffset) == 1L);
         }
@@ -708,7 +694,6 @@ public class SinkKafkaPostgresTest {
         WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
 
         long entityId = 123450L;
-        // 1. Initial base row at LSN 1000
         ChangeEvent baseEvent = new ChangeEvent(
                 SOURCE, TABLE, ChangeEvent.Op.UPSERT,
                 new String[] {String.valueOf(entityId), "job_initial", "key_initial"},
@@ -717,7 +702,6 @@ public class SinkKafkaPostgresTest {
             writer.write(c, List.of(new RoutedEvent(baseEvent, route, null)), List.of(), "g-outcome-test", List.of());
         }
 
-        // 2. Replay with newer LSN (1100) -> APPLIED
         UUID replayAppliedUuid = UUID.randomUUID();
         ReplayIdentity replayAppliedId = new ReplayIdentity(replayAppliedUuid, DLT, 0, 1100L);
         ChangeEvent appliedEvent = new ChangeEvent(
@@ -730,7 +714,6 @@ public class SinkKafkaPostgresTest {
         }
         assertThat(queryLedgerOutcome(replayAppliedUuid)).isEqualTo("APPLIED");
 
-        // 3. Replay with older LSN (900) -> SKIPPED_STALE
         UUID replayStaleUuid = UUID.randomUUID();
         ReplayIdentity replayStaleId = new ReplayIdentity(replayStaleUuid, DLT, 0, 900L);
         ChangeEvent staleEvent = new ChangeEvent(
@@ -742,7 +725,6 @@ public class SinkKafkaPostgresTest {
             assertThat(res.replayOutcomes().get(replayStaleId)).isEqualTo(ReplayOutcome.SKIPPED_STALE);
         }
         assertThat(queryLedgerOutcome(replayStaleUuid)).isEqualTo("SKIPPED_STALE");
-        // Verify warehouse raw row still contains LSN 1100 values
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT job_name, _is_deleted FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityId)) {
@@ -751,7 +733,6 @@ public class SinkKafkaPostgresTest {
             assertThat(rs.getBoolean(2)).isFalse();
         }
 
-        // 4. Stale delete at LSN 800 -> SKIPPED_STALE
         UUID staleDeleteUuid = UUID.randomUUID();
         ReplayIdentity staleDeleteId = new ReplayIdentity(staleDeleteUuid, DLT, 0, 800L);
         ChangeEvent staleDeleteEvent = new ChangeEvent(
@@ -765,7 +746,6 @@ public class SinkKafkaPostgresTest {
         assertThat(queryLedgerOutcome(staleDeleteUuid)).isEqualTo("SKIPPED_STALE");
         assertThat(scalar("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityId + " AND _is_deleted = false")).isEqualTo(1L);
 
-        // 5. Fresh delete at LSN 1200 -> APPLIED
         UUID freshDeleteUuid = UUID.randomUUID();
         ReplayIdentity freshDeleteId = new ReplayIdentity(freshDeleteUuid, DLT, 0, 1200L);
         ChangeEvent freshDeleteEvent = new ChangeEvent(
@@ -828,7 +808,6 @@ public class SinkKafkaPostgresTest {
         WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
 
         long entityId = 345670L;
-        // Event 1: has full job_name and job_key available
         UUID contributingUuid = UUID.randomUUID();
         ReplayIdentity contributingId = new ReplayIdentity(contributingUuid, DLT, 0, 3001L);
         ChangeEvent contribEvent = new ChangeEvent(
@@ -836,7 +815,6 @@ public class SinkKafkaPostgresTest {
                 new String[] {String.valueOf(entityId), "name_toast_contributed", "key_orig"},
                 List.of(), 3001L, System.currentTimeMillis() * 1000L);
 
-        // Event 2: newer LSN (3002), but job_name is unavailable (TOAST); job_key is updated
         UUID newerToastUuid = UUID.randomUUID();
         ReplayIdentity newerToastId = new ReplayIdentity(newerToastUuid, DLT, 0, 3002L);
         ChangeEvent toastEvent = new ChangeEvent(
@@ -848,7 +826,6 @@ public class SinkKafkaPostgresTest {
             BatchWriter.WriteResult res = writer.write(c,
                     List.of(new RoutedEvent(contribEvent, route, contributingId), new RoutedEvent(toastEvent, route, newerToastId)),
                     List.of(), "g-toast-merge", List.of());
-            // Contributing row must NOT be marked superseded: its job_name was applied
             assertThat(res.replayOutcomes().get(contributingId)).isEqualTo(ReplayOutcome.APPLIED);
             assertThat(res.replayOutcomes().get(newerToastId)).isEqualTo(ReplayOutcome.APPLIED);
         }
@@ -881,7 +858,6 @@ public class SinkKafkaPostgresTest {
                 assertThat(rs.next()).isTrue();
                 stage = rs.getString(1);
             }
-            // Python explicit COPY column list without _replay_id
             String copySql = "COPY pg_temp.\"" + stage + "\" (source_id, tenant_id, \"job_instance_id\", \"job_name\", \"job_key\", "
                     + "_source_generation, _source_lsn, _source_ts, _op, _unavailable, _owner_epoch, _target) FROM STDIN WITH (FORMAT csv)";
             String csvRow = "\"" + pySource + "\",\"tenant-py\"," + pyJobId + ",\"py_job\",\"py_key\",0,9999,\"2026-01-01T00:00:00Z\",u,,1,prod\n";
@@ -908,14 +884,12 @@ public class SinkKafkaPostgresTest {
         Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
         long entityId = 678910L;
 
-        // 1. Seed entity at LSN 200
         update("INSERT INTO raw.raw_" + TABLE + " (source_id, tenant_id, job_instance_id, job_name, job_key, _source_generation, _source_lsn, _source_ts, _ingested_at, _ingest_engine, _is_deleted) "
                 + "VALUES ('" + SOURCE + "', 'tenant-a', " + entityId + ", 'job_lsn200', 'key_lsn200', 0, 200, NOW(), NOW(), 'KAFKA', false)");
 
         CountDownLatch tx1UpdatedLatch = new CountDownLatch(1);
         CountDownLatch tx1CommitLatch = new CountDownLatch(1);
 
-        // Transaction 1: updates entity to LSN 300 with a delayed commit
         CompletableFuture<Void> tx1Future = CompletableFuture.runAsync(() -> {
             try (Connection c1 = engineSource.getConnection()) {
                 c1.setAutoCommit(false);
@@ -929,7 +903,6 @@ public class SinkKafkaPostgresTest {
                     assertThat(updated).isEqualTo(1);
                 }
                 tx1UpdatedLatch.countDown();
-                // Hold lock until signaled to commit
                 assertThat(tx1CommitLatch.await(30, TimeUnit.SECONDS)).isTrue();
                 c1.commit();
             } catch (Exception e) {
@@ -937,10 +910,8 @@ public class SinkKafkaPostgresTest {
             }
         });
 
-        // Wait until Tx1 has executed its update and acquired the row lock
         assertThat(tx1UpdatedLatch.await(10, TimeUnit.SECONDS)).isTrue();
 
-        // Transaction 2: replay at LSN 100 from separate connection executes UPSERT and waits on row lock
         UUID replayUuid = UUID.randomUUID();
         ReplayIdentity replayId = new ReplayIdentity(replayUuid, DLT, 0, 100L);
         ChangeEvent replayEvent = new ChangeEvent(
@@ -971,27 +942,21 @@ public class SinkKafkaPostgresTest {
             }
         });
 
-        // Wait until Tx2 has obtained its connection and captured its backend PID
         assertThat(tx2PidCapturedLatch.await(10, TimeUnit.SECONDS))
                 .as("Transaction 2 should capture its backend PID").isTrue();
         long tx2Pid = tx2PidHolder.get();
 
-        // Deterministically verify Tx2 is blocked waiting on the row lock specifically for its backend PID
         await("Transaction 2 (pid " + tx2Pid + ") waiting on ungranted row lock in pg_locks", () ->
                 scalar("SELECT count(*) FROM pg_locks WHERE NOT granted AND pid = " + tx2Pid) > 0);
 
-        // Commit Transaction 1
         tx1CommitLatch.countDown();
         tx1Future.get(15, TimeUnit.SECONDS);
 
-        // Transaction 2 resumes and finishes
         BatchWriter.WriteResult res = tx2Future.get(15, TimeUnit.SECONDS);
 
-        // Transaction 2 was recorded as SKIPPED_STALE
         assertThat(res.replayOutcomes().get(replayId)).isEqualTo(ReplayOutcome.SKIPPED_STALE);
         assertThat(queryLedgerOutcome(replayUuid)).isEqualTo("SKIPPED_STALE");
 
-        // Verify warehouse LSN 300 remains intact
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT job_name, job_key, _source_lsn FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityId)) {
@@ -1009,11 +974,9 @@ public class SinkKafkaPostgresTest {
         WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
 
         long entityId = 789012L;
-        // Seed an existing warehouse row containing newer values and LSN 5000
         update("INSERT INTO raw.raw_" + TABLE + " (source_id, tenant_id, job_instance_id, job_name, job_key, _source_generation, _source_lsn, _source_ts, _ingested_at, _ingest_engine, _is_deleted) "
                 + "VALUES ('" + SOURCE + "', 'tenant-a', " + entityId + ", 'job_newer_5000', 'key_newer_5000', 0, 5000, NOW(), NOW(), 'KAFKA', false)");
 
-        // 1. Replay 1 (older non-contributing candidate LSN 4000)
         UUID olderNonContribUuid = UUID.randomUUID();
         ReplayIdentity olderNonContribId = new ReplayIdentity(olderNonContribUuid, DLT, 0, 4000L);
         ChangeEvent olderNonContribEvent = new ChangeEvent(
@@ -1021,7 +984,6 @@ public class SinkKafkaPostgresTest {
                 new String[] {String.valueOf(entityId), "job_older_unused", "key_older_unused"},
                 List.of(), 4000L, System.currentTimeMillis() * 1000L);
 
-        // 2. Replay 2 (contributes job_name, LSN 4001; job_key is unavailable/TOAST)
         UUID contrib1Uuid = UUID.randomUUID();
         ReplayIdentity contrib1Id = new ReplayIdentity(contrib1Uuid, DLT, 0, 4001L);
         ChangeEvent contrib1Event = new ChangeEvent(
@@ -1029,7 +991,6 @@ public class SinkKafkaPostgresTest {
                 new String[] {String.valueOf(entityId), "job_contributed_name", null},
                 List.of("job_key"), 4001L, System.currentTimeMillis() * 1000L);
 
-        // 3. Replay 3 (contributes job_key, candidate LSN 4002; job_name is unavailable/TOAST)
         UUID contrib2Uuid = UUID.randomUUID();
         ReplayIdentity contrib2Id = new ReplayIdentity(contrib2Uuid, DLT, 0, 4002L);
         ChangeEvent contrib2Event = new ChangeEvent(
@@ -1045,19 +1006,15 @@ public class SinkKafkaPostgresTest {
                             new RoutedEvent(contrib2Event, route, contrib2Id)),
                     List.of(), "g-toast-stale", List.of());
 
-            // Both contributing replay IDs are recorded as SKIPPED_STALE
             assertThat(res.replayOutcomes().get(contrib1Id)).isEqualTo(ReplayOutcome.SKIPPED_STALE);
             assertThat(res.replayOutcomes().get(contrib2Id)).isEqualTo(ReplayOutcome.SKIPPED_STALE);
-            // Non-contributing replay ID is SKIPPED_SUPERSEDED
             assertThat(res.replayOutcomes().get(olderNonContribId)).isEqualTo(ReplayOutcome.SKIPPED_SUPERSEDED);
         }
 
-        // Ledger verification
         assertThat(queryLedgerOutcome(contrib1Uuid)).isEqualTo("SKIPPED_STALE");
         assertThat(queryLedgerOutcome(contrib2Uuid)).isEqualTo("SKIPPED_STALE");
         assertThat(queryLedgerOutcome(olderNonContribUuid)).isEqualTo("SKIPPED_SUPERSEDED");
 
-        // No replay identity remains CLAIMED
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT count(*) FROM meta.replay_ledger WHERE outcome = 'CLAIMED'")) {
@@ -1065,7 +1022,6 @@ public class SinkKafkaPostgresTest {
             assertThat(rs.getLong(1)).isZero();
         }
 
-        // Existing newer warehouse values and LSN remain unchanged
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT job_name, job_key, _source_lsn FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityId)) {
@@ -1085,11 +1041,9 @@ public class SinkKafkaPostgresTest {
         WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
 
         long execId = 890124L;
-        // Seed an existing warehouse row with newer LSN 6000
         update("INSERT INTO raw.raw_" + execTable + " (source_id, tenant_id, job_execution_id, job_instance_id, status, exit_code, _source_generation, _source_lsn, _source_ts, _ingested_at, _ingest_engine, _is_deleted) "
                 + "VALUES ('" + SOURCE + "', 'tenant-a', " + execId + ", 1, 'EXISTING_STATUS', '0', 0, 6000, NOW(), NOW(), 'KAFKA', false)");
 
-        // 1. Replay 1 (older non-contributing LSN 4500)
         UUID olderNonContribUuid = UUID.randomUUID();
         ReplayIdentity olderNonContribId = new ReplayIdentity(olderNonContribUuid, DLT, 0, 4500L);
         ChangeEvent olderNonContribEvent = new ChangeEvent(
@@ -1098,7 +1052,6 @@ public class SinkKafkaPostgresTest {
                 List.of("start_time", "end_time", "exit_message", "created_on_utc", "last_modified_on_utc"),
                 4500L, System.currentTimeMillis() * 1000L);
 
-        // 2. Replay 2 (contributes status, LSN 4501; exit_code and other columns unavailable)
         UUID contrib1Uuid = UUID.randomUUID();
         ReplayIdentity contrib1Id = new ReplayIdentity(contrib1Uuid, DLT, 0, 4501L);
         ChangeEvent contrib1Event = new ChangeEvent(
@@ -1107,8 +1060,6 @@ public class SinkKafkaPostgresTest {
                 List.of("exit_code", "start_time", "end_time", "exit_message", "created_on_utc", "last_modified_on_utc"),
                 4501L, System.currentTimeMillis() * 1000L);
 
-        // 3. Replay 3 (contributes exit_code, candidate LSN 4502; status and other columns unavailable)
-        // Notice: start_time, end_time, etc. remain unavailable after merge (cardinality(_unavailable) > 0)
         UUID contrib2Uuid = UUID.randomUUID();
         ReplayIdentity contrib2Id = new ReplayIdentity(contrib2Uuid, DLT, 0, 4502L);
         ChangeEvent contrib2Event = new ChangeEvent(
@@ -1125,19 +1076,15 @@ public class SinkKafkaPostgresTest {
                             new RoutedEvent(contrib2Event, route, contrib2Id)),
                     List.of(), "g-toast-partial-stale", List.of());
 
-            // Both contributing replay IDs are recorded as SKIPPED_STALE (via upd_stale_unavail)
             assertThat(res.replayOutcomes().get(contrib1Id)).isEqualTo(ReplayOutcome.SKIPPED_STALE);
             assertThat(res.replayOutcomes().get(contrib2Id)).isEqualTo(ReplayOutcome.SKIPPED_STALE);
-            // Non-contributing replay ID is SKIPPED_SUPERSEDED
             assertThat(res.replayOutcomes().get(olderNonContribId)).isEqualTo(ReplayOutcome.SKIPPED_SUPERSEDED);
         }
 
-        // Ledger verification
         assertThat(queryLedgerOutcome(contrib1Uuid)).isEqualTo("SKIPPED_STALE");
         assertThat(queryLedgerOutcome(contrib2Uuid)).isEqualTo("SKIPPED_STALE");
         assertThat(queryLedgerOutcome(olderNonContribUuid)).isEqualTo("SKIPPED_SUPERSEDED");
 
-        // No replay identity remains CLAIMED
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT count(*) FROM meta.replay_ledger WHERE outcome = 'CLAIMED'")) {
@@ -1145,7 +1092,6 @@ public class SinkKafkaPostgresTest {
             assertThat(rs.getLong(1)).isZero();
         }
 
-        // Existing newer warehouse values and LSN remain unchanged
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT status, exit_code, _source_lsn FROM raw.raw_" + execTable + " WHERE job_execution_id = " + execId)) {
@@ -1162,7 +1108,6 @@ public class SinkKafkaPostgresTest {
         long epoch = scalar("SELECT epoch FROM meta.ingestion_ownership WHERE source_id = '" + SOURCE + "' AND table_name = '" + TABLE + "'");
         Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
 
-        // 1. Seed existing row in warehouse at LSN 500 for id 9101
         long idStaleEntity = 9101L;
         update("INSERT INTO raw.raw_" + TABLE
                 + " (source_id, tenant_id, job_instance_id, job_name, job_key, _source_generation, _source_lsn, _source_ts, _ingested_at, _ingest_engine, _is_deleted) "
@@ -1173,9 +1118,8 @@ public class SinkKafkaPostgresTest {
         ReplayIdentity idStale = new ReplayIdentity(uuidStale, DLT, 0, 5001L);
         ChangeEvent eventStale = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
                 new String[] {String.valueOf(idStaleEntity), "stale-job", "stale-key"},
-                List.of(), 200L, System.currentTimeMillis() * 1000L); // Older LSN 200 vs 500
+                List.of(), 200L, System.currentTimeMillis() * 1000L);
 
-        // 2. Intra-batch deduplication for new entity 9102 (older LSN 100, newer LSN 200)
         long idDedupEntity = 9102L;
         UUID uuidOlder = UUID.randomUUID();
         ReplayIdentity idOlder = new ReplayIdentity(uuidOlder, DLT, 0, 5002L);
@@ -1189,7 +1133,6 @@ public class SinkKafkaPostgresTest {
                 new String[] {String.valueOf(idDedupEntity), "newer-job", "newer-key"},
                 List.of(), 200L, System.currentTimeMillis() * 1000L);
 
-        // Run preflight
         BatchWriter.PreflightResult res;
         try (Connection c = engineSource.getConnection()) {
             c.setAutoCommit(true);
@@ -1201,17 +1144,14 @@ public class SinkKafkaPostgresTest {
             assertThat(c.getAutoCommit()).isTrue();
         }
 
-        // Verify predicted outcomes
         assertThat(res.predictedOutcomes()).containsEntry(idStale, ReplayOutcome.SKIPPED_STALE);
         assertThat(res.predictedOutcomes()).containsEntry(idNewer, ReplayOutcome.APPLIED);
         assertThat(res.predictedOutcomes()).containsEntry(idOlder, ReplayOutcome.SKIPPED_SUPERSEDED);
 
-        // Verify zero transient ledger claims remain in meta.replay_ledger after rollback
         assertThat(queryLedgerOutcome(uuidStale)).isNull();
         assertThat(queryLedgerOutcome(uuidNewer)).isNull();
         assertThat(queryLedgerOutcome(uuidOlder)).isNull();
 
-        // Verify target table state: new entity was NOT committed
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + idDedupEntity)) {
@@ -1219,7 +1159,6 @@ public class SinkKafkaPostgresTest {
             assertThat(rs.getLong(1)).isZero();
         }
 
-        // Verify existing entity was NOT mutated by stale replay
         try (Connection c = postgres.createConnection("");
              Statement s = c.createStatement();
              ResultSet rs = s.executeQuery("SELECT job_name, _source_lsn FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + idStaleEntity)) {
@@ -1237,7 +1176,6 @@ public class SinkKafkaPostgresTest {
 
         UUID failUuid = UUID.randomUUID();
         ReplayIdentity failId = new ReplayIdentity(failUuid, DLT, 0, 5010L);
-        // Invalid non-numeric input for bigint column job_instance_id
         ChangeEvent poisonEvent = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
                 new String[] {"INVALID_NON_NUMERIC_ID", "fail-job", "fail-key"},
                 List.of(), 100L, System.currentTimeMillis() * 1000L);
@@ -1250,7 +1188,6 @@ public class SinkKafkaPostgresTest {
             assertThat(c.getAutoCommit()).isTrue();
         }
 
-        // Transient ledger claim must be rolled back
         assertThat(queryLedgerOutcome(failUuid)).isNull();
     }
 
@@ -1272,7 +1209,6 @@ public class SinkKafkaPostgresTest {
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("Connection must have autoCommit enabled before entering preflight");
 
-            // Transaction state remains false, caller owns transaction
             assertThat(c.getAutoCommit()).isFalse();
             c.rollback();
         }
@@ -1323,15 +1259,12 @@ public class SinkKafkaPostgresTest {
                     .isInstanceOf(PreflightRollbackException.class)
                     .hasCause(forcedRollbackError);
 
-            // setAutoCommit(true) must NEVER have been called after rollback failed
             assertThat(autoCommitTrueCalled.get()).isFalse();
 
-            // Real connection must be explicitly rolled back by caller
             realConn.rollback();
             realConn.setAutoCommit(true);
         }
 
-        // Ledger claim must not persist
         assertThat(queryLedgerOutcome(uuid)).isNull();
     }
 
@@ -1381,13 +1314,11 @@ public class SinkKafkaPostgresTest {
                     .isInstanceOf(PreflightRollbackException.class)
                     .hasCause(forcedAutoCommitError);
 
-            // Rollback DID succeed on the real connection prior to autoCommit restoration failure
             assertThat(rollbackCalled.get()).isTrue();
 
             realConn.setAutoCommit(true);
         }
 
-        // Ledger claim must not persist
         assertThat(queryLedgerOutcome(uuid)).isNull();
     }
 
@@ -1397,7 +1328,6 @@ public class SinkKafkaPostgresTest {
         UUID staleUuid = UUID.randomUUID();
         UUID unrecordedUuid = UUID.randomUUID();
 
-        // Seed outcomes in PostgreSQL
         try (Connection c = postgres.createConnection("");
              PreparedStatement ps = c.prepareStatement(
                      "INSERT INTO meta.replay_ledger (replay_id, dlt_topic, dlt_partition, dlt_offset, source_id, table_name, outcome) "
@@ -1417,7 +1347,6 @@ public class SinkKafkaPostgresTest {
             ps.executeUpdate();
         }
 
-        // Publish 3 records to DLT on Kafka with those replay IDs
         for (UUID uuid : List.of(appliedUuid, staleUuid, unrecordedUuid)) {
             ProducerRecord<byte[], byte[]> pr = new ProducerRecord<>(
                     DLT, 0, null, ("{\"source\":{\"name\":\"" + SOURCE + "\",\"table\":\"" + TABLE + "\"},\"op\":\"c\"}").getBytes(StandardCharsets.UTF_8));

@@ -460,7 +460,6 @@ public class DeadLetterListCommandTest {
         MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(r));
         DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
 
-        // Map has no entry for absentUuid
         Connection conn = mockConnection(Map.of(), new ArrayList<>(), new AtomicInteger(0), null);
         MockDataSource ds = new MockDataSource(conn);
 
@@ -523,7 +522,6 @@ public class DeadLetterListCommandTest {
                 .contains("fineract.cdc.dlt[0]@10\tfineract.cdc.batch_job_instance[0]@100\t" + sharedUuid + "\tAPPLIED")
                 .contains("fineract.cdc.dlt[0]@11\tfineract.cdc.batch_job_instance[0]@101\t" + sharedUuid + "\tAPPLIED");
 
-        // The ledger was queried for distinct identities
         assertThat(queriedUuids).containsExactly(sharedUuid);
     }
 
@@ -566,7 +564,6 @@ public class DeadLetterListCommandTest {
                 .hasMessageContaining("Failed to inspect replay ledger")
                 .hasCause(dbErr);
 
-        // Kafka consumer must still be closed even when ledger inspection fails
         assertThat(consumer.closed()).isTrue();
     }
 
@@ -575,7 +572,6 @@ public class DeadLetterListCommandTest {
         UUID uuid = UUID.randomUUID();
         AtomicInteger closeCalls = new AtomicInteger(0);
 
-        // 1. Success case
         ConsumerRecord<byte[], byte[]> r1 = createConsumerRecord(DLT, 0, 10L, "bank-a", "batch_job_instance", 100L, uuid, false);
         MockConsumer<byte[], byte[]> consumer1 = createMockConsumer(DLT, List.of(r1));
         DeadLetterReader reader1 = new DeadLetterReader(consumer1, DLT, CONTRACT);
@@ -590,7 +586,6 @@ public class DeadLetterListCommandTest {
         assertThat(closeCalls.get()).isEqualTo(1);
         assertThat(ds1.evictCalls.get()).isZero();
 
-        // 2. Failure case
         closeCalls.set(0);
         ConsumerRecord<byte[], byte[]> r2 = createConsumerRecord(DLT, 0, 11L, "bank-a", "batch_job_instance", 101L, uuid, false);
         MockConsumer<byte[], byte[]> consumer2 = createMockConsumer(DLT, List.of(r2));
@@ -607,44 +602,37 @@ public class DeadLetterListCommandTest {
 
         assertThat(consumer2.closed()).isTrue();
         assertThat(closeCalls.get()).isEqualTo(1);
-        assertThat(ds2.evictCalls.get()).isEqualTo(1); // Tainted connection evicted
+        assertThat(ds2.evictCalls.get()).isEqualTo(1);
     }
 
     @Test
     public void cliArgumentParsingInvariants() {
-        // Unknown option
         assertThatThrownBy(() -> DeadLetterListCommand.parseArgs(new String[]{"--foo"}))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Unknown option: '--foo'.");
 
-        // Positional argument
         assertThatThrownBy(() -> DeadLetterListCommand.parseArgs(new String[]{"positional"}))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Unexpected positional argument: 'positional'. Options must start with '--'.");
 
-        // Duplicate option
         assertThatThrownBy(() -> DeadLetterListCommand.parseArgs(new String[]{"--with-ledger", "--with-ledger"}))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Duplicate option: '--with-ledger'.");
 
-        // Empty option name
         assertThatThrownBy(() -> DeadLetterListCommand.parseArgs(new String[]{"--"}))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Empty option name: '--'.");
 
-        // Invalid boolean value
         assertThatThrownBy(() -> DeadLetterListCommand.parseArgs(new String[]{"--with-ledger=maybe"}))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Invalid boolean value 'maybe' for option '--with-ledger'. Expected 'true' or 'false'.");
 
-        // Valid boolean parsing
         Map<String, String> opts = DeadLetterListCommand.parseArgs(new String[]{"--with-ledger=false"});
         assertThat(opts.get("with-ledger")).isEqualTo("false");
 
         Map<String, String> opts2 = DeadLetterListCommand.parseArgs(new String[]{"--with-ledger"});
         assertThat(opts2.get("with-ledger")).isEqualTo("true");
 
-        // Negative limit
         ConsumerRecord<byte[], byte[]> r = createConsumerRecord(DLT, 0, 10L, "bank-a", "batch_job_instance", 100L, UUID.randomUUID(), false);
         MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(r));
         DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
@@ -654,7 +642,6 @@ public class DeadLetterListCommandTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Limit must be positive: 0");
 
-        // Negative max-bytes
         MockConsumer<byte[], byte[]> consumer2 = createMockConsumer(DLT, List.of(r));
         DeadLetterReader reader2 = new DeadLetterReader(consumer2, DLT, CONTRACT);
         assertThatThrownBy(() -> DeadLetterListCommand.run(

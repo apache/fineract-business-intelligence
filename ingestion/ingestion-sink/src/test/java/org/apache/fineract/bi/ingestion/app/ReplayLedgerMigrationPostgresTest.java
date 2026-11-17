@@ -90,18 +90,15 @@ public class ReplayLedgerMigrationPostgresTest {
         runPlatformSql();
 
         try (Connection c = connect()) {
-            // Verify table existence
             try (Statement s = c.createStatement();
                  ResultSet rs = s.executeQuery("SELECT to_regclass('meta.replay_ledger') IS NOT NULL")) {
                 assertThat(rs.next()).isTrue();
                 assertThat(rs.getBoolean(1)).isTrue();
             }
 
-            // Verify primary key is solely on replay_id
             List<String> pkColumns = queryPrimaryKeyColumns(c);
             assertThat(pkColumns).containsExactly("replay_id");
 
-            // Verify indexes exist
             try (Statement s = c.createStatement();
                  ResultSet rs = s.executeQuery(
                          "SELECT indexname FROM pg_indexes WHERE schemaname = 'meta' AND tablename = 'replay_ledger' ORDER BY indexname")) {
@@ -120,7 +117,6 @@ public class ReplayLedgerMigrationPostgresTest {
 
     @Test(priority = 2)
     public void migrationFromOldCompositeKeySchemaPreservesRowsAndMatchesJavaUuids() throws Exception {
-        // Known test coordinates and their expected Java-derived RFC 4122 v3 UUIDs
         String topic1 = "fineract.cdc.dlt";
         int part1 = 0;
         long off1 = 0L;
@@ -139,7 +135,6 @@ public class ReplayLedgerMigrationPostgresTest {
         UUID expectedUuid3 = ReplayIdentity.legacyLineageId(topic3, part3, off3);
         assertThat(expectedUuid3).isEqualTo(UUID.fromString("e2b70e37-5c34-3134-b37e-af9786e6adf6"));
 
-        // Setup legacy composite-key schema with pre-existing data
         try (Connection c = connect(); Statement s = c.createStatement()) {
             s.execute("DROP TABLE IF EXISTS meta.replay_ledger CASCADE");
             s.execute("CREATE TABLE meta.replay_ledger ("
@@ -168,10 +163,8 @@ public class ReplayLedgerMigrationPostgresTest {
             }
         }
 
-        // Apply platform.sql upgrade
         runPlatformSql();
 
-        // Verify preservation, backfilled UUIDs, sentinels, and primary key
         try (Connection c = connect()) {
             try (Statement s = c.createStatement();
                  ResultSet rs = s.executeQuery("SELECT count(*) FROM meta.replay_ledger")) {
@@ -182,7 +175,6 @@ public class ReplayLedgerMigrationPostgresTest {
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT replay_id, source_id, table_name, outcome FROM meta.replay_ledger "
                             + "WHERE dlt_topic = ? AND dlt_partition = ? AND dlt_offset = ?")) {
-                // Vector 1
                 ps.setString(1, topic1);
                 ps.setInt(2, part1);
                 ps.setLong(3, off1);
@@ -194,7 +186,6 @@ public class ReplayLedgerMigrationPostgresTest {
                     assertThat(rs.getString("outcome")).isEqualTo("LEGACY_UNKNOWN");
                 }
 
-                // Vector 2
                 ps.setString(1, topic2);
                 ps.setInt(2, part2);
                 ps.setLong(3, off2);
@@ -206,7 +197,6 @@ public class ReplayLedgerMigrationPostgresTest {
                     assertThat(rs.getString("outcome")).isEqualTo("LEGACY_UNKNOWN");
                 }
 
-                // Vector 3
                 ps.setString(1, topic3);
                 ps.setInt(2, part3);
                 ps.setLong(3, off3);
@@ -219,11 +209,9 @@ public class ReplayLedgerMigrationPostgresTest {
                 }
             }
 
-            // Verify final primary key is solely replay_id
             List<String> pkColumns = queryPrimaryKeyColumns(c);
             assertThat(pkColumns).containsExactly("replay_id");
 
-            // Verify NOT NULL on all required columns
             verifyNotNull(c, "replay_id");
             verifyNotNull(c, "source_id");
             verifyNotNull(c, "table_name");
@@ -269,7 +257,6 @@ public class ReplayLedgerMigrationPostgresTest {
             assertThat(beforeReapplication).hasSize(3);
         }
 
-        // Reapply platform.sql against the already migrated database
         runPlatformSql();
 
         try (Connection c = connect()) {
@@ -291,7 +278,6 @@ public class ReplayLedgerMigrationPostgresTest {
 
     @Test(priority = 4)
     public void partiallyMigratedTableWithMissingBackfillCompletesMigration() throws Exception {
-        // Partial migration state: columns exist, but rows not yet backfilled, old PK still active
         try (Connection c = connect(); Statement s = c.createStatement()) {
             s.execute("DROP TABLE IF EXISTS meta.replay_ledger CASCADE");
             s.execute("CREATE TABLE meta.replay_ledger ("
@@ -308,7 +294,6 @@ public class ReplayLedgerMigrationPostgresTest {
                     + "VALUES ('partial.topic', 2, 888)");
         }
 
-        // Apply platform.sql
         runPlatformSql();
 
         try (Connection c = connect()) {
@@ -347,7 +332,6 @@ public class ReplayLedgerMigrationPostgresTest {
                     + "replayed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
                     + "PRIMARY KEY (dlt_topic, dlt_partition, dlt_offset))");
 
-            // Row 1: already has custom non-null replay_id, source_id, table_name
             try (PreparedStatement ps = c.prepareStatement(
                     "INSERT INTO meta.replay_ledger (replay_id, dlt_topic, dlt_partition, dlt_offset, source_id, table_name) "
                             + "VALUES (?, ?, ?, ?, ?, ?)")) {
@@ -360,16 +344,13 @@ public class ReplayLedgerMigrationPostgresTest {
                 ps.executeUpdate();
             }
 
-            // Row 2: legacy row with NULL replay_id
             s.execute("INSERT INTO meta.replay_ledger (dlt_topic, dlt_partition, dlt_offset) "
                     + "VALUES ('legacy.topic', 1, 200)");
         }
 
-        // Apply platform.sql
         runPlatformSql();
 
         try (Connection c = connect()) {
-            // Row 1 must preserve its existing replay_id, source_id, and table_name
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT replay_id, source_id, table_name FROM meta.replay_ledger WHERE dlt_offset = 100")) {
                 try (ResultSet rs = ps.executeQuery()) {
@@ -380,7 +361,6 @@ public class ReplayLedgerMigrationPostgresTest {
                 }
             }
 
-            // Row 2 must have backfilled UUID matching Java lineage calculation
             UUID expectedLegacyUuid = ReplayIdentity.legacyLineageId("legacy.topic", 1, 200L);
             try (PreparedStatement ps = c.prepareStatement(
                     "SELECT replay_id, source_id, table_name FROM meta.replay_ledger WHERE dlt_offset = 200")) {
@@ -408,7 +388,6 @@ public class ReplayLedgerMigrationPostgresTest {
                     + "GRANT USAGE ON SCHEMA meta TO analytics_engine;");
         }
 
-        // Apply platform.sql
         runPlatformSql();
 
         try (Connection c = connect(); Statement s = c.createStatement()) {
@@ -428,7 +407,6 @@ public class ReplayLedgerMigrationPostgresTest {
                 assertThat(rs.getBoolean(6)).as("analytics_engine must NOT have DELETE on meta.replay_ledger").isFalse();
             }
 
-            // Verify actual execution privileges as analytics_engine role
             s.execute("SET ROLE analytics_engine");
             s.execute("UPDATE meta.replay_ledger SET outcome = 'APPLIED' WHERE 1 = 0");
             assertThatThrownBy(() -> s.execute("UPDATE meta.replay_ledger SET source_id = 'denied' WHERE 1 = 0"))

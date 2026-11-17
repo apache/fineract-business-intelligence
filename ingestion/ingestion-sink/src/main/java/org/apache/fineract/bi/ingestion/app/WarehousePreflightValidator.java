@@ -42,15 +42,6 @@ public final class WarehousePreflightValidator {
     public record ValidationResult(boolean passed, String reason, RoutedEvent routedEvent) {
     }
 
-    /**
-     * Point-in-time predicted replay outcomes for replayed candidate events evaluated
-     * against current warehouse staging semantics and LSN ordering guards.
-     * <p>
-     * NOTE: These outcomes are dry-run point-in-time predictions, NOT committed warehouse outcomes.
-     * Downstream warehouse application is asynchronous and live publication does not guarantee
-     * that these predicted outcomes will match the eventual committed outcomes.
-     * Ordinary non-replay events do not acquire replay outcomes and will not be present in this map.
-     */
     public record BatchValidationResult(
             boolean passed,
             String reason,
@@ -77,13 +68,6 @@ public final class WarehousePreflightValidator {
         this.writer = Objects.requireNonNull(writer, "writer");
     }
 
-    /**
-     * Validates CDC payload availability, replay identity headers, Debezium envelope parsing,
-     * and current ownership routing.
-     * <p>
-     * Rejects records with omitted/unavailable payloads, invalid replay headers, poison JSON,
-     * or routes that are HOLD, SKIP, or UNKNOWN_SOURCE. Only records routed to PROD or SHADOW pass.
-     */
     public ValidationResult validateRoute(OwnershipSnapshot ownership, DeadLetterRecord record) {
         Objects.requireNonNull(ownership, "OwnershipSnapshot is required for route validation");
         Objects.requireNonNull(record, "DeadLetterRecord is required for route validation");
@@ -133,14 +117,6 @@ public final class WarehousePreflightValidator {
         return new ValidationResult(true, null, routed);
     }
 
-    /**
-     * Executes warehouse preflight staging and apply_staged_batch validation inside a transaction
-     * that is unconditionally rolled back for a batch of routed events.
-     * <p>
-     * Ordinary warehouse validation rejections return a failed {@link BatchValidationResult}.
-     * If preflight setup, rollback, or connection restoration fails, {@link PreflightRollbackException}
-     * is propagated immediately to abort the replay operation and prevent connection reuse.
-     */
     public BatchValidationResult validateWarehouse(Connection connection, Collection<RoutedEvent> routedEvents)
             throws PreflightRollbackException {
         Objects.requireNonNull(connection, "Database connection is required for warehouse preflight");
@@ -162,10 +138,6 @@ public final class WarehousePreflightValidator {
         }
     }
 
-    /**
-     * Executes warehouse preflight staging for a single routed event inside a transaction
-     * that is unconditionally rolled back.
-     */
     public ValidationResult validateWarehouse(Connection connection, RoutedEvent routed)
             throws PreflightRollbackException {
         Objects.requireNonNull(routed, "RoutedEvent is required for warehouse preflight");
@@ -173,9 +145,6 @@ public final class WarehousePreflightValidator {
         return new ValidationResult(batchResult.passed(), batchResult.reason(), routed);
     }
 
-    /**
-     * Validates both payload routing and warehouse staging against the database.
-     */
     public ValidationResult validate(Connection connection, OwnershipSnapshot ownership, DeadLetterRecord record)
             throws PreflightRollbackException {
         ValidationResult routeResult = validateRoute(ownership, record);

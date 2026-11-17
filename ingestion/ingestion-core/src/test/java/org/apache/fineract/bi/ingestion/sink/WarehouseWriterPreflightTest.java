@@ -183,7 +183,6 @@ public class WarehouseWriterPreflightTest {
                 .hasCause(rollbackError);
 
         assertThat(rollbacks.get()).isEqualTo(1);
-        // Autocommit must NOT have been restored to true when rollback failed
         assertThat(autoCommit.get()).isFalse();
     }
 
@@ -198,7 +197,6 @@ public class WarehouseWriterPreflightTest {
                 .isSameAs(unwrapError);
 
         assertThat(rollbacks.get()).isEqualTo(1);
-        // Autocommit MUST be restored to true immediately after successful rollback
         assertThat(autoCommit.get()).isTrue();
     }
 
@@ -252,7 +250,6 @@ public class WarehouseWriterPreflightTest {
                 });
 
         assertThat(rollbacks.get()).isEqualTo(1);
-        // Autocommit must NOT have been restored to true
         assertThat(autoCommit.get()).isFalse();
     }
 
@@ -266,7 +263,6 @@ public class WarehouseWriterPreflightTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Connection must have autoCommit enabled before entering preflight");
 
-        // Staging was not executed, rollback was not executed, transaction state unchanged
         assertThat(rollbacks.get()).isEqualTo(0);
         assertThat(autoCommit.get()).isFalse();
     }

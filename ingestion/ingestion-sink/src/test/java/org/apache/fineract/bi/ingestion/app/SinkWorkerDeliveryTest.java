@@ -594,10 +594,8 @@ public class SinkWorkerDeliveryTest {
         assertThat(letters.letters).isEmpty();
         assertThat(w.heldPartitions()).isEmpty();
 
-        // Mark replay completed in ledger (simulating successful write + ledger claim)
         ledger.add(replayId);
 
-        // 1. Ownership transitions to PAUSED (HOLD)
         OwnershipSnapshot holdSnap = new OwnershipSnapshot(
                 Map.of(OwnershipSnapshot.key("bank-a", "batch_job_instance"),
                         new OwnershipSnapshot.Entry("KAFKA", null, "PAUSED", 8)),
@@ -617,7 +615,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(letters.letters).as("duplicate is not dead-lettered").isEmpty();
         assertThat(w.buffered()).isZero();
 
-        // 2. Ownership transitions to UNKNOWN_SOURCE (unregistered source)
         OwnershipSnapshot unknownSnap = new OwnershipSnapshot(
                 Map.of(),
                 Map.of(),
@@ -647,12 +644,10 @@ public class SinkWorkerDeliveryTest {
         View view = new View(snapshot("STEADY", "KAFKA"));
         SinkWorker w = worker(view, fakeConnections(ledger), Map.of());
 
-        // 1. Replay record with same replayId UUID but DIFFERENT coordinates
         ReplayIdentity diffCoords = new ReplayIdentity(sharedUuid, "other.dlt.topic", 3, 777L);
         ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
         ReplayIdentityHeaders.add(r1.headers(), diffCoords);
 
-        // 2. Ordinary non-replay CDC record (no replay headers)
         ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 2);
 
         w.enqueue(r1);
@@ -660,7 +655,6 @@ public class SinkWorkerDeliveryTest {
 
         Map<TopicPartition, OffsetAndMetadata> commit = w.processWithRetry(consumer);
 
-        // r1 was skipped by early completed-replay check; r2 was written normally
         assertThat(writer.allIds()).containsExactly(2L);
         assertThat(commit.get(P0).offset()).isEqualTo(2L);
         assertThat(letters.letters).isEmpty();
@@ -704,7 +698,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("other_table", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
 
-        // Ordinary CDC counters retain previous behavior
         assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
                 .isEqualTo(3.0);
     }
@@ -729,7 +722,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
 
-        // Ordinary CDC counters work normally
         assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
                 .isEqualTo(2.0);
     }
@@ -757,7 +749,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(1.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
 
-        // Ordinary CDC counters retain previous skip-counting semantics
         assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "skipped").count())
                 .isEqualTo(1.0);
         assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
