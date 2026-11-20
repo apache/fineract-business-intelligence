@@ -62,8 +62,10 @@ models:
           - not_null
       - name: client_hash
         description: >
-          MD5 hash of (source_id || '::' || tenant_id || '::' || id) — pseudonymised PK safe
-          for analytics layers.
+          Hex HMAC-SHA256 of (source_id || '::' || tenant_id || '::' || id), keyed by
+          meta.pii_hash_key and computed by meta.client_hash(). Pseudonymised, not
+          anonymous, PK for the analytics layers: anyone who can read the key can
+          recompute it, and it changes when the key is rotated.
         tests:
           - not_null
           - unique

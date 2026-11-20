@@ -25,7 +25,9 @@ models:
       client_hash is the surrogate primary key safe for analytics use.
     columns:
       - name: client_hash
-        description: Pseudonymised surrogate primary key (MD5 of source_id + tenant_id + client_id).
+        description: >
+          Pseudonymised surrogate primary key: HMAC-SHA256 of source_id, tenant_id and
+          client_id, keyed by meta.pii_hash_key. Changes when the key is rotated.
         tests:
           - not_null
           - unique
