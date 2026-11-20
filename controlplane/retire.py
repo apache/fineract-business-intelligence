@@ -40,6 +40,7 @@ _BOOKKEEPING = (
     "meta.extract_watermarks",
     "meta.ingestion_progress",
     "meta.connector_state",
+    "meta.replay_ledger",
 )
 
 

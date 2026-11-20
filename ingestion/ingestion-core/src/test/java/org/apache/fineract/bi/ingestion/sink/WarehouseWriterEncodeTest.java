@@ -41,7 +41,7 @@ public class WarehouseWriterEncodeTest {
         Route route = new Route(Route.Target.SHADOW, 12, "tenant-a", 2, null);
         String csv = writer.encode(contract.requireTable("batch_job_instance"), List.of(new RoutedEvent(e, route)));
         assertThat(csv).isEqualTo(
-                "\"s1\",\"tenant-a\",\"5\",\"Say \"\"hi\"\"\",,2,77,\"2026-01-01T10:00:00Z\",u,\"{job_key}\",12,shadow\n");
+                "\"s1\",\"tenant-a\",\"5\",\"Say \"\"hi\"\"\",,2,77,\"2026-01-01T10:00:00Z\",u,\"{job_key}\",12,shadow,\n");
     }
 
     @Test
@@ -51,6 +51,18 @@ public class WarehouseWriterEncodeTest {
                 new String[] {"5", null, null}, List.of(), null, 0L);
         Route route = new Route(Route.Target.PROD, 1, "t", 0, null);
         String csv = writer.encode(contract.requireTable("batch_job_instance"), List.of(new RoutedEvent(e, route)));
-        assertThat(csv).isEqualTo("\"s1\",\"t\",\"5\",,,0,,\"1970-01-01T00:00:00Z\",d,,1,prod\n");
+        assertThat(csv).isEqualTo("\"s1\",\"t\",\"5\",,,0,,\"1970-01-01T00:00:00Z\",d,,1,prod,\n");
+    }
+
+    @Test
+    public void encodesReplayIdWhenPresent() {
+        WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
+        ChangeEvent e = new ChangeEvent("s1", "batch_job_instance", ChangeEvent.Op.UPSERT,
+                new String[] {"5", "Job", null}, List.of(), 10L, 0L);
+        Route route = new Route(Route.Target.PROD, 1, "t", 0, null);
+        java.util.UUID replayUuid = java.util.UUID.fromString("12345678-1234-1234-1234-123456789abc");
+        ReplayIdentity id = new ReplayIdentity(replayUuid, "fbi.dlt.prod", 0, 100L);
+        String csv = writer.encode(contract.requireTable("batch_job_instance"), List.of(new RoutedEvent(e, route, id)));
+        assertThat(csv).isEqualTo("\"s1\",\"t\",\"5\",\"Job\",,0,10,\"1970-01-01T00:00:00Z\",u,,1,prod,12345678-1234-1234-1234-123456789abc\n");
     }
 }

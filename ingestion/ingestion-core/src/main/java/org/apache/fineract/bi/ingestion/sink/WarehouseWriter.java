@@ -28,9 +28,14 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.fineract.bi.ingestion.cdc.ChangeEvent;
 import org.apache.fineract.bi.ingestion.contract.ColumnSpec;
@@ -59,38 +64,45 @@ public final class WarehouseWriter implements BatchWriter {
     public record Applied(String table, String target, long rows, long deletes) {
     }
 
-    public List<Applied> write(Connection c, Collection<RoutedEvent> events, Collection<PartitionOffset> offsets,
+    public WriteResult write(Connection c, Collection<RoutedEvent> events, Collection<PartitionOffset> offsets,
             String consumerGroup) throws SQLException {
         return write(c, events, offsets, consumerGroup, List.of());
     }
 
     @Override
-    public List<Applied> write(Connection c, Collection<RoutedEvent> events, Collection<PartitionOffset> offsets,
+    public WriteResult write(Connection c, Collection<RoutedEvent> events, Collection<PartitionOffset> offsets,
             String consumerGroup, Collection<SkipCheck> skips) throws SQLException {
-        Map<String, List<RoutedEvent>> byTable = new TreeMap<>();
-        for (RoutedEvent e : events) {
-            byTable.computeIfAbsent(e.event().table(), k -> new ArrayList<>()).add(e);
-        }
-        List<Applied> applied = new ArrayList<>();
         c.setAutoCommit(false);
         try {
+            Set<ReplayIdentity> claimed = claimReplays(c, events);
+
+            Map<String, List<RoutedEvent>> byTable = new TreeMap<>();
+            Set<ReplayIdentity> batchSeen = new HashSet<>();
+            for (RoutedEvent e : events) {
+                if (e.isReplay()) {
+                    ReplayIdentity id = e.replayIdentity();
+                    if (!claimed.contains(id) || !batchSeen.add(id)) {
+                        continue;
+                    }
+                }
+                byTable.computeIfAbsent(e.event().table(), k -> new ArrayList<>()).add(e);
+            }
+
             verifySkips(c, skips);
-            CopyManager copy = c.unwrap(PGConnection.class).getCopyAPI();
-            for (Map.Entry<String, List<RoutedEvent>> entry : byTable.entrySet()) {
-                TableContract table = contract.requireTable(entry.getKey());
-                createStage(c, table);
-                copy.copyIn(copySql(table), new StringReader(encode(table, entry.getValue())));
-                try (PreparedStatement ps = c.prepareStatement(
-                        "SELECT target, rows_applied, rows_deleted FROM meta.apply_staged_batch(?, ?)")) {
-                    ps.setString(1, table.tableName());
-                    ps.setString(2, engine);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        while (rs.next()) {
-                            applied.add(new Applied(table.tableName(), rs.getString(1), rs.getLong(2), rs.getLong(3)));
-                        }
+            List<Applied> applied = stageAndApply(c, byTable);
+
+            Map<ReplayIdentity, ReplayOutcome> replayOutcomes = new LinkedHashMap<>();
+            if (!claimed.isEmpty()) {
+                replayOutcomes = findCompletedReplayOutcomes(c, claimed);
+                for (ReplayIdentity id : claimed) {
+                    ReplayOutcome outcome = replayOutcomes.get(id);
+                    if (outcome == null || outcome == ReplayOutcome.CLAIMED) {
+                        throw new IllegalStateException("Replay identity " + id.replayId()
+                                + " did not receive a terminal outcome (outcome=" + outcome + ")");
                     }
                 }
             }
+
             if (!offsets.isEmpty()) {
                 try (PreparedStatement ps = c.prepareStatement(UPSERT_OFFSET)) {
                     for (PartitionOffset o : offsets) {
@@ -104,7 +116,7 @@ public final class WarehouseWriter implements BatchWriter {
                 }
             }
             c.commit();
-            return applied;
+            return new WriteResult(applied, replayOutcomes);
         } catch (SQLException e) {
             rollbackQuietly(c);
             if (FencedWriteException.SQLSTATE.equals(e.getSQLState())) {
@@ -118,6 +130,203 @@ public final class WarehouseWriter implements BatchWriter {
             rollbackQuietly(c);
             throw e;
         }
+    }
+
+    public List<Applied> stageAndApply(Connection c, Map<String, List<RoutedEvent>> byTable)
+            throws SQLException, IOException {
+        List<Applied> applied = new ArrayList<>();
+        if (byTable.isEmpty()) {
+            return applied;
+        }
+        CopyManager copy = c.unwrap(PGConnection.class).getCopyAPI();
+        for (Map.Entry<String, List<RoutedEvent>> entry : byTable.entrySet()) {
+            TableContract table = contract.requireTable(entry.getKey());
+            createStage(c, table);
+            copy.copyIn(copySql(table), new StringReader(encode(table, entry.getValue())));
+            try (PreparedStatement ps = c.prepareStatement(
+                    "SELECT target, rows_applied, rows_deleted FROM meta.apply_staged_batch(?, ?)")) {
+                ps.setString(1, table.tableName());
+                ps.setString(2, engine);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        applied.add(new Applied(table.tableName(), rs.getString(1), rs.getLong(2), rs.getLong(3)));
+                    }
+                }
+            }
+        }
+        return applied;
+    }
+
+    @Override
+    public PreflightResult preflight(Connection c, Collection<RoutedEvent> events) throws SQLException {
+        boolean origAutoCommit;
+        try {
+            origAutoCommit = c.getAutoCommit();
+        } catch (SQLException | RuntimeException setupEx) {
+            String msg = "Failed to initialize connection transaction state for preflight: "
+                    + setupEx.getMessage();
+            throw new PreflightRollbackException(msg, setupEx);
+        }
+
+        if (!origAutoCommit) {
+            throw new IllegalStateException("Connection must have autoCommit enabled before entering preflight; "
+                    + "existing transaction boundary owned by caller must not be mutated or rolled back");
+        }
+
+        try {
+            c.setAutoCommit(false);
+        } catch (SQLException | RuntimeException setupEx) {
+            String msg = "Failed to initialize connection transaction state for preflight: "
+                    + setupEx.getMessage();
+            throw new PreflightRollbackException(msg, setupEx);
+        }
+
+        List<Applied> result = null;
+        Map<ReplayIdentity, ReplayOutcome> predictedOutcomes = Map.of();
+        Exception validationFailure = null;
+        try {
+            Set<ReplayIdentity> claimed = claimReplays(c, events);
+
+            Map<String, List<RoutedEvent>> byTable = new TreeMap<>();
+            Set<ReplayIdentity> batchSeen = new HashSet<>();
+            for (RoutedEvent e : events) {
+                if (e != null && e.isReplay()) {
+                    ReplayIdentity id = e.replayIdentity();
+                    if (!claimed.contains(id) || !batchSeen.add(id)) {
+                        continue;
+                    }
+                }
+                if (e != null) {
+                    byTable.computeIfAbsent(e.event().table(), k -> new ArrayList<>()).add(e);
+                }
+            }
+
+            result = stageAndApply(c, byTable);
+
+            if (!claimed.isEmpty()) {
+                predictedOutcomes = findCompletedReplayOutcomes(c, claimed);
+                for (ReplayIdentity id : claimed) {
+                    ReplayOutcome outcome = predictedOutcomes.get(id);
+                    if (outcome == null || outcome == ReplayOutcome.CLAIMED) {
+                        throw new IllegalStateException("Replay identity " + id.replayId()
+                                + " did not receive a terminal predicted outcome (outcome=" + outcome + ")");
+                    }
+                }
+            }
+        } catch (IOException e) {
+            validationFailure = new SQLException("COPY stream failed during preflight", "08006", e);
+        } catch (Exception e) {
+            validationFailure = e;
+        }
+
+        boolean rollbackSucceeded = false;
+        try {
+            c.rollback();
+            rollbackSucceeded = true;
+        } catch (SQLException | RuntimeException rollbackEx) {
+            String msg = "Preflight transaction rollback failed; connection may be in an unresolved state: "
+                    + rollbackEx.getMessage();
+            throw new PreflightRollbackException(msg, rollbackEx, validationFailure);
+        }
+
+        if (origAutoCommit && rollbackSucceeded) {
+            try {
+                c.setAutoCommit(true);
+            } catch (SQLException | RuntimeException autoCommitEx) {
+                String msg = "Failed to restore connection autoCommit state after preflight rollback: "
+                        + autoCommitEx.getMessage();
+                throw new PreflightRollbackException(msg, autoCommitEx, validationFailure);
+            }
+        }
+
+        if (validationFailure != null) {
+            if (validationFailure instanceof SQLException sqlEx) {
+                throw sqlEx;
+            }
+            if (validationFailure instanceof RuntimeException rtEx) {
+                throw rtEx;
+            }
+            throw new SQLException("Preflight validation failed", "XX000", validationFailure);
+        }
+
+        return new PreflightResult(result != null ? result : List.of(), predictedOutcomes);
+    }
+
+    public static Set<ReplayIdentity> claimReplays(Connection c, Collection<RoutedEvent> events)
+            throws SQLException {
+        if (c == null || events == null || events.isEmpty()) {
+            return Set.of();
+        }
+        Map<UUID, RoutedEvent> firstByReplayId = new LinkedHashMap<>();
+        for (RoutedEvent e : events) {
+            if (e != null && e.isReplay()) {
+                firstByReplayId.putIfAbsent(e.replayIdentity().replayId(), e);
+            }
+        }
+        if (firstByReplayId.isEmpty()) {
+            return Set.of();
+        }
+        Set<ReplayIdentity> claimed = new HashSet<>();
+        String sql = "INSERT INTO meta.replay_ledger (replay_id, dlt_topic, dlt_partition, dlt_offset, source_id, table_name, outcome) "
+                + "VALUES (?, ?, ?, ?, ?, ?, 'CLAIMED') ON CONFLICT (replay_id) DO NOTHING RETURNING replay_id";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            for (RoutedEvent e : firstByReplayId.values()) {
+                ReplayIdentity id = e.replayIdentity();
+                ps.setObject(1, id.replayId());
+                ps.setString(2, id.dltTopic());
+                ps.setInt(3, id.dltPartition());
+                ps.setLong(4, id.dltOffset());
+                ps.setString(5, e.event().sourceId());
+                ps.setString(6, e.event().table());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        claimed.add(id);
+                    }
+                }
+            }
+        }
+        return claimed;
+    }
+
+    public static Map<ReplayIdentity, ReplayOutcome> findCompletedReplayOutcomes(Connection c,
+            Collection<ReplayIdentity> identities) throws SQLException {
+        if (c == null || identities == null || identities.isEmpty()) {
+            return Map.of();
+        }
+        Map<UUID, ReplayOutcome> outcomeByUuid = new HashMap<>();
+        Map<ReplayIdentity, ReplayOutcome> result = new LinkedHashMap<>();
+        String sql = "SELECT replay_id, outcome FROM meta.replay_ledger WHERE replay_id = ?";
+        try (PreparedStatement ps = c.prepareStatement(sql)) {
+            for (ReplayIdentity id : identities) {
+                if (id == null || id.replayId() == null) {
+                    continue;
+                }
+                UUID uuid = id.replayId();
+                if (!outcomeByUuid.containsKey(uuid)) {
+                    ps.setObject(1, uuid);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            String outcomeStr = rs.getString(2);
+                            ReplayOutcome outcome = outcomeStr != null ? ReplayOutcome.valueOf(outcomeStr)
+                                    : ReplayOutcome.LEGACY_UNKNOWN;
+                            outcomeByUuid.put(uuid, outcome);
+                        } else {
+                            outcomeByUuid.put(uuid, null);
+                        }
+                    }
+                }
+                ReplayOutcome outcome = outcomeByUuid.get(uuid);
+                if (outcome != null) {
+                    result.put(id, outcome);
+                }
+            }
+        }
+        return result;
+    }
+
+    public static Set<ReplayIdentity> findCompletedReplays(Connection c, Collection<ReplayIdentity> identities)
+            throws SQLException {
+        return findCompletedReplayOutcomes(c, identities).keySet();
     }
 
     static void verifySkips(Connection c, Collection<SkipCheck> skips) throws SQLException {
@@ -217,6 +426,10 @@ public final class WarehouseWriter implements BatchWriter {
             CsvEncoder.append(sb, CsvEncoder.identifierArray(e.unavailable()));
             sb.append(',').append(re.route().epoch());
             sb.append(',').append(re.route().stageTarget());
+            sb.append(',');
+            if (re.isReplay() && re.replayIdentity() != null && re.replayIdentity().replayId() != null) {
+                sb.append(re.replayIdentity().replayId());
+            }
             sb.append('\n');
         }
         return sb.toString();
@@ -240,7 +453,7 @@ public final class WarehouseWriter implements BatchWriter {
             for (ColumnSpec col : table.columns()) {
                 cols.append(", \"").append(col.name()).append('"');
             }
-            cols.append(", _source_generation, _source_lsn, _source_ts, _op, _unavailable, _owner_epoch, _target");
+            cols.append(", _source_generation, _source_lsn, _source_ts, _op, _unavailable, _owner_epoch, _target, _replay_id");
             return "COPY pg_temp.\"stage_" + table.rawTable() + "\" (" + cols + ") FROM STDIN WITH (FORMAT csv)";
         });
     }

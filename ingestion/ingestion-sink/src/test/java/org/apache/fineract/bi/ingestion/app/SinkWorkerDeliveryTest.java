@@ -21,25 +21,39 @@ package org.apache.fineract.bi.ingestion.app;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.fineract.bi.ingestion.cdc.DebeziumEnvelopeParser;
 import org.apache.fineract.bi.ingestion.config.Env;
 import org.apache.fineract.bi.ingestion.contract.Contract;
 import org.apache.fineract.bi.ingestion.contract.ContractLoader;
+import org.apache.fineract.bi.ingestion.app.SinkMetrics.ReplayOutcomeLabel;
 import org.apache.fineract.bi.ingestion.routing.OwnershipSnapshot;
 import org.apache.fineract.bi.ingestion.routing.OwnershipView;
 import org.apache.fineract.bi.ingestion.sink.BatchWriter;
 import org.apache.fineract.bi.ingestion.sink.PartitionOffset;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
+import org.apache.fineract.bi.ingestion.sink.ReplayOutcome;
 import org.apache.fineract.bi.ingestion.sink.RoutedEvent;
 import org.apache.fineract.bi.ingestion.sink.SkipCheck;
 import org.apache.fineract.bi.ingestion.sink.WarehouseWriter;
@@ -60,10 +74,11 @@ public class SinkWorkerDeliveryTest {
         final List<List<Long>> batches = new ArrayList<>();
         final List<Collection<PartitionOffset>> offsets = new ArrayList<>();
         final List<Collection<SkipCheck>> skips = new ArrayList<>();
+        Map<ReplayIdentity, ReplayOutcome> replayOutcomesToReturn = Map.of();
         java.util.function.Consumer<List<Long>> before = ids -> { };
 
         @Override
-        public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+        public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                 Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
             List<Long> ids = new ArrayList<>();
             for (RoutedEvent e : events) {
@@ -73,7 +88,12 @@ public class SinkWorkerDeliveryTest {
             batches.add(ids);
             offsets.add(new ArrayList<>(offs));
             skips.add(new ArrayList<>(skip));
-            return List.of();
+            return new BatchWriter.WriteResult(List.of(), replayOutcomesToReturn);
+        }
+
+        @Override
+        public BatchWriter.PreflightResult preflight(Connection c, Collection<RoutedEvent> events) {
+            throw new UnsupportedOperationException("FakeWriter does not support preflight");
         }
 
         List<Long> allIds() {
@@ -137,17 +157,89 @@ public class SinkWorkerDeliveryTest {
     }
 
     private SinkWorker worker(View view, Map<String, String> extra) {
+        return worker(view, () -> null, extra);
+    }
+
+    private SinkWorker worker(View view, ConnectionSource connections, Map<String, String> extra) {
         Map<String, String> env = new HashMap<>(Map.of(
                 "SINK_MAX_BACKOFF_MS", "20", "SINK_MAX_BATCH_WAIT_MS", "1", "SINK_HEALTH_STUCK_MS", "50"));
         env.putAll(extra);
         SinkConfig config = SinkConfig.from(Env.of(env), env);
-        SinkWorker w = new SinkWorker(0, config, () -> null, view, new DebeziumEnvelopeParser(contract), writer, letters,
+        SinkWorker w = new SinkWorker(0, config, connections, view, new DebeziumEnvelopeParser(contract), writer, letters,
                 metrics, new ProgressReporter(null, "test"), p -> consumer);
         w.attach(consumer);
         consumer.assign(List.of(P0, P1));
         consumer.updateBeginningOffsets(Map.of(P0, 0L, P1, 0L));
         consumer.updateEndOffsets(Map.of(P0, 1_000L, P1, 1_000L));
         return w;
+    }
+
+    private ConnectionSource fakeConnections(Set<ReplayIdentity> ledger) {
+        return () -> (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[] { Connection.class },
+                (proxy, method, args) -> {
+                    if ("prepareStatement".equals(method.getName())) {
+                        UUID[] currentReplayId = new UUID[1];
+                        String[] currentTopic = new String[1];
+                        int[] currentPartition = new int[1];
+                        long[] currentOffset = new long[1];
+                        return (PreparedStatement) Proxy.newProxyInstance(
+                                PreparedStatement.class.getClassLoader(),
+                                new Class<?>[] { PreparedStatement.class },
+                                (pProxy, pMethod, pArgs) -> {
+                                    if ("setObject".equals(pMethod.getName())) {
+                                        if (pArgs[1] instanceof UUID u) {
+                                            currentReplayId[0] = u;
+                                        }
+                                        return null;
+                                    }
+                                    if ("setString".equals(pMethod.getName())) {
+                                        currentTopic[0] = (String) pArgs[1];
+                                        return null;
+                                    }
+                                    if ("setInt".equals(pMethod.getName())) {
+                                        currentPartition[0] = (Integer) pArgs[1];
+                                        return null;
+                                    }
+                                    if ("setLong".equals(pMethod.getName())) {
+                                        currentOffset[0] = (Long) pArgs[1];
+                                        return null;
+                                    }
+                                    if ("executeQuery".equals(pMethod.getName())) {
+                                        boolean exists = (currentReplayId[0] != null && ledger.stream()
+                                                .anyMatch(id -> currentReplayId[0].equals(id.replayId())))
+                                                || (currentTopic[0] != null && ledger.contains(new ReplayIdentity(
+                                                currentTopic[0], currentPartition[0], currentOffset[0])));
+                                        boolean[] returned = {false};
+                                        return (ResultSet) Proxy.newProxyInstance(
+                                                ResultSet.class.getClassLoader(),
+                                                new Class<?>[] { ResultSet.class },
+                                                (rProxy, rMethod, rArgs) -> {
+                                                    if ("next".equals(rMethod.getName())) {
+                                                        if (exists && !returned[0]) {
+                                                            returned[0] = true;
+                                                            return true;
+                                                        }
+                                                        return false;
+                                                    }
+                                                    if ("close".equals(rMethod.getName())) {
+                                                        return null;
+                                                    }
+                                                    return null;
+                                                });
+                                    }
+                                    if ("close".equals(pMethod.getName())) {
+                                        return null;
+                                    }
+                                    return null;
+                                });
+                    }
+                    if ("close".equals(method.getName())) {
+                        return null;
+                    }
+                    return null;
+                });
     }
 
     private static ConsumerRecord<byte[], byte[]> record(TopicPartition tp, long offset, String source, long id) {
@@ -181,7 +273,7 @@ public class SinkWorkerDeliveryTest {
         SinkWorker[] holder = new SinkWorker[1];
         FakeWriter flaky = new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 if (attempts[0]++ == 0) {
                     holder[0].rebalanceListener().onPartitionsRevoked(Set.of(P0));
@@ -211,7 +303,7 @@ public class SinkWorkerDeliveryTest {
         int[] attempts = {0};
         FakeWriter flaky = new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 if (attempts[0]++ < 3) {
                     throw new SQLException("connection reset", "08006");
@@ -233,7 +325,7 @@ public class SinkWorkerDeliveryTest {
     public void onePoisonRowIsIsolatedAndDeadLetteredWhileTheRestOfTheBatchIsApplied() {
         FakeWriter strict = new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 for (RoutedEvent e : events) {
                     if ("3".equals(e.event().values()[0])) {
@@ -264,7 +356,7 @@ public class SinkWorkerDeliveryTest {
     public void aPermanentSchemaErrorStopsTheWorkerInsteadOfRetryingForever() {
         FakeWriter broken = new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 throw new SQLException("Unknown contract table", "FBI02");
             }
@@ -280,7 +372,7 @@ public class SinkWorkerDeliveryTest {
     public void healthTurnsRedWhenBatchesKeepFailingLongerThanTheThreshold() throws Exception {
         FakeWriter down = new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 throw new SQLException("connection refused", "08001");
             }
@@ -387,7 +479,7 @@ public class SinkWorkerDeliveryTest {
     private FakeWriter rejecting(java.util.function.Predicate<Long> poison) {
         return new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 for (RoutedEvent e : events) {
                     if (poison.test(Long.parseLong(e.event().values()[0]))) {
@@ -405,13 +497,13 @@ public class SinkWorkerDeliveryTest {
         FakeWriter base = rejecting(id -> id == 3L);
         writer = new FakeWriter() {
             @Override
-            public List<WarehouseWriter.Applied> write(Connection c, Collection<RoutedEvent> events,
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
                     Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
                 if (++calls[0] == 2) {
                     throw new org.apache.fineract.bi.ingestion.sink.FencedWriteException(
                             new SQLException("Writer KAFKA fenced", "FBI01"));
                 }
-                List<WarehouseWriter.Applied> out = base.write(c, events, offs, group, skip);
+                BatchWriter.WriteResult out = base.write(c, events, offs, group, skip);
                 batches.add(base.batches.get(base.batches.size() - 1));
                 return out;
             }
@@ -482,5 +574,249 @@ public class SinkWorkerDeliveryTest {
         assertThat(w.buffered()).isEqualTo(37);
         assertThat(w.isAlive()).isTrue();
         assertThat(w.isHealthy(System.currentTimeMillis())).as("the tripped breaker turns health red").isFalse();
+    }
+
+    @Test
+    public void duplicateReplayIsSkippedEvenIfOwnershipChangesToHoldOrUnknownSource() {
+        Set<ReplayIdentity> ledger = new HashSet<>();
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, fakeConnections(ledger), Map.of());
+
+        ReplayIdentity replayId = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 100L);
+        ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r1.headers(), replayId);
+
+        w.enqueue(r1);
+        Map<TopicPartition, OffsetAndMetadata> commit1 = w.processWithRetry(consumer);
+
+        assertThat(writer.allIds()).containsExactly(1L);
+        assertThat(commit1.get(P0).offset()).isEqualTo(1L);
+        assertThat(letters.letters).isEmpty();
+        assertThat(w.heldPartitions()).isEmpty();
+
+        ledger.add(replayId);
+
+        OwnershipSnapshot holdSnap = new OwnershipSnapshot(
+                Map.of(OwnershipSnapshot.key("bank-a", "batch_job_instance"),
+                        new OwnershipSnapshot.Entry("KAFKA", null, "PAUSED", 8)),
+                Map.of("bank-a", new OwnershipSnapshot.SourceMeta("t-a", 0)),
+                System.currentTimeMillis());
+        view.current.set(holdSnap);
+
+        ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 1);
+        ReplayIdentityHeaders.add(r2.headers(), replayId);
+        w.enqueue(r2);
+
+        Map<TopicPartition, OffsetAndMetadata> commit2 = w.processWithRetry(consumer);
+
+        assertThat(commit2.get(P0).offset()).isEqualTo(2L);
+        assertThat(writer.allIds()).as("duplicate is not re-applied to warehouse").containsExactly(1L);
+        assertThat(w.heldPartitions()).as("duplicate is skipped rather than held").isEmpty();
+        assertThat(letters.letters).as("duplicate is not dead-lettered").isEmpty();
+        assertThat(w.buffered()).isZero();
+
+        OwnershipSnapshot unknownSnap = new OwnershipSnapshot(
+                Map.of(),
+                Map.of(),
+                System.currentTimeMillis());
+        view.current.set(unknownSnap);
+
+        ConsumerRecord<byte[], byte[]> r3 = record(P0, 2, "bank-a", 1);
+        ReplayIdentityHeaders.add(r3.headers(), replayId);
+        w.enqueue(r3);
+
+        Map<TopicPartition, OffsetAndMetadata> commit3 = w.processWithRetry(consumer);
+
+        assertThat(commit3.get(P0).offset()).isEqualTo(3L);
+        assertThat(writer.allIds()).as("duplicate is not re-applied to warehouse").containsExactly(1L);
+        assertThat(w.heldPartitions()).as("duplicate is not held").isEmpty();
+        assertThat(letters.letters).as("duplicate is not dead-lettered as UNKNOWN_SOURCE").isEmpty();
+        assertThat(w.buffered()).isZero();
+    }
+
+    @Test
+    public void earlyCompletedReplayCheckUsesReplayIdAndAllowsOrdinaryEvents() {
+        Set<ReplayIdentity> ledger = new HashSet<>();
+        UUID sharedUuid = UUID.randomUUID();
+        ReplayIdentity committedReplay = new ReplayIdentity(sharedUuid, "fineract.dlt.batch_job_instance", 0, 100L);
+        ledger.add(committedReplay);
+
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, fakeConnections(ledger), Map.of());
+
+        ReplayIdentity diffCoords = new ReplayIdentity(sharedUuid, "other.dlt.topic", 3, 777L);
+        ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r1.headers(), diffCoords);
+
+        ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 2);
+
+        w.enqueue(r1);
+        w.enqueue(r2);
+
+        Map<TopicPartition, OffsetAndMetadata> commit = w.processWithRetry(consumer);
+
+        assertThat(writer.allIds()).containsExactly(2L);
+        assertThat(commit.get(P0).offset()).isEqualTo(2L);
+        assertThat(letters.letters).isEmpty();
+        assertThat(w.buffered()).isZero();
+    }
+
+    @Test
+    public void replayOutcomesIncrementDedicatedCountersWithCorrectTableAttribution() {
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, Map.of());
+
+        ReplayIdentity replay1 = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 101L);
+        ReplayIdentity replay2 = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 102L);
+        ReplayIdentity replay3 = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 103L);
+
+        ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r1.headers(), replay1);
+
+        ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 2);
+        ReplayIdentityHeaders.add(r2.headers(), replay2);
+
+        ConsumerRecord<byte[], byte[]> r3 = record(P0, 2, "bank-a", 3);
+        ReplayIdentityHeaders.add(r3.headers(), replay3);
+
+        writer.replayOutcomesToReturn = Map.of(
+                replay1, ReplayOutcome.APPLIED,
+                replay2, ReplayOutcome.SKIPPED_STALE,
+                replay3, ReplayOutcome.SKIPPED_SUPERSEDED);
+
+        w.enqueue(r1);
+        w.enqueue(r2);
+        w.enqueue(r3);
+
+        Map<TopicPartition, OffsetAndMetadata> commit = w.processWithRetry(consumer);
+
+        assertThat(commit.get(P0).offset()).isEqualTo(3L);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(1.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(1.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(1.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("other_table", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
+
+        assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
+                .isEqualTo(3.0);
+    }
+
+    @Test
+    public void ordinaryCdcEventsDoNotIncrementReplayCounters() {
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, Map.of());
+
+        ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
+        ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 2);
+
+        w.enqueue(r1);
+        w.enqueue(r2);
+
+        Map<TopicPartition, OffsetAndMetadata> commit = w.processWithRetry(consumer);
+
+        assertThat(commit.get(P0).offset()).isEqualTo(2L);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
+
+        assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
+                .isEqualTo(2.0);
+    }
+
+    @Test
+    public void alreadyCompletedReplayFastPathIncrementsAlreadyCompletedReplayMetric() {
+        Set<ReplayIdentity> ledger = new HashSet<>();
+        ReplayIdentity completedReplay = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 100L);
+        ledger.add(completedReplay);
+
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, fakeConnections(ledger), Map.of());
+
+        ConsumerRecord<byte[], byte[]> r1 = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r1.headers(), completedReplay);
+
+        ConsumerRecord<byte[], byte[]> r2 = record(P0, 1, "bank-a", 2);
+
+        w.enqueue(r1);
+        w.enqueue(r2);
+
+        Map<TopicPartition, OffsetAndMetadata> commit = w.processWithRetry(consumer);
+
+        assertThat(commit.get(P0).offset()).isEqualTo(2L);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(1.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
+
+        assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "skipped").count())
+                .isEqualTo(1.0);
+        assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
+                .isEqualTo(1.0);
+    }
+
+    @Test
+    public void legacyUnknownOutcomeIsRecordedAsLegacyUnknownAndNeverAsApplied() {
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, Map.of());
+
+        ReplayIdentity replay = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 101L);
+        ConsumerRecord<byte[], byte[]> r = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r.headers(), replay);
+
+        writer.replayOutcomesToReturn = Map.of(replay, ReplayOutcome.LEGACY_UNKNOWN);
+
+        w.enqueue(r);
+        w.processWithRetry(consumer);
+
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(1.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
+    }
+
+    @Test
+    public void claimedOutcomeIsNeverRecordedAsCompleted() {
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, Map.of());
+
+        ReplayIdentity replay = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 101L);
+        ConsumerRecord<byte[], byte[]> r = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r.headers(), replay);
+
+        writer.replayOutcomesToReturn = Map.of(replay, ReplayOutcome.CLAIMED);
+
+        w.enqueue(r);
+        w.processWithRetry(consumer);
+
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
+    }
+
+    @Test
+    public void replayOutcomesNotRecordedIfWarehouseWriteThrowsException() {
+        writer = new FakeWriter() {
+            @Override
+            public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
+                    Collection<PartitionOffset> offs, String group, Collection<SkipCheck> skip) throws SQLException {
+                throw new SQLException("Warehouse write failure", "40001");
+            }
+        };
+        View view = new View(snapshot("STEADY", "KAFKA"));
+        SinkWorker w = worker(view, Map.of());
+
+        ReplayIdentity replay = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 101L);
+        ConsumerRecord<byte[], byte[]> r = record(P0, 0, "bank-a", 1);
+        ReplayIdentityHeaders.add(r.headers(), replay);
+
+        w.enqueue(r);
+        assertThatThrownBy(() -> w.process(List.of(r)))
+                .isInstanceOf(SQLException.class);
+
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(0.0);
+        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
     }
 }
