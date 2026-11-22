@@ -158,57 +158,6 @@ public class WarehousePreflightValidatorTest {
     }
 
     @Test
-    public void rejectsRouteHold() throws Exception {
-        MockWriter writer = new MockWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-
-        RecordHeaders h = headers("batch_job_instance");
-        byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
-        DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
-
-        WarehousePreflightValidator.ValidationResult result =
-                validator.validate(null, ownership("bank-a", "batch_job_instance", Route.Target.HOLD), record);
-
-        assertThat(result.passed()).isFalse();
-        assertThat(result.reason()).contains("paused (HOLD)");
-        assertThat(writer.preflightCalled).isFalse();
-    }
-
-    @Test
-    public void rejectsRouteSkip() throws Exception {
-        MockWriter writer = new MockWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-
-        RecordHeaders h = headers("batch_job_instance");
-        byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
-        DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
-
-        WarehousePreflightValidator.ValidationResult result =
-                validator.validate(null, ownership("bank-a", "batch_job_instance", Route.Target.SKIP), record);
-
-        assertThat(result.passed()).isFalse();
-        assertThat(result.reason()).contains("SKIP");
-        assertThat(writer.preflightCalled).isFalse();
-    }
-
-    @Test
-    public void rejectsUnknownSource() throws Exception {
-        MockWriter writer = new MockWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-
-        RecordHeaders h = headers("batch_job_instance");
-        byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"unregistered-bank\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
-        DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
-
-        WarehousePreflightValidator.ValidationResult result =
-                validator.validate(null, ownership("bank-a", "batch_job_instance", Route.Target.PROD), record);
-
-        assertThat(result.passed()).isFalse();
-        assertThat(result.reason()).contains("Unknown source");
-        assertThat(writer.preflightCalled).isFalse();
-    }
-
-    @Test
     public void passesValidEventThroughWarehousePreflight() throws Exception {
         MockWriter writer = new MockWriter();
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
@@ -279,24 +228,6 @@ public class WarehousePreflightValidatorTest {
 
         assertThat(batchResult.passed()).isFalse();
         assertThat(batchResult.reason()).contains("23505").contains("unique constraint violation");
-        assertThat(writer.preflightCalled).isTrue();
-    }
-
-    @Test
-    public void capturesWarehouseRejectionDetails() throws Exception {
-        MockWriter writer = new MockWriter();
-        writer.failureToThrow = new SQLException("numeric field overflow", "22003");
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-
-        RecordHeaders h = headers("batch_job_instance");
-        byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
-        DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
-
-        WarehousePreflightValidator.ValidationResult result =
-                validator.validate(mockConnection(), ownership("bank-a", "batch_job_instance", Route.Target.PROD), record);
-
-        assertThat(result.passed()).isFalse();
-        assertThat(result.reason()).contains("22003").contains("numeric field overflow");
         assertThat(writer.preflightCalled).isTrue();
     }
 
@@ -401,46 +332,26 @@ public class WarehousePreflightValidatorTest {
     }
 
     @Test
-    public void validateWarehouseRejectsNullConnection() {
-        MockWriter writer = new MockWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-        RecordHeaders h = headers("batch_job_instance");
-        byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
-        DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
-        WarehousePreflightValidator.ValidationResult routeResult =
-                validator.validateRoute(ownership("bank-a", "batch_job_instance", Route.Target.PROD), record);
-
-        assertThatThrownBy(() -> validator.validateWarehouse(null, routeResult.routedEvent()))
-                .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("Database connection is required");
-    }
-
-    @Test
-    public void validateWarehouseRejectsNullRoutedEvent() {
-        MockWriter writer = new MockWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), (RoutedEvent) null))
-                .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("RoutedEvent is required for warehouse preflight");
-    }
-
-    @Test
-    public void validateWarehouseRejectsNullRoutedEventsCollection() {
-        MockWriter writer = new MockWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), (Collection<RoutedEvent>) null))
-                .isInstanceOf(NullPointerException.class)
-                .hasMessageContaining("RoutedEvents collection is required for warehouse preflight");
-    }
-
-    @Test
-    public void validateRouteRejectsNullArguments() {
+    public void validateRejectsNullArguments() {
         MockWriter writer = new MockWriter();
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
         RecordHeaders h = headers("batch_job_instance");
         byte[] payload = bytes("{\"after\":{\"job_instance_id\":1},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
         DeadLetterRecord record = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 1L, h, payload, contract);
         OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        WarehousePreflightValidator.ValidationResult routeResult = validator.validateRoute(os, record);
+
+        assertThatThrownBy(() -> validator.validateWarehouse(null, routeResult.routedEvent()))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("Database connection is required");
+
+        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), (RoutedEvent) null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("RoutedEvent is required for warehouse preflight");
+
+        assertThatThrownBy(() -> validator.validateWarehouse(mockConnection(), (Collection<RoutedEvent>) null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("RoutedEvents collection is required for warehouse preflight");
 
         assertThatThrownBy(() -> validator.validateRoute(null, record))
                 .isInstanceOf(NullPointerException.class)

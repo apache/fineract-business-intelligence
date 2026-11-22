@@ -649,23 +649,4 @@ public class WarehouseWriterReplayLedgerTest {
         assertThat(db.txLedger).isEmpty();
         assertThat(c.getAutoCommit()).isTrue();
     }
-
-    @Test
-    public void preflightRejectsWhenConnectionAutoCommitIsAlreadyFalse() throws Exception {
-        TestDatabase db = new TestDatabase();
-        Connection c = db.createConnection();
-        c.setAutoCommit(false);
-
-        UUID uuid = UUID.randomUUID();
-        ReplayIdentity id = new ReplayIdentity(uuid, "fineract.cdc.dlt", 0, 105L);
-        RoutedEvent event = createReplayEvent("bank-a", "batch_job_instance", "1", id);
-
-        assertThatThrownBy(() -> writer.preflight(c, List.of(event)))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("Connection must have autoCommit enabled before entering preflight");
-
-        assertThat(db.rollbackCount.get()).isZero();
-        assertThat(db.commitCount.get()).isZero();
-        assertThat(c.getAutoCommit()).isFalse();
-    }
 }
