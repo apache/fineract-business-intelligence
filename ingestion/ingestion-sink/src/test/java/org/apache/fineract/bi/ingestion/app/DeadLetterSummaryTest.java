@@ -24,8 +24,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.UUID;
 import org.apache.fineract.bi.ingestion.contract.Contract;
 import org.apache.fineract.bi.ingestion.contract.ContractLoader;
+import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.testng.annotations.Test;
 
@@ -199,5 +201,44 @@ public void countsOmittedPayloadsWithoutTreatingThemAsAvailable() {
     @Test
     public void returnsNoGroupsForAnEmptyDlt() {
         assertThat(DeadLetterSummary.summarize(List.of())).isEmpty();
+    }
+
+    @Test
+    public void accumulatorCountsInvalidReplayRecordsWithoutRetainingPayloads() {
+        RecordHeaders validHeaders = new RecordHeaders();
+        validHeaders.add("fbi.dlt.reason", bytes("WAREHOUSE_REJECTED"));
+        validHeaders.add("fbi.source.topic", bytes("fineract.cdc.batch_job_instance"));
+        validHeaders.add("fbi.source.partition", bytes("0"));
+        validHeaders.add("fbi.source.offset", bytes("100"));
+        validHeaders.add(ReplayIdentity.ID_HEADER, bytes(UUID.randomUUID().toString()));
+        validHeaders.add(ReplayIdentity.TOPIC_HEADER, bytes("fineract.cdc.dlt"));
+        validHeaders.add(ReplayIdentity.PARTITION_HEADER, bytes("0"));
+        validHeaders.add(ReplayIdentity.OFFSET_HEADER, bytes("10"));
+
+        DeadLetterRecord valid = DeadLetterRecord.parse(
+                "fineract.cdc.dlt", 0, 10, validHeaders,
+                bytes("{\"source\":{\"name\":\"bank-a\"},\"op\":\"c\"}"), CONTRACT);
+
+        RecordHeaders invalidHeaders = new RecordHeaders();
+        invalidHeaders.add("fbi.dlt.reason", bytes("WAREHOUSE_REJECTED"));
+        invalidHeaders.add("fbi.source.topic", bytes("fineract.cdc.batch_job_instance"));
+        invalidHeaders.add("fbi.source.partition", bytes("0"));
+        invalidHeaders.add("fbi.source.offset", bytes("101"));
+        invalidHeaders.add(ReplayIdentity.ID_HEADER, bytes("invalid-uuid"));
+        invalidHeaders.add(ReplayIdentity.TOPIC_HEADER, bytes("fineract.cdc.dlt"));
+        invalidHeaders.add(ReplayIdentity.PARTITION_HEADER, bytes("0"));
+        invalidHeaders.add(ReplayIdentity.OFFSET_HEADER, bytes("11"));
+
+        DeadLetterRecord invalid = DeadLetterRecord.parse(
+                "fineract.cdc.dlt", 0, 11, invalidHeaders,
+                bytes("{\"source\":{\"name\":\"bank-a\"},\"op\":\"c\"}"), CONTRACT);
+
+        DeadLetterSummary.Accumulator accumulator = new DeadLetterSummary.Accumulator();
+        accumulator.add(valid);
+        accumulator.add(invalid);
+
+        assertThat(accumulator.invalidReplayRecordCount()).isEqualTo(1);
+        assertThat(accumulator.snapshot()).hasSize(1);
+        assertThat(accumulator.snapshot().get(0).count()).isEqualTo(2);
     }
 }

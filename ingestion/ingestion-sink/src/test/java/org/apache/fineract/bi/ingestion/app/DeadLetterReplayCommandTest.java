@@ -35,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -109,6 +110,27 @@ public class DeadLetterReplayCommandTest {
         byte[] payload = bytes("{\"after\":{\"job_instance_id\":" + off + "},\"source\":{\"name\":\""
                 + source + "\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
         return DeadLetterRecord.parse("fineract.cdc.dlt", 0, off, h, key, payload, contract);
+    }
+
+    private static void renderReport(
+            DeadLetterReader.ScanResult scan,
+            DeadLetterReplayCommand.ReplayFilter filter,
+            boolean dryRun,
+            boolean skipPreflight,
+            List<DeadLetterRecord> matched,
+            List<DeadLetterRecord> rejectedPayloads,
+            List<DeadLetterRecord> invalidReplayHeaders,
+            List<DeadLetterRecord> preflightFailed,
+            List<DeadLetterRecord> readyToReplay,
+            int replayedCount,
+            Map<DeadLetterRecord, String> failureReasons,
+            PrintStream out) {
+        DeadLetterReplayCommand.renderReport(
+                scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
+                invalidReplayHeaders, List.of(), Map.of(), preflightFailed, List.of(), readyToReplay,
+                new DeadLetterReplayCommand.PublicationSnapshot(replayedCount, 0, Math.max(0, readyToReplay.size() - replayedCount), failureReasons),
+                failureReasons,
+                DeadLetterReplayCommand.LedgerCheckStatus.NOT_NEEDED, null, Map.of(), out);
     }
 
     @Test
@@ -224,7 +246,7 @@ public class DeadLetterReplayCommandTest {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         DeadLetterReplayCommand.ReplayFilter filter = new DeadLetterReplayCommand.ReplayFilter(null, null, null, null);
 
-        DeadLetterReplayCommand.renderReport(
+        renderReport(
                 scan, filter, false, true,
                 List.of(r1, r2), List.of(), List.of(), List.of(), List.of(r1, r2), 2, Map.of(),
                 new PrintStream(out, true, StandardCharsets.UTF_8));
@@ -265,7 +287,7 @@ public class DeadLetterReplayCommandTest {
         failures.put(omitted, "Payload is omitted or unavailable");
         failures.put(badReplay, "Invalid replay identity: " + badReplay.replayIdentityError());
 
-        DeadLetterReplayCommand.renderReport(
+        renderReport(
                 scan, new DeadLetterReplayCommand.ReplayFilter(null, null, null, null), false, true,
                 List.of(omitted, badReplay), List.of(omitted), List.of(badReplay), List.of(), List.of(), 0,
                 failures, new PrintStream(out, true, StandardCharsets.UTF_8));
@@ -284,7 +306,7 @@ public class DeadLetterReplayCommandTest {
         DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(1, Collections.emptyMap());
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        DeadLetterReplayCommand.renderReport(
+        renderReport(
                 scan, new DeadLetterReplayCommand.ReplayFilter(null, null, null, null), true, false,
                 List.of(r), List.of(), List.of(), List.of(), List.of(r), 0,
                 Map.of(), new PrintStream(out, true, StandardCharsets.UTF_8));
@@ -312,7 +334,7 @@ public class DeadLetterReplayCommandTest {
         DeadLetterReplayCommand.ReplayFilter filter =
                 new DeadLetterReplayCommand.ReplayFilter("WAREHOUSE_REJECTED", null, null, null);
 
-        DeadLetterReplayCommand.renderReport(
+        renderReport(
                 new DeadLetterReader.ScanResult(1, Collections.emptyMap()), filter, true, false,
                 List.of(r), List.of(), List.of(), List.of(), List.of(r), 0,
                 Map.of(), new PrintStream(out, true, StandardCharsets.UTF_8));
@@ -356,6 +378,24 @@ public class DeadLetterReplayCommandTest {
         return new OwnershipSnapshot(Map.of(OwnershipSnapshot.key(source, table), entry),
                 Map.of(source, new OwnershipSnapshot.SourceMeta("tenant-a", 0)),
                 System.currentTimeMillis());
+    }
+
+    private static OwnershipSnapshot ownership(Map<String, List<String>> sourcesAndTables, Route.Target target) {
+        Map<String, OwnershipSnapshot.Entry> entries = new HashMap<>();
+        Map<String, OwnershipSnapshot.SourceMeta> sources = new HashMap<>();
+        for (Map.Entry<String, List<String>> e : sourcesAndTables.entrySet()) {
+            String src = e.getKey();
+            sources.put(src, new OwnershipSnapshot.SourceMeta("tenant-" + src, 0));
+            for (String tbl : e.getValue()) {
+                OwnershipSnapshot.Entry entry = new OwnershipSnapshot.Entry(
+                        target == Route.Target.PROD ? "KAFKA" : "PYTHON",
+                        target == Route.Target.SHADOW ? "KAFKA" : null,
+                        target == Route.Target.HOLD ? "PAUSED" : "STEADY",
+                        1L);
+                entries.put(OwnershipSnapshot.key(src, tbl), entry);
+            }
+        }
+        return new OwnershipSnapshot(entries, sources, System.currentTimeMillis());
     }
 
     private Connection mockConnection(AtomicBoolean isClosed, AtomicInteger abortCalls) {
@@ -500,7 +540,7 @@ public class DeadLetterReplayCommandTest {
                                                     }
                                                     if ("getString".equals(rsName)) {
                                                         ReplayOutcome o = completedLedgerOutcomes != null ? completedLedgerOutcomes.get(currentUuid.get()) : null;
-                                                        if (o == null || o == ReplayOutcome.LEGACY_UNKNOWN) {
+                                                        if (o == null) {
                                                             return null;
                                                         }
                                                         return o.name();
@@ -555,6 +595,9 @@ public class DeadLetterReplayCommandTest {
         final List<Collection<RoutedEvent>> preflightCalls = new ArrayList<>();
         SQLException nextException = null;
         Map<ReplayIdentity, ReplayOutcome> predictedOutcomes = null;
+        java.util.function.Function<Collection<RoutedEvent>, SQLException> failureRule = null;
+        Set<UUID> failingUuids = new HashSet<>();
+        SQLException failureToThrow = null;
 
         @Override
         public BatchWriter.WriteResult write(Connection c, Collection<RoutedEvent> events,
@@ -570,9 +613,35 @@ public class DeadLetterReplayCommandTest {
                 nextException = null;
                 throw toThrow;
             }
+            if (failureRule != null) {
+                SQLException err = failureRule.apply(events);
+                if (err != null) {
+                    throw err;
+                }
+            }
+            if (!failingUuids.isEmpty()) {
+                for (RoutedEvent e : events) {
+                    if (e.replayIdentity() != null && failingUuids.contains(e.replayIdentity().replayId())) {
+                        throw failureToThrow != null
+                                ? failureToThrow
+                                : new SQLException("22003: numeric field overflow", "22003");
+                    }
+                }
+            }
+            if (predictedOutcomes != null) {
+                return new BatchWriter.PreflightResult(
+                        List.of(new WarehouseWriter.Applied("batch_job_instance", "prod", events.size(), 0)),
+                        predictedOutcomes);
+            }
+            Map<ReplayIdentity, ReplayOutcome> outcomes = new HashMap<>();
+            for (RoutedEvent e : events) {
+                if (e.replayIdentity() != null) {
+                    outcomes.put(e.replayIdentity(), ReplayOutcome.APPLIED);
+                }
+            }
             return new BatchWriter.PreflightResult(
                     List.of(new WarehouseWriter.Applied("batch_job_instance", "prod", events.size(), 0)),
-                    predictedOutcomes != null ? predictedOutcomes : Map.of());
+                    outcomes);
         }
     }
 
@@ -611,7 +680,7 @@ public class DeadLetterReplayCommandTest {
     @Test
     public void ordinaryValidationFailureFailsEntireBatchClosedAndPreservesConnection() throws Exception {
         StubWriter writer = new StubWriter();
-        writer.nextException = new SQLException("22003: numeric field overflow", "22003");
+        writer.nextException = new SQLException("42P01: relation does not exist", "42P01");
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
 
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
@@ -638,7 +707,7 @@ public class DeadLetterReplayCommandTest {
         assertThat(aborts.get()).isEqualTo(0);
         assertThat(producer.history()).isEmpty();
         String report = out.toString(StandardCharsets.UTF_8);
-        assertThat(report).contains("Preflight failed: 2").contains("numeric field overflow");
+        assertThat(report).contains("Preflight failed: 2").contains("relation does not exist");
     }
 
     @Test
@@ -1271,7 +1340,7 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.execute(
                 null, contract, new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
-                true, true, 0, null, null, null, null, null))
+                true, true, 0, DeadLetterReader.DEFAULT_MAX_BYTES, null, null, null, null, null))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Limit must be positive");
 
@@ -1291,7 +1360,7 @@ public class DeadLetterReplayCommandTest {
                     100, 25, 4096, Map.of(), reason);
             ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-            DeadLetterReplayCommand.renderReport(
+            renderReport(
                     scan, new DeadLetterReplayCommand.ReplayFilter(null, null, null, null), true, false,
                     List.of(r), List.of(), List.of(), List.of(), List.of(r), 0,
                     Map.of(), new PrintStream(out, true, StandardCharsets.UTF_8));
@@ -1330,19 +1399,19 @@ public class DeadLetterReplayCommandTest {
     public void parseArgsRejectsAllRemovedAliasesWithActionableGuidance() {
         assertThatThrownBy(() -> DeadLetterReplayCommand.parseArgs(new String[] {"--source-id=bank-a"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--source-id' is no longer supported. Use '--source' instead.");
+                .hasMessageContaining("Unknown option: '--source-id'.");
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.parseArgs(new String[] {"--offsets=0:10..20"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--offsets' is no longer supported. Use '--offset-range' instead.");
+                .hasMessageContaining("Unknown option: '--offsets'.");
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.parseArgs(new String[] {"--preflight-only"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--preflight-only' is no longer supported. Use '--dry-run' instead.");
+                .hasMessageContaining("Unknown option: '--preflight-only'.");
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.parseArgs(new String[] {"--confirm-unfiltered"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--confirm-unfiltered' is no longer supported. Use '--confirm-all' instead.");
+                .hasMessageContaining("Unknown option: '--confirm-unfiltered'.");
     }
 
     @Test
@@ -1523,19 +1592,19 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.run(null, contract, new String[] {"--source-id=bank-a"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--source-id' is no longer supported. Use '--source' instead.");
+                .hasMessageContaining("Unknown option: '--source-id'.");
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.run(null, contract, new String[] {"--offsets=0:10..20"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--offsets' is no longer supported. Use '--offset-range' instead.");
+                .hasMessageContaining("Unknown option: '--offsets'.");
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.run(null, contract, new String[] {"--preflight-only"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--preflight-only' is no longer supported. Use '--dry-run' instead.");
+                .hasMessageContaining("Unknown option: '--preflight-only'.");
 
         assertThatThrownBy(() -> DeadLetterReplayCommand.run(null, contract, new String[] {"--confirm-unfiltered"}))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Option '--confirm-unfiltered' is no longer supported. Use '--confirm-all' instead.");
+                .hasMessageContaining("Unknown option: '--confirm-unfiltered'.");
     }
 
     @Test
@@ -1601,13 +1670,19 @@ public class DeadLetterReplayCommandTest {
         public Future<RecordMetadata> send(ProducerRecord<byte[], byte[]> record, Callback callback) {
             recordsSent.add(record);
             Future<RecordMetadata> future = sendHandler.apply(record);
-            if (callback != null && future.isDone()) {
-                try {
-                    callback.onCompletion(future.get(), null);
-                } catch (ExecutionException e) {
-                    callback.onCompletion(null, (Exception) (e.getCause() != null ? e.getCause() : e));
-                } catch (Exception e) {
-                    callback.onCompletion(null, e);
+            if (callback != null) {
+                if (future instanceof CompletableFuture) {
+                    ((CompletableFuture<RecordMetadata>) future).whenComplete((meta, ex) -> {
+                        callback.onCompletion(meta, ex instanceof Exception ? (Exception) ex : (ex != null ? new Exception(ex) : null));
+                    });
+                } else if (future != null && future.isDone()) {
+                    try {
+                        callback.onCompletion(future.get(), null);
+                    } catch (ExecutionException e) {
+                        callback.onCompletion(null, (Exception) (e.getCause() != null ? e.getCause() : e));
+                    } catch (Exception e) {
+                        callback.onCompletion(null, e);
+                    }
                 }
             }
             return future;
@@ -1660,7 +1735,7 @@ public class DeadLetterReplayCommandTest {
                 .contains("Records replayed to Kafka: 2")
                 .contains("- Acknowledged: 2")
                 .contains("- Failed: 0")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .doesNotContain("PARTIAL PUBLICATION")
                 .doesNotContain("Rejected / Failed records:");
     }
@@ -1681,23 +1756,22 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed")
                 .hasCause(brokerError)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(1);
                     assertThat(rpe.failedCount()).isEqualTo(1);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(producer.history()).hasSize(2);
         assertThat(report)
-                .contains("PARTIAL PUBLICATION: some records failed to publish or remain unconfirmed.")
+                .contains("PARTIAL PUBLICATION: some records failed to publish.")
                 .contains("Records ready for replay: 2")
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Rejected / Failed records:")
                 .contains("Kafka publication failed: Broker connection disconnected");
     }
@@ -1723,13 +1797,12 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 1 acknowledged, 2 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 2 failed")
                 .hasCause(err2)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(1);
                     assertThat(rpe.failedCount()).isEqualTo(2);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
@@ -1737,7 +1810,7 @@ public class DeadLetterReplayCommandTest {
         assertThat(report)
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 2")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Kafka publication failed: Topic authorization failed")
                 .contains("Kafka publication failed: Timeout waiting for ack");
     }
@@ -1759,7 +1832,7 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed")
                 .hasCause(syncErr);
 
         String report = out.toString(StandardCharsets.UTF_8);
@@ -1767,7 +1840,7 @@ public class DeadLetterReplayCommandTest {
         assertThat(report)
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Synchronous send failure: Local buffer exhausted");
     }
 
@@ -1801,12 +1874,11 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(rInvalidPart, rValidPart), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed")
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(1);
                     assertThat(rpe.failedCount()).isEqualTo(1);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         assertThat(producer.history()).hasSize(1);
@@ -1814,7 +1886,7 @@ public class DeadLetterReplayCommandTest {
         assertThat(report)
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Invalid original partition: -1");
     }
 
@@ -1841,70 +1913,61 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed")
                 .hasCause(flushErr)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(1);
                     assertThat(rpe.failedCount()).isEqualTo(1);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Kafka publication failed: Record 2 broker ack error");
     }
 
     @Test
-    public void liveReplayInterruptedWaitMarksRemainingRecordsAsUnconfirmed() throws Exception {
+    public void liveReplayAsynchronousCallbacksCompleteBeforeCountsAsserted() throws Exception {
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
         DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
         DeadLetterRecord r3 = record("WAREHOUSE_REJECTED", "bank-a", 2, 12L, false, bytes("k3"));
 
-        TestProducer producer = new TestProducer(record -> {
-            if (record.partition() == 0) {
-                return CompletableFuture.completedFuture(null);
-            } else if (record.partition() == 1) {
-                return new CompletableFuture<>() {
-                    @Override
-                    public RecordMetadata get() throws InterruptedException {
-                        throw new InterruptedException("Thread interrupted while waiting");
-                    }
-                };
-            } else {
-                return new CompletableFuture<>();
-            }
-        });
+        CompletableFuture<RecordMetadata> f1 = new CompletableFuture<>();
+        CompletableFuture<RecordMetadata> f2 = new CompletableFuture<>();
+        CompletableFuture<RecordMetadata> f3 = new CompletableFuture<>();
+
+        TestProducer producer = new TestProducer(
+                record -> {
+                    if (record.partition() == 0) return f1;
+                    if (record.partition() == 1) return f2;
+                    return f3;
+                },
+                () -> {
+                    f1.complete(null);
+                    f2.completeExceptionally(new RuntimeException("Async callback failure"));
+                    f3.complete(null);
+                }
+        );
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        Thread.interrupted();
-
-        try {
-            assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
-                    .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                    .hasMessage("Replay publication incomplete: 1 acknowledged, 0 failed, 2 unconfirmed")
-                    .satisfies(e -> {
-                        DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
-                        assertThat(rpe.acknowledgedCount()).isEqualTo(1);
-                        assertThat(rpe.failedCount()).isEqualTo(0);
-                        assertThat(rpe.unconfirmedCount()).isEqualTo(2);
-                    });
-
-            assertThat(Thread.currentThread().isInterrupted()).isTrue();
-        } finally {
-            Thread.interrupted();
-        }
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
+                .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
+                .hasMessage("Replay publication incomplete: 2 acknowledged, 1 failed")
+                .satisfies(e -> {
+                    DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(2);
+                    assertThat(rpe.failedCount()).isEqualTo(1);
+                });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
-                .contains("- Acknowledged: 1")
-                .contains("- Failed: 0")
-                .contains("- Unconfirmed: 2")
-                .contains("Wait interrupted while awaiting Kafka acknowledgement")
-                .contains("Wait cancelled due to thread interruption");
+                .contains("- Acknowledged: 2")
+                .contains("- Failed: 1")
+                .doesNotContain("Unconfirmed")
+                .contains("Kafka publication failed: Async callback failure");
     }
 
     @Test
@@ -1912,27 +1975,26 @@ public class DeadLetterReplayCommandTest {
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
 
         CompletableFuture<RecordMetadata> cancelled = new CompletableFuture<>();
-        cancelled.cancel(true);
+        cancelled.completeExceptionally(new CancellationException("Future was cancelled"));
 
         TestProducer producer = new TestProducer(record -> cancelled);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 0 acknowledged, 1 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 0 acknowledged, 1 failed")
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(0);
                     assertThat(rpe.failedCount()).isEqualTo(1);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
                 .contains("- Acknowledged: 0")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
-                .contains("Future was cancelled");
+                .doesNotContain("Unconfirmed")
+                .contains("Kafka publication failed: Future was cancelled");
     }
 
     @Test
@@ -1957,7 +2019,7 @@ public class DeadLetterReplayCommandTest {
     }
 
     @Test
-    public void renderReportOverloadsPreserveBackwardsCompatibility() {
+    public void renderReportCanonicalFormat() {
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
         DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(1, Map.of());
         DeadLetterReplayCommand.ReplayFilter filter = new DeadLetterReplayCommand.ReplayFilter(null, null, null, null);
@@ -1965,96 +2027,95 @@ public class DeadLetterReplayCommandTest {
         ByteArrayOutputStream out12 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
-                List.of(r1), List.of(), List.of(), List.of(), List.of(r1),
-                1, Map.of(), new PrintStream(out12, true, StandardCharsets.UTF_8));
+                List.of(r1), List.of(), List.of(), List.of(), Map.of(),
+                List.of(), List.of(), List.of(r1),
+                new DeadLetterReplayCommand.PublicationSnapshot(1, 0, 0),
+                Map.of(), DeadLetterReplayCommand.LedgerCheckStatus.NOT_NEEDED,
+                null, Map.of(), new PrintStream(out12, true, StandardCharsets.UTF_8));
         assertThat(out12.toString(StandardCharsets.UTF_8))
                 .contains("LIVE REPLAY (--execute)")
                 .contains("Records replayed to Kafka: 1")
                 .contains("- Acknowledged: 1");
 
-        ByteArrayOutputStream out13 = new ByteArrayOutputStream();
-        DeadLetterReplayCommand.renderReport(
-                scan, filter, false, false,
-                List.of(r1), List.of(), List.of(), List.of(), List.of(), List.of(r1),
-                1, Map.of(), new PrintStream(out13, true, StandardCharsets.UTF_8));
-        assertThat(out13.toString(StandardCharsets.UTF_8))
-                .contains("LIVE REPLAY (--execute)")
-                .contains("Records replayed to Kafka: 1");
-
         ByteArrayOutputStream out14 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
-                List.of(r1), List.of(), List.of(), List.of(), List.of(), List.of(r1),
-                1, Map.of(), DeadLetterReplayCommand.LedgerCheckStatus.PERFORMED,
-                new PrintStream(out14, true, StandardCharsets.UTF_8));
+                List.of(r1), List.of(), List.of(), List.of(), Map.of(),
+                List.of(), List.of(), List.of(r1),
+                new DeadLetterReplayCommand.PublicationSnapshot(1, 0, 0),
+                Map.of(), DeadLetterReplayCommand.LedgerCheckStatus.PERFORMED,
+                null, Map.of(), new PrintStream(out14, true, StandardCharsets.UTF_8));
         assertThat(out14.toString(StandardCharsets.UTF_8))
                 .contains("Already completed (in ledger): 0 (ledger check performed)");
 
         ByteArrayOutputStream out17 = new ByteArrayOutputStream();
         DeadLetterReplayCommand.renderReport(
                 scan, filter, false, false,
-                List.of(r1), List.of(), List.of(), List.of(), List.of(), List.of(r1),
-                1, 0, 0, Map.of(), DeadLetterReplayCommand.LedgerCheckStatus.PERFORMED,
-                new RuntimeException("Flush error"),
+                List.of(r1), List.of(), List.of(), List.of(), Map.of(),
+                List.of(), List.of(), List.of(r1),
+                new DeadLetterReplayCommand.PublicationSnapshot(1, 0, 0),
+                Map.of(), DeadLetterReplayCommand.LedgerCheckStatus.PERFORMED,
+                new RuntimeException("Flush error"), Map.of(),
                 new PrintStream(out17, true, StandardCharsets.UTF_8));
         assertThat(out17.toString(StandardCharsets.UTF_8))
                 .contains("Producer flush failed: Flush error")
-                .contains("PUBLICATION FAILED: producer flush encountered an error despite acknowledged futures.");
+                .contains("PUBLICATION FAILED: producer flush encountered an error despite acknowledged records.");
+
+        ByteArrayOutputStream out18 = new ByteArrayOutputStream();
+        DeadLetterReplayCommand.renderReport(
+                scan, filter, false, false,
+                List.of(r1), List.of(), List.of(), List.of(), Map.of(),
+                List.of(), List.of(), List.of(r1, record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"))),
+                new DeadLetterReplayCommand.PublicationSnapshot(1, 0, 1),
+                Map.of(), DeadLetterReplayCommand.LedgerCheckStatus.PERFORMED,
+                new RuntimeException("Flush error"), Map.of(),
+                new PrintStream(out18, true, StandardCharsets.UTF_8));
+        assertThat(out18.toString(StandardCharsets.UTF_8))
+                .contains("Callback outcomes observed at reporting time after flush failure:")
+                .contains("- Acknowledged: 1")
+                .contains("- Failed: 0")
+                .doesNotContain("Records replayed to Kafka")
+                .contains("Producer flush failed: Flush error")
+                .contains("PUBLICATION FAILED: producer flush encountered an error before all callbacks completed.");
     }
 
     @Test
-    public void flushFailureWithUnfinishedFutureLeavesRecordUnconfirmedWithoutCallingBlockingGet() throws Exception {
+    public void flushFailureWithMixedCallbackResultsPreservesAccurateCountsAndThrows() throws Exception {
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
+        DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
 
         RuntimeException flushErr = new RuntimeException("Kafka producer flush exploded");
-        AtomicBoolean getCalled = new AtomicBoolean(false);
-
-        Future<RecordMetadata> unfinishedFuture = new CompletableFuture<>() {
-            @Override
-            public boolean isDone() {
-                return false;
-            }
-
-            @Override
-            public RecordMetadata get() {
-                getCalled.set(true);
-                throw new AssertionError("Blocking get() must not be called on unfinished future after flush failure");
-            }
-
-            @Override
-            public RecordMetadata get(long timeout, java.util.concurrent.TimeUnit unit) {
-                getCalled.set(true);
-                throw new AssertionError("Blocking get() must not be called on unfinished future after flush failure");
-            }
-        };
+        RuntimeException callbackErr = new RuntimeException("Record 2 callback error");
 
         TestProducer producer = new TestProducer(
-                record -> unfinishedFuture,
+                record -> {
+                    if (record.partition() == 1) {
+                        return CompletableFuture.failedFuture(callbackErr);
+                    }
+                    return CompletableFuture.completedFuture(null);
+                },
                 () -> { throw flushErr; }
         );
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        assertThatThrownBy(() -> runReplayTest(List.of(r1), false, false, producer, out))
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 0 acknowledged, 0 failed, 1 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed")
                 .hasCause(flushErr)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
-                    assertThat(rpe.acknowledgedCount()).isEqualTo(0);
-                    assertThat(rpe.failedCount()).isEqualTo(0);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(1);
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(1);
+                    assertThat(rpe.failedCount()).isEqualTo(1);
                 });
-
-        assertThat(getCalled.get()).isFalse();
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
-                .contains("- Acknowledged: 0")
-                .contains("- Failed: 0")
-                .contains("- Unconfirmed: 1")
+                .contains("- Acknowledged: 1")
+                .contains("- Failed: 1")
+                .doesNotContain("Unconfirmed")
                 .contains("Producer flush failed: Kafka producer flush exploded")
-                .contains("PARTIAL PUBLICATION: some records failed to publish or remain unconfirmed.")
-                .contains("Producer flush failed with unfinished future: Kafka producer flush exploded");
+                .contains("PARTIAL PUBLICATION: some records failed to publish.")
+                .contains("Kafka publication failed: Record 2 callback error");
     }
 
     @Test
@@ -2072,22 +2133,21 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication failed during flush: 2 acknowledged, 0 failed, 0 unconfirmed")
+                .hasMessage("Replay publication failed during flush: 2 acknowledged, 0 failed")
                 .hasCause(flushErr)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(2);
                     assertThat(rpe.failedCount()).isEqualTo(0);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
                 .contains("- Acknowledged: 2")
                 .contains("- Failed: 0")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Producer flush failed: Kafka producer flush socket reset")
-                .contains("PUBLICATION FAILED: producer flush encountered an error despite acknowledged futures.")
+                .contains("PUBLICATION FAILED: producer flush encountered an error despite acknowledged records.")
                 .doesNotContain("PARTIAL PUBLICATION")
                 .doesNotContain("Rejected / Failed records:");
     }
@@ -2113,116 +2173,330 @@ public class DeadLetterReplayCommandTest {
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed, 0 unconfirmed")
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 1 failed")
                 .hasCause(flushErr)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(1);
                     assertThat(rpe.failedCount()).isEqualTo(1);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Producer flush failed: Kafka flush cluster rebalancing")
-                .contains("PARTIAL PUBLICATION: some records failed to publish or remain unconfirmed.")
+                .contains("PARTIAL PUBLICATION: some records failed to publish.")
                 .contains("Kafka publication failed: Leader not available");
     }
 
     @Test
-    public void flushFailureCombinedWithThreadInterruptionPreservesUnconfirmedStatus() throws Exception {
+    public void liveReplayFlushFailsBeforeAllCallbacksCompleteReportsObservedOutcomesWithoutClaimingFinalTotals() throws Exception {
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
         DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
         DeadLetterRecord r3 = record("WAREHOUSE_REJECTED", "bank-a", 2, 12L, false, bytes("k3"));
 
-        RuntimeException flushErr = new RuntimeException("Kafka producer flush timeout");
+        RuntimeException flushErr = new RuntimeException("Kafka producer flush socket reset");
+        CompletableFuture<RecordMetadata> pendingFuture2 = new CompletableFuture<>();
+        CompletableFuture<RecordMetadata> pendingFuture3 = new CompletableFuture<>();
 
         TestProducer producer = new TestProducer(
                 record -> {
                     if (record.partition() == 0) {
                         return CompletableFuture.completedFuture(null);
                     } else if (record.partition() == 1) {
-                        return new CompletableFuture<>() {
-                            @Override
-                            public boolean isDone() {
-                                return true;
-                            }
-
-                            @Override
-                            public RecordMetadata get() throws InterruptedException {
-                                throw new InterruptedException("Thread interrupted during future get");
-                            }
-                        };
+                        return pendingFuture2;
                     } else {
-                        return new CompletableFuture<>();
+                        return pendingFuture3;
                     }
                 },
                 () -> { throw flushErr; }
         );
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
-        Thread.interrupted();
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
+                .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
+                .hasMessage("Replay publication failed during flush: observed 1 acknowledged, 0 failed (2 callbacks pending)")
+                .hasCause(flushErr)
+                .satisfies(e -> {
+                    DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(1);
+                    assertThat(rpe.failedCount()).isEqualTo(0);
+                });
 
-        try {
-            assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
-                    .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                    .hasMessage("Replay publication incomplete: 1 acknowledged, 0 failed, 2 unconfirmed")
-                    .satisfies(e -> {
-                        DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
-                        assertThat(rpe.acknowledgedCount()).isEqualTo(1);
-                        assertThat(rpe.failedCount()).isEqualTo(0);
-                        assertThat(rpe.unconfirmedCount()).isEqualTo(2);
-                    });
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Records ready for replay: 3")
+                .contains("Callback outcomes observed at reporting time after flush failure:")
+                .contains("- Acknowledged: 1")
+                .contains("- Failed: 0")
+                .doesNotContain("Records replayed to Kafka")
+                .doesNotContain("Unconfirmed")
+                .contains("Producer flush failed: Kafka producer flush socket reset")
+                .contains("PUBLICATION FAILED: producer flush encountered an error before all callbacks completed.");
+    }
 
-            assertThat(Thread.currentThread().isInterrupted()).isTrue();
-        } finally {
-            Thread.interrupted();
-        }
+    @Test
+    public void liveReplayCallbacksCompletingAfterSnapshotDoNotMutateReportOrExceptionCounts() throws Exception {
+        DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
+        DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
+
+        RuntimeException flushErr = new RuntimeException("Kafka producer flush socket reset");
+        CompletableFuture<RecordMetadata> pendingFuture2 = new CompletableFuture<>();
+
+        AtomicBoolean completedLate = new AtomicBoolean(false);
+        TestProducer producer = new TestProducer(
+                record -> {
+                    if (record.partition() == 0) {
+                        return CompletableFuture.completedFuture(null);
+                    } else {
+                        return pendingFuture2;
+                    }
+                },
+                () -> { throw flushErr; }
+        );
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream() {
+            @Override
+            public synchronized void write(int b) {
+                if (completedLate.compareAndSet(false, true)) {
+                    pendingFuture2.complete(null);
+                }
+                super.write(b);
+            }
+
+            @Override
+            public synchronized void write(byte[] b, int off, int len) {
+                if (completedLate.compareAndSet(false, true)) {
+                    pendingFuture2.complete(null);
+                }
+                super.write(b, off, len);
+            }
+        };
+
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
+                .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
+                .hasMessage("Replay publication failed during flush: observed 1 acknowledged, 0 failed (1 callback pending)")
+                .hasCause(flushErr)
+                .satisfies(e -> {
+                    DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(1);
+                    assertThat(rpe.failedCount()).isEqualTo(0);
+                    assertThat(rpe.publication().pendingCallbacks()).isEqualTo(1);
+                    assertThat(rpe.publication().failureReasons()).isEmpty();
+                });
+
+        assertThat(completedLate).isTrue();
+        assertThat(pendingFuture2).isCompleted();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Records ready for replay: 2")
+                .contains("Callback outcomes observed at reporting time after flush failure:")
+                .contains("- Acknowledged: 1")
+                .contains("- Failed: 0")
+                .doesNotContain("Records replayed to Kafka")
+                .doesNotContain("Unconfirmed")
+                .contains("Producer flush failed: Kafka producer flush socket reset")
+                .contains("PUBLICATION FAILED: producer flush encountered an error before all callbacks completed.");
+    }
+
+    @Test
+    public void liveReplayCallbackFailureCompletingAfterSnapshotDoesNotMutateReportOrException() throws Exception {
+        DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
+        DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
+
+        RuntimeException flushErr = new RuntimeException("Kafka producer flush socket reset");
+        RuntimeException lateFailure = new RuntimeException("Late callback publication failure");
+        CompletableFuture<RecordMetadata> pendingFuture2 = new CompletableFuture<>();
+
+        AtomicBoolean completedLate = new AtomicBoolean(false);
+        TestProducer producer = new TestProducer(
+                record -> {
+                    if (record.partition() == 0) {
+                        return CompletableFuture.completedFuture(null);
+                    } else {
+                        return pendingFuture2;
+                    }
+                },
+                () -> { throw flushErr; }
+        );
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream() {
+            @Override
+            public synchronized void write(int b) {
+                if (completedLate.compareAndSet(false, true)) {
+                    pendingFuture2.completeExceptionally(lateFailure);
+                }
+                super.write(b);
+            }
+
+            @Override
+            public synchronized void write(byte[] b, int off, int len) {
+                if (completedLate.compareAndSet(false, true)) {
+                    pendingFuture2.completeExceptionally(lateFailure);
+                }
+                super.write(b, off, len);
+            }
+        };
+
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
+                .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
+                .hasMessage("Replay publication failed during flush: observed 1 acknowledged, 0 failed (1 callback pending)")
+                .hasCause(flushErr)
+                .satisfies(e -> {
+                    DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(1);
+                    assertThat(rpe.failedCount()).isEqualTo(0);
+                    assertThat(rpe.publication().pendingCallbacks()).isEqualTo(1);
+                    assertThat(rpe.publication().failureReasons()).doesNotContainKey(r2);
+                    assertThat(rpe.publication().failureReasons()).doesNotContainValue("Kafka publication failed: Late callback publication failure");
+                });
+
+        assertThat(completedLate).isTrue();
+        assertThat(pendingFuture2).isCompletedExceptionally();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Records ready for replay: 2")
+                .contains("Callback outcomes observed at reporting time after flush failure:")
+                .contains("- Acknowledged: 1")
+                .contains("- Failed: 0")
+                .doesNotContain("Late callback publication failure")
+                .doesNotContain("Rejected / Failed records:")
+                .doesNotContain("Records replayed to Kafka")
+                .doesNotContain("Unconfirmed")
+                .contains("Producer flush failed: Kafka producer flush socket reset")
+                .contains("PUBLICATION FAILED: producer flush encountered an error before all callbacks completed.");
+    }
+
+    @Test
+    public void liveReplayFlushFailsWithSinglePendingCallbackReportsAccurateCount() throws Exception {
+        DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
+        DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
+
+        RuntimeException flushErr = new RuntimeException("Kafka producer flush socket reset");
+        CompletableFuture<RecordMetadata> pendingFuture2 = new CompletableFuture<>();
+
+        TestProducer producer = new TestProducer(
+                record -> {
+                    if (record.partition() == 0) {
+                        return CompletableFuture.completedFuture(null);
+                    } else {
+                        return pendingFuture2;
+                    }
+                },
+                () -> { throw flushErr; }
+        );
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2), false, false, producer, out))
+                .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
+                .hasMessage("Replay publication failed during flush: observed 1 acknowledged, 0 failed (1 callback pending)")
+                .hasCause(flushErr)
+                .satisfies(e -> {
+                    DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(1);
+                    assertThat(rpe.failedCount()).isEqualTo(0);
+                });
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Records ready for replay: 2")
+                .contains("Callback outcomes observed at reporting time after flush failure:")
+                .contains("- Acknowledged: 1")
+                .contains("- Failed: 0")
+                .doesNotContain("Records replayed to Kafka")
+                .doesNotContain("Unconfirmed")
+                .contains("Producer flush failed: Kafka producer flush socket reset")
+                .contains("PUBLICATION FAILED: producer flush encountered an error before all callbacks completed.");
+    }
+
+    @Test
+    public void liveReplayMixedCallbackAndSynchronousFailuresWithAccurateCounts() throws Exception {
+        DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
+        DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 1, 11L, false, bytes("k2"));
+        DeadLetterRecord r3 = record("WAREHOUSE_REJECTED", "bank-a", 2, 12L, false, bytes("k3"));
+
+        RuntimeException syncErr = new RuntimeException("Synchronous buffer full");
+        RuntimeException asyncErr = new RuntimeException("Broker rejected payload");
+
+        AtomicInteger count = new AtomicInteger(0);
+        TestProducer producer = new TestProducer(record -> {
+            int idx = count.getAndIncrement();
+            if (idx == 1) {
+                throw syncErr;
+            } else if (idx == 2) {
+                return CompletableFuture.failedFuture(asyncErr);
+            }
+            return CompletableFuture.completedFuture(null);
+        });
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        assertThatThrownBy(() -> runReplayTest(List.of(r1, r2, r3), false, false, producer, out))
+                .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
+                .hasMessage("Replay publication incomplete: 1 acknowledged, 2 failed")
+                .hasCause(syncErr)
+                .satisfies(e -> {
+                    DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
+                    assertThat(rpe.acknowledgedCount()).isEqualTo(1);
+                    assertThat(rpe.failedCount()).isEqualTo(2);
+                });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
                 .contains("- Acknowledged: 1")
-                .contains("- Failed: 0")
-                .contains("- Unconfirmed: 2")
-                .contains("Producer flush failed: Kafka producer flush timeout")
-                .contains("Wait interrupted while awaiting Kafka acknowledgement (producer flush failed: Kafka producer flush timeout)")
-                .contains("Wait cancelled due to thread interruption (producer flush failed: Kafka producer flush timeout)");
+                .contains("- Failed: 2")
+                .doesNotContain("Unconfirmed")
+                .contains("Synchronous send failure: Synchronous buffer full")
+                .contains("Kafka publication failed: Broker rejected payload");
     }
 
     @Test
-    public void nullFutureReturnedByProducerSendClassifiedAsFailedWithMeaningfulCause() throws Exception {
+    public void liveReplayCallbackExceptionWithoutMessageHandledCleanly() throws Exception {
         DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
 
-        TestProducer producer = new TestProducer(record -> null);
+        RuntimeException errWithoutMsg = new RuntimeException();
+        TestProducer producer = new TestProducer(record -> CompletableFuture.failedFuture(errWithoutMsg));
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
         assertThatThrownBy(() -> runReplayTest(List.of(r1), false, false, producer, out))
                 .isInstanceOf(DeadLetterReplayCommand.ReplayPublicationException.class)
-                .hasMessage("Replay publication incomplete: 0 acknowledged, 1 failed, 0 unconfirmed")
-                .hasCauseInstanceOf(IllegalStateException.class)
+                .hasMessage("Replay publication incomplete: 0 acknowledged, 1 failed")
+                .hasCause(errWithoutMsg)
                 .satisfies(e -> {
                     DeadLetterReplayCommand.ReplayPublicationException rpe = (DeadLetterReplayCommand.ReplayPublicationException) e;
                     assertThat(rpe.acknowledgedCount()).isEqualTo(0);
                     assertThat(rpe.failedCount()).isEqualTo(1);
-                    assertThat(rpe.unconfirmedCount()).isEqualTo(0);
-                    assertThat(rpe.getCause()).hasMessage("No future returned from Kafka producer");
                 });
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
                 .contains("- Acknowledged: 0")
                 .contains("- Failed: 1")
-                .contains("- Unconfirmed: 0")
-                .contains("No future returned from Kafka producer");
+                .doesNotContain("Unconfirmed")
+                .contains("Kafka publication failed: RuntimeException");
     }
 
     private DeadLetterRecord makeRecordWithReplayUuid(String reason, String sourceId, int partition, long offset, UUID replayUuid) {
         RecordHeaders h = headers(reason, sourceId, "fineract.cdc.batch_job_instance", partition, offset);
         ReplayIdentityHeaders.add(h, new ReplayIdentity(replayUuid, "fineract.cdc.dlt", partition, offset));
         byte[] payload = bytes("{\"after\":{\"job_instance_id\":" + offset + "},\"source\":{\"name\":\"" + sourceId + "\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
+        return DeadLetterRecord.parse("fineract.cdc.dlt", partition, offset, h, bytes("k" + offset), payload, contract);
+    }
+
+    private DeadLetterRecord makeRecordWithReplayUuid(String reason, String sourceId, String table, int partition, long offset, UUID replayUuid) {
+        RecordHeaders h = headers(reason, sourceId, "fineract.cdc." + table, partition, offset);
+        ReplayIdentityHeaders.add(h, new ReplayIdentity(replayUuid, "fineract.cdc.dlt", partition, offset));
+        byte[] payload = bytes("{\"after\":{\"job_instance_id\":" + offset + "},\"source\":{\"name\":\"" + sourceId + "\",\"table\":\"" + table + "\",\"ts_ms\":1000},\"op\":\"c\"}");
+        return DeadLetterRecord.parse("fineract.cdc.dlt", partition, offset, h, bytes("k" + offset), payload, contract);
+    }
+
+    private DeadLetterRecord makeRecordWithReplayUuidAndPk(String reason, String sourceId, String table, int partition, long offset, UUID replayUuid, long pk) {
+        RecordHeaders h = headers(reason, sourceId, "fineract.cdc." + table, partition, offset);
+        ReplayIdentityHeaders.add(h, new ReplayIdentity(replayUuid, "fineract.cdc.dlt", partition, offset));
+        byte[] payload = bytes("{\"after\":{\"job_instance_id\":" + pk + "},\"source\":{\"name\":\"" + sourceId + "\",\"table\":\"" + table + "\",\"ts_ms\":1000},\"op\":\"c\"}");
         return DeadLetterRecord.parse("fineract.cdc.dlt", partition, offset, h, bytes("k" + offset), payload, contract);
     }
 
@@ -2253,7 +2527,6 @@ public class DeadLetterReplayCommandTest {
                 .contains("- APPLIED: 1")
                 .contains("- SKIPPED_STALE: 0")
                 .contains("- SKIPPED_SUPERSEDED: 0")
-                .doesNotContain("LEGACY_UNKNOWN")
                 .doesNotContain("CLAIMED")
                 .contains("Already completed in replay ledger (" + appliedUuid + ": APPLIED)");
         assertThat(writer.preflightCalls).isEmpty();
@@ -2322,37 +2595,6 @@ public class DeadLetterReplayCommandTest {
     }
 
     @Test
-    public void legacyUnknownReplayIdDisplaysAccuratelyAndNeverAsConfirmedApplied() throws Exception {
-        StubWriter writer = new StubWriter();
-        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
-
-        UUID legacyUuid = UUID.randomUUID();
-        DeadLetterRecord r = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, legacyUuid);
-
-        MockProducer<byte[], byte[]> producer =
-                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
-        Connection conn = mockConnection(Map.of(legacyUuid, ReplayOutcome.LEGACY_UNKNOWN));
-
-        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
-        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(1, Map.of());
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-
-        DeadLetterReplayCommand.processMatchedRecords(
-                scan, List.of(r), contract,
-                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
-                true, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
-
-        String report = out.toString(StandardCharsets.UTF_8);
-        assertThat(report)
-                .contains("Already completed (in ledger): 1 (ledger check performed)")
-                .contains("- APPLIED: 0")
-                .contains("- LEGACY_UNKNOWN: 1")
-                .doesNotContain("- APPLIED: 1")
-                .contains("Already completed in replay ledger (" + legacyUuid + ": LEGACY_UNKNOWN)");
-        assertThat(writer.preflightCalls).isEmpty();
-    }
-
-    @Test
     public void claimedReplayIdDisplaysNonTerminalUnresolvedStateAndBlocksReplay() throws Exception {
         StubWriter writer = new StubWriter();
         WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
@@ -2391,20 +2633,17 @@ public class DeadLetterReplayCommandTest {
         UUID uApplied = UUID.randomUUID();
         UUID uStale = UUID.randomUUID();
         UUID uSuperseded = UUID.randomUUID();
-        UUID uUnknown = UUID.randomUUID();
         UUID uClaimed = UUID.randomUUID();
 
         DeadLetterRecord rApplied = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, uApplied);
         DeadLetterRecord rStale = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, uStale);
         DeadLetterRecord rSuperseded = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 12L, uSuperseded);
-        DeadLetterRecord rUnknown = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 13L, uUnknown);
         DeadLetterRecord rClaimed = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 14L, uClaimed);
 
         Map<UUID, ReplayOutcome> outcomes = new HashMap<>();
         outcomes.put(uApplied, ReplayOutcome.APPLIED);
         outcomes.put(uStale, ReplayOutcome.SKIPPED_STALE);
         outcomes.put(uSuperseded, ReplayOutcome.SKIPPED_SUPERSEDED);
-        outcomes.put(uUnknown, ReplayOutcome.LEGACY_UNKNOWN);
         outcomes.put(uClaimed, ReplayOutcome.CLAIMED);
 
         MockProducer<byte[], byte[]> producer =
@@ -2412,21 +2651,20 @@ public class DeadLetterReplayCommandTest {
         Connection conn = mockConnection(outcomes);
 
         OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
-        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(5, Map.of());
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(4, Map.of());
         ByteArrayOutputStream out = new ByteArrayOutputStream();
 
         DeadLetterReplayCommand.processMatchedRecords(
-                scan, List.of(rApplied, rStale, rSuperseded, rUnknown, rClaimed), contract,
+                scan, List.of(rApplied, rStale, rSuperseded, rClaimed), contract,
                 new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
                 true, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
 
         String report = out.toString(StandardCharsets.UTF_8);
         assertThat(report)
-                .contains("Already completed (in ledger): 5 (ledger check performed)")
+                .contains("Already completed (in ledger): 4 (ledger check performed)")
                 .contains("- APPLIED: 1")
                 .contains("- SKIPPED_STALE: 1")
                 .contains("- SKIPPED_SUPERSEDED: 1")
-                .contains("- LEGACY_UNKNOWN: 1")
                 .contains("- CLAIMED: 1 (in-progress/unresolved)");
         assertThat(writer.preflightCalls).isEmpty();
     }
@@ -2578,12 +2816,678 @@ public class DeadLetterReplayCommandTest {
                 .contains("Records replayed to Kafka: 1")
                 .contains("- Acknowledged: 1")
                 .contains("- Failed: 0")
-                .contains("- Unconfirmed: 0")
+                .doesNotContain("Unconfirmed")
                 .contains("Notice: Records reported as Acknowledged have been accepted by the Kafka broker.")
                 .contains("Warehouse ingestion consumes Kafka asynchronously; broker acknowledgement does not prove warehouse application.")
                 .contains("Durable warehouse outcomes can be inspected later using 'dlt-list --with-ledger' after the sink processes the replay.")
                 .doesNotContain("Predicted warehouse outcomes")
                 .doesNotContain("Applied to warehouse")
                 .doesNotContain("Warehouse applied");
+    }
+
+    @Test
+    public void oneInvalidRecordAmongSeveralValidCandidatesIsolatesAndPublishesValidOnly() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2Bad = UUID.randomUUID();
+        UUID u3 = UUID.randomUUID();
+
+        writer.failingUuids.add(u2Bad);
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2Bad);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 12L, u3);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        AtomicBoolean closed = new AtomicBoolean(false);
+        AtomicInteger aborts = new AtomicInteger(0);
+        Connection conn = mockConnection(closed, aborts);
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).hasSize(2);
+        assertThat(closed.get()).isFalse();
+        assertThat(aborts.get()).isEqualTo(0);
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 2")
+                .contains("Preflight failed: 1")
+                .contains("numeric field overflow")
+                .contains("Records replayed to Kafka: 2");
+    }
+
+    @Test
+    public void multipleInvalidRecordsInDifferentPositionsIsolatedAccurately() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1Bad = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        UUID u3Bad = UUID.randomUUID();
+        UUID u4 = UUID.randomUUID();
+
+        writer.failingUuids.add(u1Bad);
+        writer.failingUuids.add(u3Bad);
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1Bad);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 12L, u3Bad);
+        DeadLetterRecord r4 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 13L, u4);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        AtomicBoolean closed = new AtomicBoolean(false);
+        AtomicInteger aborts = new AtomicInteger(0);
+        Connection conn = mockConnection(closed, aborts);
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(4, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3, r4), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                true, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).isEmpty();
+        assertThat(closed.get()).isFalse();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 2")
+                .contains("Preflight failed: 2")
+                .contains("numeric field overflow")
+                .contains("Preflight verified candidates ready for live replay:")
+                .contains(r2.dltOffset() + "")
+                .contains(r4.dltOffset() + "");
+    }
+
+    @Test
+    public void allCandidatesValidInvokesPreflightOnlyOnce() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        UUID u3 = UUID.randomUUID();
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 12L, u3);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(writer.preflightCalls).hasSize(1);
+        assertThat(writer.preflightCalls.get(0)).hasSize(3);
+        assertThat(producer.history()).hasSize(3);
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 3")
+                .contains("Preflight failed: 0");
+    }
+
+    @Test
+    public void allCandidatesInvalidBisectsAndFailsAllWithoutPublication() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1Bad = UUID.randomUUID();
+        UUID u2Bad = UUID.randomUUID();
+
+        writer.failingUuids.add(u1Bad);
+        writer.failingUuids.add(u2Bad);
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1Bad);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2Bad);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        AtomicBoolean closed = new AtomicBoolean(false);
+        AtomicInteger aborts = new AtomicInteger(0);
+        Connection conn = mockConnection(closed, aborts);
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(2, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(writer.preflightCalls).hasSize(3);
+        assertThat(producer.history()).isEmpty();
+        assertThat(closed.get()).isFalse();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 0")
+                .contains("Preflight failed: 2")
+                .contains("numeric field overflow");
+    }
+
+    @Test
+    public void multipleSourceTableGroupsIsolatesFailingGroupWhilePassingValidGroup() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2Bad = UUID.randomUUID();
+        UUID u3 = UUID.randomUUID();
+        UUID u4 = UUID.randomUUID();
+
+        writer.failingUuids.add(u2Bad);
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 10L, u1);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 11L, u2Bad);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-b", "batch_job_instance", 0, 12L, u3);
+        DeadLetterRecord r4 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-b", "batch_job_instance", 0, 13L, u4);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership(Map.of(
+                "bank-a", List.of("batch_job_instance"),
+                "bank-b", List.of("batch_job_instance")), Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(4, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3, r4), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).hasSize(3);
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 3")
+                .contains("Preflight failed: 1")
+                .contains("Records replayed to Kafka: 3");
+    }
+
+    @Test
+    public void infrastructureErrorsDoNotBisectAndFailEntireBatchClosedWithoutPublication() throws Exception {
+        StubWriter writer = new StubWriter();
+        writer.nextException = new SQLException("08006: connection failure", "08006");
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        DeadLetterRecord r1 = record("WAREHOUSE_REJECTED", "bank-a", 0, 10L, false, bytes("k1"));
+        DeadLetterRecord r2 = record("WAREHOUSE_REJECTED", "bank-a", 0, 11L, false, bytes("k2"));
+        DeadLetterRecord r3 = record("WAREHOUSE_REJECTED", "bank-a", 0, 12L, false, bytes("k3"));
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        AtomicBoolean closed = new AtomicBoolean(false);
+        AtomicInteger aborts = new AtomicInteger(0);
+        Connection conn = mockConnection(closed, aborts);
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(writer.preflightCalls).hasSize(1);
+        assertThat(closed.get()).isFalse();
+        assertThat(aborts.get()).isEqualTo(0);
+        assertThat(producer.history()).isEmpty();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight failed: 3")
+                .contains("connection failure");
+    }
+
+    @Test
+    public void finalCombinedSetValidationFailureMarksProvisionallyValidCandidatesInconclusive() throws Exception {
+        StubWriter writer = new StubWriter();
+        AtomicInteger callCount = new AtomicInteger(0);
+        writer.failureRule = events -> {
+            int call = callCount.incrementAndGet();
+            if (call == 1) {
+                return new SQLException("22003: numeric field overflow", "22003");
+            }
+            if (events.size() > 1) {
+                return new SQLException("23505: unique constraint violation", "23505");
+            }
+            return null;
+        };
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(2, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).isEmpty();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight inconclusive: 2")
+                .contains("Preflight passed: 0")
+                .contains("Preflight failed: 0")
+                .contains("Warehouse validation inconclusive: provisionally valid records failed when combined in a single batch")
+                .doesNotContain("Predicted warehouse outcomes");
+    }
+
+    @Test
+    public void interdependentParentChildPairDoesNotFalselyAttributeChildAsInvalidAndDoesNotPublish() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1Parent = UUID.randomUUID();
+        UUID u2Child = UUID.randomUUID();
+        UUID u3Bad = UUID.randomUUID();
+
+        writer.failureRule = events -> {
+            boolean hasU3 = events.stream().anyMatch(e -> e.replayIdentity() != null && u3Bad.equals(e.replayIdentity().replayId()));
+            if (hasU3) {
+                return new SQLException("22003: numeric field overflow", "22003");
+            }
+            boolean hasParent = events.stream().anyMatch(e -> e.replayIdentity() != null && u1Parent.equals(e.replayIdentity().replayId()));
+            boolean hasChild = events.stream().anyMatch(e -> e.replayIdentity() != null && u2Child.equals(e.replayIdentity().replayId()));
+            if (hasChild && !hasParent) {
+                return new SQLException("23503: foreign key violation", "23503");
+            }
+            return null;
+        };
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1Parent);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2Child);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 12L, u3Bad);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).isEmpty();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight inconclusive: 3")
+                .contains("Preflight passed: 0")
+                .contains("Preflight failed: 0")
+                .contains("23503")
+                .contains("foreign key violation");
+    }
+
+    @Test
+    public void systemicErrorDuringRecursionAbortsIsolationAndDoesNotFalselyLabelUnresolvedCandidates() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        UUID u3 = UUID.randomUUID();
+
+        AtomicInteger callCount = new AtomicInteger(0);
+        writer.failureRule = events -> {
+            int call = callCount.incrementAndGet();
+            if (call == 1) {
+                return new SQLException("22003: numeric field overflow", "22003");
+            }
+            if (call == 2) {
+                return null;
+            }
+            return new SQLException("08006: connection failure during recursion", "08006");
+        };
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 12L, u3);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(callCount.get()).isEqualTo(3);
+        assertThat(producer.history()).isEmpty();
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight inconclusive: 3")
+                .contains("Preflight passed: 0")
+                .contains("Preflight failed: 0")
+                .contains("08006")
+                .contains("connection failure during recursion");
+    }
+
+    @Test
+    public void interleavedSourceTableCandidatesPreserveOriginalOrderInCombinedPreflightAndPublication() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        UUID u3 = UUID.randomUUID();
+        UUID u4Bad = UUID.randomUUID();
+
+        writer.failingUuids.add(u4Bad);
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 10L, u1);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-b", "batch_job_instance", 0, 11L, u2);
+        DeadLetterRecord r3 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 12L, u3);
+        DeadLetterRecord r4 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-b", "batch_job_instance", 0, 13L, u4Bad);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership(Map.of(
+                "bank-a", List.of("batch_job_instance"),
+                "bank-b", List.of("batch_job_instance")), Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(4, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3, r4), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).hasSize(3);
+        List<UUID> publishedUuids = producer.history().stream()
+                .map(p -> ReplayIdentityHeaders.read(p.headers()).orElseThrow().replayId())
+                .toList();
+        assertThat(publishedUuids).containsExactly(u1, u2, u3);
+
+        Collection<RoutedEvent> finalCombinedCall = writer.preflightCalls.get(writer.preflightCalls.size() - 1);
+        List<UUID> preflightedUuids = finalCombinedCall.stream()
+                .map(e -> e.replayIdentity().replayId())
+                .toList();
+        assertThat(preflightedUuids).containsExactly(u1, u2, u3);
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 3")
+                .contains("Preflight failed: 1")
+                .contains("Records replayed to Kafka: 3");
+    }
+
+    @Test
+    public void predictedOutcomesComeFromFinalCombinedPreflightNotStaleSubset() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1Bad = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+
+        writer.failingUuids.add(u1Bad);
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 10L, u1Bad);
+        DeadLetterRecord r2 = makeRecordWithReplayUuid("WAREHOUSE_REJECTED", "bank-a", 0, 11L, u2);
+
+        writer.predictedOutcomes = Map.of(r2.replayIdentity(), ReplayOutcome.SKIPPED_STALE);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(2, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                true, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 1")
+                .contains("Preflight failed: 1")
+                .contains("- SKIPPED_STALE: 1")
+                .contains("- APPLIED: 0")
+                .contains("- SKIPPED_SUPERSEDED: 0");
+    }
+
+    @Test
+    public void candidatesForSameEntityTreatedAsAtomicUnitSoSupersededRecordDoesNotFailPreflight() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1Older = UUID.randomUUID();
+        UUID u2Newer = UUID.randomUUID();
+        UUID u3Bad = UUID.randomUUID();
+
+        writer.failureRule = events -> {
+            boolean hasU3 = events.stream().anyMatch(e -> e.replayIdentity() != null
+                    && u3Bad.equals(e.replayIdentity().replayId()));
+            if (hasU3) {
+                return new SQLException("22003: numeric field overflow on unrelated entity", "22003");
+            }
+            boolean hasU1 = events.stream().anyMatch(e -> e.replayIdentity() != null
+                    && u1Older.equals(e.replayIdentity().replayId()));
+            boolean hasU2 = events.stream().anyMatch(e -> e.replayIdentity() != null
+                    && u2Newer.equals(e.replayIdentity().replayId()));
+            if (hasU1 && !hasU2) {
+                return new SQLException("22003: numeric field overflow on older superseded record", "22003");
+            }
+            return null;
+        };
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 10L, u1Older, 9001L);
+        DeadLetterRecord r2 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 11L, u2Newer, 9001L);
+        DeadLetterRecord r3 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 12L, u3Bad, 9999L);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        for (Collection<RoutedEvent> call : writer.preflightCalls) {
+            boolean has1 = call.stream().anyMatch(e -> e.replayIdentity() != null && u1Older.equals(e.replayIdentity().replayId()));
+            boolean has2 = call.stream().anyMatch(e -> e.replayIdentity() != null && u2Newer.equals(e.replayIdentity().replayId()));
+            assertThat(has1).isEqualTo(has2);
+        }
+
+        Collection<RoutedEvent> finalCall = writer.preflightCalls.get(writer.preflightCalls.size() - 1);
+        List<UUID> finalUuids = finalCall.stream().map(e -> e.replayIdentity().replayId()).toList();
+        assertThat(finalUuids).containsExactly(u1Older, u2Newer);
+
+        assertThat(producer.history()).hasSize(2);
+        List<UUID> publishedUuids = producer.history().stream()
+                .map(p -> ReplayIdentityHeaders.read(p.headers()).orElseThrow().replayId())
+                .toList();
+        assertThat(publishedUuids).containsExactly(u1Older, u2Newer);
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 2")
+                .contains("Preflight failed: 1")
+                .contains("numeric field overflow on unrelated entity")
+                .doesNotContain("numeric field overflow on older superseded record");
+    }
+
+    @Test
+    public void failingMultiRecordEntityUnitReportedAsInconclusiveRatherThanIndividuallyFailed() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        UUID u3 = UUID.randomUUID();
+
+        writer.failureRule = events -> {
+            boolean hasEntity9001 = events.stream().anyMatch(e -> e.replayIdentity() != null
+                    && (u1.equals(e.replayIdentity().replayId()) || u2.equals(e.replayIdentity().replayId())));
+            if (hasEntity9001) {
+                return new SQLException("22003: numeric field overflow on entity 9001", "22003");
+            }
+            return null;
+        };
+
+        DeadLetterRecord r1 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 10L, u1, 9001L);
+        DeadLetterRecord r2 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 11L, u2, 9001L);
+        DeadLetterRecord r3 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 12L, u3, 9999L);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(3, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2, r3), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).hasSize(1);
+        UUID published = ReplayIdentityHeaders.read(producer.history().get(0).headers()).orElseThrow().replayId();
+        assertThat(published).isEqualTo(u3);
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight passed: 1")
+                .contains("Preflight failed: 0")
+                .contains("Preflight inconclusive: 2")
+                .contains("multi-record entity unit failed validation and individual attribution is unsafe");
+    }
+
+    @Test
+    public void unresolvableEntityPrimaryKeyFailsClosedAsInconclusiveWithoutArbitraryBisection() throws Exception {
+        StubWriter writer = new StubWriter();
+        WarehousePreflightValidator validator = new WarehousePreflightValidator(contract, writer);
+
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+
+        writer.failureRule = events -> new SQLException("22003: numeric field overflow", "22003");
+
+        RecordHeaders h1 = headers("WAREHOUSE_REJECTED", "bank-a", "fineract.cdc.batch_job_instance", 0, 10L);
+        ReplayIdentityHeaders.add(h1, new ReplayIdentity(u1, "fineract.cdc.dlt", 0, 10L));
+        byte[] payload1 = bytes("{\"after\":{\"job_instance_id\":9999999999999999999999999999999999999999},\"source\":{\"name\":\"bank-a\",\"table\":\"batch_job_instance\",\"ts_ms\":1000},\"op\":\"c\"}");
+        DeadLetterRecord r1 = DeadLetterRecord.parse("fineract.cdc.dlt", 0, 10L, h1, bytes("k10"), payload1, contract);
+
+        DeadLetterRecord r2 = makeRecordWithReplayUuidAndPk("WAREHOUSE_REJECTED", "bank-a", "batch_job_instance", 0, 11L, u2, 9002L);
+
+        MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, null, new ByteArraySerializer(), new ByteArraySerializer());
+        Connection conn = mockConnection(new AtomicBoolean(false), new AtomicInteger(0));
+
+        OwnershipSnapshot os = ownership("bank-a", "batch_job_instance", Route.Target.PROD);
+        DeadLetterReader.ScanResult scan = new DeadLetterReader.ScanResult(2, Map.of());
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        DeadLetterReplayCommand.processMatchedRecords(
+                scan, List.of(r1, r2), contract,
+                new DeadLetterReplayCommand.ReplayFilter(null, null, null, null),
+                false, false, conn, os, validator, producer, new PrintStream(out, true, StandardCharsets.UTF_8));
+
+        assertThat(producer.history()).isEmpty();
+        assertThat(writer.preflightCalls).hasSize(1);
+
+        String report = out.toString(StandardCharsets.UTF_8);
+        assertThat(report)
+                .contains("Preflight inconclusive: 2")
+                .contains("Preflight passed: 0")
+                .contains("Preflight failed: 0")
+                .contains("primary-key identity could not be reliably determined for entity isolation");
+    }
+
+    @Test
+    public void auditPrimaryKeyNormalizationMatchesPostgresEqualitySemantics() {
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("char(10)", "abc   ")).isEqualTo("abc");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("character(10)", "abc   ")).isEqualTo("abc");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("bpchar", "abc   ")).isEqualTo("abc");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("char", "abc")).isEqualTo("abc");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("char(10)", "   ")).isEqualTo("");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("char(10)", " abc ")).isEqualTo(" abc");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("varchar(255)", "abc   ")).isEqualTo("abc   ");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("character varying(100)", "abc   ")).isEqualTo("abc   ");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("text", "abc   ")).isEqualTo("abc   ");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("numeric(10,2)", "100.00")).isEqualTo("100");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("decimal", "100.0")).isEqualTo("100");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("numeric", "0.00")).isEqualTo("0");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("numeric", "-0.0")).isEqualTo("0");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("numeric", "0")).isEqualTo("0");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("numeric", "1e2")).isEqualTo("100");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("numeric", "123.4500")).isEqualTo("123.45");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("uuid", "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"))
+                .isEqualTo("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("uuid", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"))
+                .isEqualTo("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("bigint", "  123  ")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("int8", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("bigserial", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("integer", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("int4", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("serial", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("smallint", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("int2", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("smallserial", "123")).isEqualTo("123");
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("smallint", "99999999")).isNull();
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("integer", "9999999999")).isNull();
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("date", "2026-01-01")).isNull();
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("timestamptz", "2026-01-01T00:00:00Z")).isNull();
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("bytea", "\\x0102")).isNull();
+        assertThat(DeadLetterReplayCommand.normalizePrimaryKey("jsonb", "{}")).isNull();
     }
 }

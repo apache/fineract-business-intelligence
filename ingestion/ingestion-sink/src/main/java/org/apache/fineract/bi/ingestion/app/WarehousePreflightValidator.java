@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import org.apache.fineract.bi.ingestion.cdc.ChangeEvent;
 import org.apache.fineract.bi.ingestion.cdc.DebeziumEnvelopeParser;
 import org.apache.fineract.bi.ingestion.cdc.PoisonEventException;
@@ -46,15 +47,40 @@ public final class WarehousePreflightValidator {
             boolean passed,
             String reason,
             Collection<RoutedEvent> routedEvents,
-            Map<ReplayIdentity, ReplayOutcome> predictedOutcomes) {
+            Map<ReplayIdentity, ReplayOutcome> predictedOutcomes,
+            String sqlState) {
 
         public BatchValidationResult(boolean passed, String reason, Collection<RoutedEvent> routedEvents) {
-            this(passed, reason, routedEvents, Map.of());
+            this(passed, reason, routedEvents, Map.of(), null);
+        }
+
+        public BatchValidationResult(
+                boolean passed,
+                String reason,
+                Collection<RoutedEvent> routedEvents,
+                Map<ReplayIdentity, ReplayOutcome> predictedOutcomes) {
+            this(passed, reason, routedEvents, predictedOutcomes, null);
         }
 
         public BatchValidationResult {
             routedEvents = routedEvents == null ? List.of() : List.copyOf(routedEvents);
             predictedOutcomes = predictedOutcomes == null ? Map.of() : Map.copyOf(predictedOutcomes);
+        }
+
+        private static final Set<String> RECORD_LEVEL_SQLSTATES = Set.of(
+                "22001",
+                "22003",
+                "22007",
+                "22008",
+                "22012",
+                "22021",
+                "22P02",
+                "23502",
+                "23514"
+        );
+
+        public boolean isRecordLevelError() {
+            return sqlState != null && RECORD_LEVEL_SQLSTATES.contains(sqlState);
         }
     }
 
@@ -126,15 +152,15 @@ public final class WarehousePreflightValidator {
         }
         try {
             BatchWriter.PreflightResult preflightResult = writer.preflight(connection, routedEvents);
-            return new BatchValidationResult(true, null, routedEvents, preflightResult.predictedOutcomes());
+            return new BatchValidationResult(true, null, routedEvents, preflightResult.predictedOutcomes(), null);
         } catch (PreflightRollbackException e) {
             throw e;
         } catch (SQLException e) {
             return new BatchValidationResult(
-                    false, "Warehouse validation failed: [" + e.getSQLState() + "] " + e.getMessage(), routedEvents, Map.of());
+                    false, "Warehouse validation failed: [" + e.getSQLState() + "] " + e.getMessage(), routedEvents, Map.of(), e.getSQLState());
         } catch (Exception e) {
             return new BatchValidationResult(
-                    false, "Warehouse validation failed: " + e.getMessage(), routedEvents, Map.of());
+                    false, "Warehouse validation failed: " + e.getMessage(), routedEvents, Map.of(), null);
         }
     }
 

@@ -649,164 +649,6 @@ CREATE TABLE IF NOT EXISTS meta.consumer_offsets (
     PRIMARY KEY (consumer_group, topic, kafka_partition)
 );
 
--- Note for existing installations:
--- Reapply platform.sql as an administrator to provision meta.replay_ledger, its indices, and meta.purge_replay_ledger().
--- To grant ingestion engine permissions on existing installations, run:
---   GRANT SELECT, INSERT ON meta.replay_ledger TO <warehouse_engine_user>;
---   GRANT UPDATE (outcome) ON meta.replay_ledger TO <warehouse_engine_user>;
--- (e.g. analytics_engine as configured in docker/postgres-warehouse/initdb/002_create_warehouse_roles.sh).
---
--- Retention Note:
--- The default retention of 90 days in meta.platform_settings (replay_ledger_retention_days) assumes
--- the default 14-day Kafka DLT retention (TOPIC_DLT_RETENTION_MS). Operators who increase Kafka DLT retention
--- must increase replay_ledger_retention_days correspondingly so that the ledger outlives Kafka DLT messages.
--- If cold-archived DLT records are restored to Kafka after their ledger entry has expired and been purged,
--- the LSN/generation guard only protects newer warehouse rows that still exist in the warehouse raw table.
--- Rows deleted and purged from change logs or never inserted would be reapplied if re-injected after ledger expiry.
-DO $$
-DECLARE
-    v_has_replay_id BOOLEAN;
-    v_any_nullable BOOLEAN;
-    v_needs_backfill BOOLEAN;
-    v_pk_is_sole_replay_id BOOLEAN;
-    v_existing_pk_name TEXT;
-    v_has_outcome BOOLEAN;
-BEGIN
-    IF to_regclass('meta.replay_ledger') IS NOT NULL THEN
-        -- 1. Ensure missing columns exist
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'replay_id'
-        ) INTO v_has_replay_id;
-
-        IF NOT v_has_replay_id THEN
-            ALTER TABLE meta.replay_ledger ADD COLUMN replay_id UUID;
-        END IF;
-
-        ALTER TABLE meta.replay_ledger ADD COLUMN IF NOT EXISTS source_id TEXT;
-        ALTER TABLE meta.replay_ledger ADD COLUMN IF NOT EXISTS table_name TEXT;
-
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'outcome'
-        ) INTO v_has_outcome;
-
-        IF NOT v_has_outcome THEN
-            ALTER TABLE meta.replay_ledger ADD COLUMN outcome TEXT;
-            UPDATE meta.replay_ledger SET outcome = 'LEGACY_UNKNOWN' WHERE outcome IS NULL;
-            ALTER TABLE meta.replay_ledger ALTER COLUMN outcome SET NOT NULL;
-            ALTER TABLE meta.replay_ledger ADD CONSTRAINT chk_replay_outcome
-                CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED', 'LEGACY_UNKNOWN'));
-        ELSE
-            UPDATE meta.replay_ledger SET outcome = 'LEGACY_UNKNOWN' WHERE outcome IS NULL;
-            ALTER TABLE meta.replay_ledger ALTER COLUMN outcome SET NOT NULL;
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.table_constraints
-                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND constraint_name = 'chk_replay_outcome'
-            ) THEN
-                ALTER TABLE meta.replay_ledger ADD CONSTRAINT chk_replay_outcome
-                    CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED', 'LEGACY_UNKNOWN'));
-            END IF;
-        END IF;
-
-        -- 2. Inspect column nullability via metadata before checking table rows
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'meta'
-              AND table_name = 'replay_ledger'
-              AND column_name IN ('replay_id', 'source_id', 'table_name', 'outcome')
-              AND is_nullable = 'YES'
-        ) INTO v_any_nullable;
-
-        -- When all four columns are already NOT NULL, skip the NULL-detection query and backfill entirely
-        IF v_any_nullable THEN
-            SELECT EXISTS (
-                SELECT 1 FROM meta.replay_ledger
-                WHERE replay_id IS NULL OR source_id IS NULL OR table_name IS NULL OR outcome IS NULL
-            ) INTO v_needs_backfill;
-
-            IF v_needs_backfill THEN
-                UPDATE meta.replay_ledger
-                SET replay_id = COALESCE(replay_id, (
-                        SELECT (
-                            substring(h from 1 for 8) || '-' ||
-                            substring(h from 9 for 4) || '-' ||
-                            '3' || substring(h from 14 for 3) || '-' ||
-                            substr('89ab89ab89ab89ab', strpos('0123456789abcdef', substring(h from 17 for 1)), 1) || substring(h from 18 for 3) || '-' ||
-                            substring(h from 21 for 12)
-                        )::uuid
-                        FROM (
-                            SELECT md5('fbi:replay:' || meta.replay_ledger.dlt_topic || ':' || meta.replay_ledger.dlt_partition || ':' || meta.replay_ledger.dlt_offset) AS h
-                        ) sub
-                    )),
-                    source_id = COALESCE(source_id, '<legacy>'),
-                    table_name = COALESCE(table_name, '<legacy>'),
-                    outcome = COALESCE(outcome, 'LEGACY_UNKNOWN')
-                WHERE replay_id IS NULL OR source_id IS NULL OR table_name IS NULL OR outcome IS NULL;
-            END IF;
-
-            -- 3. Enforce NOT NULL constraints on any columns still nullable
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'replay_id' AND is_nullable = 'YES'
-            ) THEN
-                ALTER TABLE meta.replay_ledger ALTER COLUMN replay_id SET NOT NULL;
-            END IF;
-
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'source_id' AND is_nullable = 'YES'
-            ) THEN
-                ALTER TABLE meta.replay_ledger ALTER COLUMN source_id SET NOT NULL;
-            END IF;
-
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'table_name' AND is_nullable = 'YES'
-            ) THEN
-                ALTER TABLE meta.replay_ledger ALTER COLUMN table_name SET NOT NULL;
-            END IF;
-
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'meta' AND table_name = 'replay_ledger' AND column_name = 'outcome' AND is_nullable = 'YES'
-            ) THEN
-                ALTER TABLE meta.replay_ledger ALTER COLUMN outcome SET NOT NULL;
-            END IF;
-        END IF;
-
-        -- 4. Check if the current primary key is solely on replay_id
-        SELECT
-            COALESCE(count(*) = 1 AND bool_and(kcu.column_name = 'replay_id'), FALSE)
-        INTO v_pk_is_sole_replay_id
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-         AND tc.table_schema = kcu.table_schema
-         AND tc.table_name = kcu.table_name
-        WHERE tc.table_schema = 'meta'
-          AND tc.table_name = 'replay_ledger'
-          AND tc.constraint_type = 'PRIMARY KEY';
-
-        IF NOT v_pk_is_sole_replay_id THEN
-            -- Find the existing primary key constraint name, if one exists
-            SELECT tc.constraint_name
-            INTO v_existing_pk_name
-            FROM information_schema.table_constraints tc
-            WHERE tc.table_schema = 'meta'
-              AND tc.table_name = 'replay_ledger'
-              AND tc.constraint_type = 'PRIMARY KEY';
-
-            IF v_existing_pk_name IS NOT NULL THEN
-                EXECUTE format('ALTER TABLE meta.replay_ledger DROP CONSTRAINT %I', v_existing_pk_name);
-            END IF;
-
-            ALTER TABLE meta.replay_ledger ADD PRIMARY KEY (replay_id);
-        END IF;
-    END IF;
-END
-$$;
-
 CREATE TABLE IF NOT EXISTS meta.replay_ledger (
     replay_id UUID PRIMARY KEY,
     dlt_topic TEXT NOT NULL,
@@ -816,21 +658,12 @@ CREATE TABLE IF NOT EXISTS meta.replay_ledger (
     table_name TEXT NOT NULL,
     outcome TEXT NOT NULL,
     replayed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_replay_outcome CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED', 'LEGACY_UNKNOWN'))
+    CONSTRAINT chk_replay_outcome CHECK (outcome IN ('CLAIMED', 'APPLIED', 'SKIPPED_STALE', 'SKIPPED_SUPERSEDED'))
 );
 
 CREATE INDEX IF NOT EXISTS replay_ledger_source_id_idx ON meta.replay_ledger (source_id);
 CREATE INDEX IF NOT EXISTS replay_ledger_dlt_coords_idx ON meta.replay_ledger (dlt_topic, dlt_partition, dlt_offset);
 CREATE INDEX IF NOT EXISTS replay_ledger_replayed_at_idx ON meta.replay_ledger (replayed_at);
-
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'analytics_engine') THEN
-        GRANT SELECT, INSERT ON meta.replay_ledger TO analytics_engine;
-        GRANT UPDATE (outcome) ON meta.replay_ledger TO analytics_engine;
-    END IF;
-END
-$$;
 
 CREATE TABLE IF NOT EXISTS meta.extract_watermarks (
     source_id TEXT NOT NULL,
@@ -1362,6 +1195,13 @@ BEGIN
     EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_temp.%I WHERE cardinality(_unavailable) > 0)', v_stage)
         INTO v_has_unavailable;
 
+    IF p_engine = 'KAFKA' THEN
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_temp.%I WHERE _replay_id IS NOT NULL)', v_stage)
+            INTO v_has_replays;
+    ELSE
+        v_has_replays := FALSE;
+    END IF;
+
     IF v_has_unavailable THEN
         SELECT string_agg(
                    format('(array_agg(%1$I ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC) '
@@ -1371,14 +1211,21 @@ BEGIN
                string_agg(
                    format('CASE WHEN NOT bool_or(%1$L <> ALL(COALESCE(_unavailable, ARRAY[]::TEXT[]))) THEN %1$L END',
                           col ->> 'name'),
-                   ', ' ORDER BY ord) FILTER (WHERE col ->> 'name' <> c.primary_key),
-               string_agg(
-                   format('(array_agg(_replay_id ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC) '
-                          || 'FILTER (WHERE _replay_id IS NOT NULL AND %1$L <> ALL(COALESCE(_unavailable, ARRAY[]::TEXT[]))))[1]',
-                          col ->> 'name'),
                    ', ' ORDER BY ord) FILTER (WHERE col ->> 'name' <> c.primary_key)
-          INTO v_merge_cols, v_unavail_expr, v_contrib_replay_expr
+          INTO v_merge_cols, v_unavail_expr
           FROM jsonb_array_elements(c.columns) WITH ORDINALITY AS x(col, ord);
+
+        IF v_has_replays THEN
+            SELECT string_agg(
+                       format('(array_agg(_replay_id ORDER BY _source_generation DESC, _source_lsn DESC NULLS LAST, _stage_seq DESC) '
+                              || 'FILTER (WHERE _replay_id IS NOT NULL AND %1$L <> ALL(COALESCE(_unavailable, ARRAY[]::TEXT[]))))[1]',
+                              col ->> 'name'),
+                       ', ' ORDER BY ord) FILTER (WHERE col ->> 'name' <> c.primary_key)
+              INTO v_contrib_replay_expr
+              FROM jsonb_array_elements(c.columns) WITH ORDINALITY AS x(col, ord);
+        ELSE
+            v_contrib_replay_expr := 'NULL::UUID';
+        END IF;
 
         v_dedup := format(
             'SELECT source_id, tenant_id, %1$s, %2$s, '
@@ -1445,9 +1292,6 @@ BEGIN
         v_old := '';
         v_log := NULL;
     END IF;
-
-    EXECUTE format('SELECT EXISTS (SELECT 1 FROM pg_temp.%I WHERE _replay_id IS NOT NULL)', v_stage)
-        INTO v_has_replays;
 
     FOREACH v_target IN ARRAY ARRAY['prod', 'shadow'] LOOP
         v_schema := CASE v_target WHEN 'prod' THEN 'raw' ELSE 'raw_shadow' END;

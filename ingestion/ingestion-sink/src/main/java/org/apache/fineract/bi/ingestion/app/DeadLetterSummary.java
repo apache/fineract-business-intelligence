@@ -140,13 +140,13 @@ public final class DeadLetterSummary {
     public static final class Accumulator {
 
         private final Map<Key, MutableGroup> groups = new HashMap<>();
-        private final List<DeadLetterRecord> invalidReplayRecords = new ArrayList<>();
+        private long invalidReplayRecordCount;
 
         public void add(DeadLetterRecord record) {
             Objects.requireNonNull(record, "record");
 
             if (record.hasInvalidReplayIdentity()) {
-                invalidReplayRecords.add(record);
+                invalidReplayRecordCount++;
             }
 
             Key key = new Key(
@@ -157,8 +157,8 @@ public final class DeadLetterSummary {
             groups.computeIfAbsent(key, ignored -> new MutableGroup()).add(record);
         }
 
-        public List<DeadLetterRecord> invalidReplayRecords() {
-            return List.copyOf(invalidReplayRecords);
+        public long invalidReplayRecordCount() {
+            return invalidReplayRecordCount;
         }
 
         public List<Group> snapshot() {

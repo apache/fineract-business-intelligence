@@ -705,7 +705,6 @@ public final class SinkWorker implements Runnable {
                     case APPLIED -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.APPLIED);
                     case SKIPPED_STALE -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.SKIPPED_STALE);
                     case SKIPPED_SUPERSEDED -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.SKIPPED_SUPERSEDED);
-                    case LEGACY_UNKNOWN -> metrics.replayOutcome(table, SinkMetrics.ReplayOutcomeLabel.LEGACY_UNKNOWN);
                     case CLAIMED -> LOG.warn("Unexpected in-flight CLAIMED outcome for replay {} on table {}", id.replayId(), table);
                 }
             });

@@ -25,20 +25,27 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.CancellationException;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.fineract.bi.ingestion.cdc.ChangeEvent;
 import org.apache.fineract.bi.ingestion.contract.Contract;
+import org.apache.fineract.bi.ingestion.contract.TableContract;
 import org.apache.fineract.bi.ingestion.routing.OwnershipCache;
 import org.apache.fineract.bi.ingestion.routing.OwnershipSnapshot;
+import org.apache.fineract.bi.ingestion.routing.Route;
 import org.apache.fineract.bi.ingestion.sink.PreflightRollbackException;
 import org.apache.fineract.bi.ingestion.sink.ReplayIdentity;
 import org.apache.fineract.bi.ingestion.sink.ReplayOutcome;
@@ -54,6 +61,175 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
 public final class DeadLetterReplayCommand {
 
     private DeadLetterReplayCommand() {
+    }
+
+    record Candidate(int index, DeadLetterRecord record, RoutedEvent routedEvent) {}
+    record GroupKey(String sourceId, String table) {}
+    record EntityKey(String sourceId, String table, String tenantId, String normalizedPk) {}
+
+    static EntityKey extractEntityKey(Contract contract, Candidate c) {
+        if (contract == null || c == null) {
+            return null;
+        }
+        RoutedEvent re = c.routedEvent();
+        if (re == null || re.event() == null) {
+            return null;
+        }
+        ChangeEvent e = re.event();
+        String sourceId = e.sourceId();
+        String table = e.table();
+        if (sourceId == null || table == null) {
+            return null;
+        }
+        Optional<TableContract> optTable = contract.table(table);
+        if (optTable.isEmpty()) {
+            return null;
+        }
+        TableContract tc = optTable.get();
+        int pkIdx = tc.primaryKeyIndex();
+        String[] values = e.values();
+        if (pkIdx < 0 || values == null || pkIdx >= values.length) {
+            return null;
+        }
+        String rawVal = values[pkIdx];
+        if (rawVal == null) {
+            return null;
+        }
+        String pkType = tc.column(tc.primaryKey()).type();
+        String normalizedPk = normalizePrimaryKey(pkType, rawVal);
+        if (normalizedPk == null) {
+            return null;
+        }
+        String tenantId = re.route() != null && re.route().tenantId() != null ? re.route().tenantId() : "";
+        return new EntityKey(sourceId, table, tenantId, normalizedPk);
+    }
+
+    static String normalizePrimaryKey(String type, String raw) {
+        if (type == null || raw == null) {
+            return null;
+        }
+        String base = type.trim().toLowerCase(Locale.ROOT);
+        int paren = base.indexOf('(');
+        String typeName = paren >= 0 ? base.substring(0, paren).trim() : base;
+        switch (typeName) {
+            case "bigint":
+            case "int8":
+            case "bigserial":
+                try {
+                    return Long.toString(Long.parseLong(raw.trim()));
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            case "integer":
+            case "int":
+            case "int4":
+            case "serial":
+                try {
+                    return Integer.toString(Integer.parseInt(raw.trim()));
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            case "smallint":
+            case "int2":
+            case "smallserial":
+                try {
+                    return Short.toString(Short.parseShort(raw.trim()));
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            case "uuid":
+                try {
+                    return UUID.fromString(raw.trim()).toString();
+                } catch (IllegalArgumentException e) {
+                    return null;
+                }
+            case "text":
+            case "varchar":
+            case "character varying":
+                return raw;
+            case "char":
+            case "character":
+            case "bpchar":
+                int end = raw.length();
+                while (end > 0 && raw.charAt(end - 1) == ' ') {
+                    end--;
+                }
+                return raw.substring(0, end);
+            case "numeric":
+            case "decimal":
+                try {
+                    java.math.BigDecimal bd = new java.math.BigDecimal(raw.trim());
+                    if (bd.compareTo(java.math.BigDecimal.ZERO) == 0) {
+                        return "0";
+                    }
+                    return bd.stripTrailingZeros().toPlainString();
+                } catch (Exception e) {
+                    return null;
+                }
+            default:
+                return null;
+        }
+    }
+
+    static final class IsolationState {
+        private final boolean[] provisionallyValid;
+        private final Set<Integer> individuallyInvalid = new HashSet<>();
+        private final Map<Integer, String> invalidReasons = new HashMap<>();
+        private final Set<Integer> inconclusive = new HashSet<>();
+        private final Map<Integer, String> inconclusiveReasons = new HashMap<>();
+        private boolean aborted;
+        private String abortReason;
+
+        IsolationState(int size) {
+            this.provisionallyValid = new boolean[size];
+        }
+
+        boolean isAborted() {
+            return aborted;
+        }
+
+        void abort(String reason) {
+            this.aborted = true;
+            this.abortReason = reason;
+        }
+
+        String abortReason() {
+            return abortReason;
+        }
+
+        void markProvisionallyValid(int index) {
+            provisionallyValid[index] = true;
+        }
+
+        boolean isProvisionallyValid(int index) {
+            return provisionallyValid[index];
+        }
+
+        void markIndividuallyInvalid(int index, String reason) {
+            individuallyInvalid.add(index);
+            invalidReasons.put(index, reason);
+        }
+
+        boolean isIndividuallyInvalid(int index) {
+            return individuallyInvalid.contains(index);
+        }
+
+        String invalidReason(int index) {
+            return invalidReasons.get(index);
+        }
+
+        void markInconclusive(int index, String reason) {
+            inconclusive.add(index);
+            inconclusiveReasons.put(index, reason);
+        }
+
+        boolean isInconclusive(int index) {
+            return inconclusive.contains(index);
+        }
+
+        String inconclusiveReason(int index) {
+            return inconclusiveReasons.get(index);
+        }
     }
 
     public record OffsetFilter(String topic, int partition, long minOffset, long maxOffset) {
@@ -282,22 +458,6 @@ public final class DeadLetterReplayCommand {
             boolean dryRun,
             boolean skipPreflight,
             int limit,
-            Connection conn,
-            OwnershipSnapshot ownership,
-            WarehousePreflightValidator preflightValidator,
-            Producer<byte[], byte[]> producer,
-            PrintStream out) throws Exception {
-        execute(config, contract, filter, dryRun, skipPreflight, limit, DeadLetterReader.DEFAULT_MAX_BYTES,
-                conn, ownership, preflightValidator, producer, out);
-    }
-
-    static void execute(
-            SinkConfig config,
-            Contract contract,
-            ReplayFilter filter,
-            boolean dryRun,
-            boolean skipPreflight,
-            int limit,
             long maxBytes,
             Connection conn,
             OwnershipSnapshot ownership,
@@ -358,10 +518,10 @@ public final class DeadLetterReplayCommand {
         List<DeadLetterRecord> invalidReplayHeaders = new ArrayList<>();
         List<DeadLetterRecord> alreadyCompleted = new ArrayList<>();
         List<DeadLetterRecord> preflightFailed = new ArrayList<>();
-        Map<DeadLetterRecord, String> failureReasons = new HashMap<>();
+        List<DeadLetterRecord> preflightInconclusive = new ArrayList<>();
+        Map<DeadLetterRecord, String> failureReasons = new ConcurrentHashMap<>();
         List<DeadLetterRecord> readyToReplay = new ArrayList<>();
 
-        record Candidate(DeadLetterRecord record, RoutedEvent routedEvent) {}
         List<Candidate> routeValidCandidates = new ArrayList<>();
 
         for (DeadLetterRecord r : matched) {
@@ -379,7 +539,7 @@ public final class DeadLetterReplayCommand {
                 continue;
             }
 
-            routeValidCandidates.add(new Candidate(r, routeResult.routedEvent()));
+            routeValidCandidates.add(new Candidate(-1, r, routeResult.routedEvent()));
         }
 
         List<Candidate> eligibleCandidates = new ArrayList<>();
@@ -390,7 +550,10 @@ public final class DeadLetterReplayCommand {
             ledgerCheckStatus = LedgerCheckStatus.NOT_NEEDED;
         } else if (conn == null) {
             ledgerCheckStatus = LedgerCheckStatus.NOT_PERFORMED;
-            eligibleCandidates.addAll(routeValidCandidates);
+            int idx = 0;
+            for (Candidate c : routeValidCandidates) {
+                eligibleCandidates.add(new Candidate(idx++, c.record(), c.routedEvent()));
+            }
         } else {
             ledgerCheckStatus = LedgerCheckStatus.PERFORMED;
             List<ReplayIdentity> candidateIdentities = routeValidCandidates.stream()
@@ -400,13 +563,11 @@ public final class DeadLetterReplayCommand {
             Map<ReplayIdentity, ReplayOutcome> completedOutcomes =
                     WarehouseWriter.findCompletedReplayOutcomes(conn, candidateIdentities);
 
+            int idx = 0;
             for (Candidate c : routeValidCandidates) {
                 ReplayIdentity id = c.routedEvent().replayIdentity();
                 if (id != null && completedOutcomes.containsKey(id)) {
                     ReplayOutcome outcome = completedOutcomes.get(id);
-                    if (outcome == null) {
-                        outcome = ReplayOutcome.LEGACY_UNKNOWN;
-                    }
                     alreadyCompleted.add(c.record());
                     alreadyCompletedOutcomes.put(c.record(), outcome);
                     if (outcome == ReplayOutcome.CLAIMED) {
@@ -417,7 +578,7 @@ public final class DeadLetterReplayCommand {
                                 "Already completed in replay ledger (" + id.replayId() + ": " + outcome + ")");
                     }
                 } else {
-                    eligibleCandidates.add(c);
+                    eligibleCandidates.add(new Candidate(idx++, c.record(), c.routedEvent()));
                 }
             }
         }
@@ -435,10 +596,72 @@ public final class DeadLetterReplayCommand {
                     readyToReplay.add(c.record());
                 }
                 predictedOutcomes = batchResult.predictedOutcomes();
-            } else {
+            } else if (!batchResult.isRecordLevelError()) {
                 for (Candidate c : eligibleCandidates) {
                     preflightFailed.add(c.record());
                     failureReasons.put(c.record(), batchResult.reason());
+                }
+            } else {
+                IsolationState state = new IsolationState(eligibleCandidates.size());
+                isolateCandidates(conn, preflightValidator, contract, eligibleCandidates, batchResult.reason(), state);
+
+                if (state.isAborted()) {
+                    for (Candidate c : eligibleCandidates) {
+                        if (state.isIndividuallyInvalid(c.index())) {
+                            preflightFailed.add(c.record());
+                            failureReasons.put(c.record(), state.invalidReason(c.index()));
+                        } else if (state.isInconclusive(c.index())) {
+                            preflightInconclusive.add(c.record());
+                            failureReasons.put(c.record(), state.inconclusiveReason(c.index()));
+                        } else {
+                            preflightInconclusive.add(c.record());
+                            failureReasons.put(c.record(),
+                                    "Warehouse validation inconclusive: non-isolatable error encountered during isolation ("
+                                            + state.abortReason() + ")");
+                        }
+                    }
+                } else {
+                    for (Candidate c : eligibleCandidates) {
+                        if (state.isIndividuallyInvalid(c.index())) {
+                            preflightFailed.add(c.record());
+                            failureReasons.put(c.record(), state.invalidReason(c.index()));
+                        } else if (state.isInconclusive(c.index())) {
+                            preflightInconclusive.add(c.record());
+                            failureReasons.put(c.record(), state.inconclusiveReason(c.index()));
+                        } else if (!state.isProvisionallyValid(c.index())) {
+                            preflightInconclusive.add(c.record());
+                            failureReasons.put(c.record(),
+                                    "Warehouse validation inconclusive: candidate was not resolved during isolation");
+                        }
+                    }
+
+                    List<Candidate> provisionallyValid = new ArrayList<>();
+                    for (Candidate c : eligibleCandidates) {
+                        if (state.isProvisionallyValid(c.index())) {
+                            provisionallyValid.add(c);
+                        }
+                    }
+
+                    if (!provisionallyValid.isEmpty()) {
+                        List<RoutedEvent> combinedEvents = provisionallyValid.stream()
+                                .map(Candidate::routedEvent)
+                                .toList();
+                        WarehousePreflightValidator.BatchValidationResult combinedResult =
+                                preflightValidator.validateWarehouse(conn, combinedEvents);
+                        if (combinedResult.passed()) {
+                            for (Candidate c : provisionallyValid) {
+                                readyToReplay.add(c.record());
+                            }
+                            predictedOutcomes = combinedResult.predictedOutcomes();
+                        } else {
+                            String inconclusiveReason = "Warehouse validation inconclusive: provisionally valid records failed when combined in a single batch ("
+                                    + combinedResult.reason() + ")";
+                            for (Candidate c : provisionallyValid) {
+                                preflightInconclusive.add(c.record());
+                                failureReasons.put(c.record(), inconclusiveReason);
+                            }
+                        }
+                    }
                 }
             }
         } else if (skipPreflight) {
@@ -447,31 +670,24 @@ public final class DeadLetterReplayCommand {
             }
         }
 
-        List<PublicationAttempt> publicationAttempts = new ArrayList<>();
-        int acknowledgedCount = 0;
-        int failedCount = 0;
-        int unconfirmedCount = 0;
-        Throwable firstFailureCause = null;
+        Object publicationLock = new Object();
+        AtomicInteger acknowledgedCount = new AtomicInteger();
+        AtomicInteger failedCount = new AtomicInteger();
+        AtomicReference<Throwable> firstFailureCause = new AtomicReference<>();
         Throwable flushError = null;
 
         if (!dryRun && !readyToReplay.isEmpty()) {
             for (DeadLetterRecord r : readyToReplay) {
-                PublicationAttempt attempt = new PublicationAttempt(r);
-                publicationAttempts.add(attempt);
-
                 if (r.originalPartition() < 0) {
-                    attempt.attempted = false;
-                    attempt.status = PublicationStatus.FAILED;
-                    attempt.errorMessage = "Invalid original partition: " + r.originalPartition();
-                    attempt.errorCause = new IllegalArgumentException(attempt.errorMessage);
-                    failureReasons.put(r, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = attempt.errorCause;
+                    String msg = "Invalid original partition: " + r.originalPartition();
+                    synchronized (publicationLock) {
+                        failedCount.incrementAndGet();
+                        failureReasons.put(r, msg);
+                        firstFailureCause.compareAndSet(null, new IllegalArgumentException(msg));
                     }
                     continue;
                 }
 
-                attempt.attempted = true;
                 try {
                     ProducerRecord<byte[], byte[]> pr = new ProducerRecord<>(
                             r.originalTopic(),
@@ -479,14 +695,26 @@ public final class DeadLetterReplayCommand {
                             r.key(),
                             r.value());
                     ReplayIdentityHeaders.add(pr.headers(), r.replayIdentity());
-                    attempt.future = producer.send(pr);
+                    producer.send(pr, (metadata, exception) -> {
+                        if (exception == null) {
+                            synchronized (publicationLock) {
+                                acknowledgedCount.incrementAndGet();
+                            }
+                        } else {
+                            String msg = "Kafka publication failed: " + (exception.getMessage() != null ? exception.getMessage() : exception.getClass().getSimpleName());
+                            synchronized (publicationLock) {
+                                failedCount.incrementAndGet();
+                                failureReasons.put(r, msg);
+                                firstFailureCause.compareAndSet(null, exception);
+                            }
+                        }
+                    });
                 } catch (Exception e) {
-                    attempt.status = PublicationStatus.FAILED;
-                    attempt.errorMessage = "Synchronous send failure: " + e.getMessage();
-                    attempt.errorCause = e;
-                    failureReasons.put(r, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = e;
+                    String msg = "Synchronous send failure: " + (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+                    synchronized (publicationLock) {
+                        failedCount.incrementAndGet();
+                        failureReasons.put(r, msg);
+                        firstFailureCause.compareAndSet(null, e);
                     }
                 }
             }
@@ -495,207 +723,221 @@ public final class DeadLetterReplayCommand {
                 producer.flush();
             } catch (Exception e) {
                 flushError = e;
-                if (firstFailureCause == null) {
-                    firstFailureCause = e;
+                synchronized (publicationLock) {
+                    firstFailureCause.compareAndSet(null, e);
                 }
             }
+        }
 
-            boolean interrupted = false;
-            for (int i = 0; i < publicationAttempts.size(); i++) {
-                PublicationAttempt attempt = publicationAttempts.get(i);
-                if (attempt.status == PublicationStatus.FAILED) {
-                    continue;
-                }
-
-                if (interrupted) {
-                    attempt.status = PublicationStatus.UNCONFIRMED;
-                    attempt.errorMessage = flushError != null
-                            ? "Wait cancelled due to thread interruption (producer flush failed: " + flushError.getMessage() + ")"
-                            : "Wait cancelled due to thread interruption";
-                    if (attempt.errorCause == null) {
-                        attempt.errorCause = flushError;
-                    }
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    continue;
-                }
-
-                if (attempt.future == null) {
-                    attempt.status = PublicationStatus.FAILED;
-                    attempt.errorMessage = "No future returned from Kafka producer";
-                    attempt.errorCause = new IllegalStateException(attempt.errorMessage);
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = attempt.errorCause;
-                    }
-                    continue;
-                }
-
-                if (flushError != null && !attempt.future.isDone()) {
-                    attempt.status = PublicationStatus.UNCONFIRMED;
-                    attempt.errorMessage = "Producer flush failed with unfinished future: " + flushError.getMessage();
-                    attempt.errorCause = flushError;
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    continue;
-                }
-
-                try {
-                    if (attempt.future.isCancelled()) {
-                        attempt.status = PublicationStatus.FAILED;
-                        attempt.errorMessage = "Future was cancelled";
-                        attempt.errorCause = new CancellationException(attempt.errorMessage);
-                        failureReasons.put(attempt.record, attempt.errorMessage);
-                        if (firstFailureCause == null) {
-                            firstFailureCause = attempt.errorCause;
-                        }
-                    } else {
-                        attempt.future.get();
-                        attempt.status = PublicationStatus.ACKNOWLEDGED;
-                    }
-                } catch (ExecutionException e) {
-                    attempt.status = PublicationStatus.FAILED;
-                    Throwable cause = e.getCause() != null ? e.getCause() : e;
-                    attempt.errorMessage = "Kafka publication failed: " + cause.getMessage();
-                    attempt.errorCause = cause;
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = cause;
-                    }
-                } catch (CancellationException e) {
-                    attempt.status = PublicationStatus.FAILED;
-                    attempt.errorMessage = "Future was cancelled: " + e.getMessage();
-                    attempt.errorCause = e;
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = e;
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    interrupted = true;
-                    attempt.status = PublicationStatus.UNCONFIRMED;
-                    attempt.errorMessage = flushError != null
-                            ? "Wait interrupted while awaiting Kafka acknowledgement (producer flush failed: " + flushError.getMessage() + ")"
-                            : "Wait interrupted while awaiting Kafka acknowledgement";
-                    attempt.errorCause = e;
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = e;
-                    }
-                } catch (Exception e) {
-                    attempt.status = PublicationStatus.FAILED;
-                    attempt.errorMessage = "Kafka future inspection error: " + e.getMessage();
-                    attempt.errorCause = e;
-                    failureReasons.put(attempt.record, attempt.errorMessage);
-                    if (firstFailureCause == null) {
-                        firstFailureCause = e;
-                    }
-                }
-            }
-
-            if (flushError != null) {
-                for (PublicationAttempt attempt : publicationAttempts) {
-                    if (attempt.status == PublicationStatus.UNCONFIRMED) {
-                        if (attempt.errorCause == null) {
-                            attempt.errorCause = flushError;
-                        }
-                        if (attempt.errorMessage == null) {
-                            attempt.errorMessage = "Producer flush failed: " + flushError.getMessage();
-                            failureReasons.put(attempt.record, attempt.errorMessage);
-                        }
-                    }
-                }
-            }
-
-            for (PublicationAttempt attempt : publicationAttempts) {
-                switch (attempt.status) {
-                    case ACKNOWLEDGED -> acknowledgedCount++;
-                    case FAILED -> failedCount++;
-                    case UNCONFIRMED -> unconfirmedCount++;
-                }
-            }
+        PublicationSnapshot publication;
+        Throwable publicationFailureCause;
+        synchronized (publicationLock) {
+            int ack = acknowledgedCount.get();
+            int failed = failedCount.get();
+            int pending = Math.max(0, readyToReplay.size() - (ack + failed));
+            publication = new PublicationSnapshot(ack, failed, pending, failureReasons);
+            publicationFailureCause = firstFailureCause.get();
         }
 
         renderReport(scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
                 invalidReplayHeaders, alreadyCompleted, alreadyCompletedOutcomes,
-                preflightFailed, readyToReplay, acknowledgedCount, failedCount,
-                unconfirmedCount, failureReasons, ledgerCheckStatus, flushError,
-                predictedOutcomes, out);
+                preflightFailed, preflightInconclusive, readyToReplay, publication,
+                publication.failureReasons(), ledgerCheckStatus, flushError, predictedOutcomes, out);
 
-        if (!dryRun && (failedCount > 0 || unconfirmedCount > 0 || flushError != null)) {
+        if (!dryRun && (publication.failedCount() > 0 || flushError != null)) {
             String message;
-            if (failedCount > 0 || unconfirmedCount > 0) {
+            if (flushError != null && publication.pendingCallbacks() > 0) {
+                int pendingCallbacks = publication.pendingCallbacks();
+                String pendingDesc = pendingCallbacks == 1 ? "1 callback pending" : pendingCallbacks + " callbacks pending";
                 message = String.format(
-                        "Replay publication incomplete: %d acknowledged, %d failed, %d unconfirmed",
-                        acknowledgedCount, failedCount, unconfirmedCount);
+                        "Replay publication failed during flush: observed %d acknowledged, %d failed (%s)",
+                        publication.acknowledgedCount(), publication.failedCount(), pendingDesc);
+            } else if (publication.failedCount() > 0) {
+                message = String.format(
+                        "Replay publication incomplete: %d acknowledged, %d failed",
+                        publication.acknowledgedCount(), publication.failedCount());
             } else {
                 message = String.format(
-                        "Replay publication failed during flush: %d acknowledged, %d failed, %d unconfirmed",
-                        acknowledgedCount, failedCount, unconfirmedCount);
+                        "Replay publication failed during flush: %d acknowledged, %d failed",
+                        publication.acknowledgedCount(), publication.failedCount());
             }
-            throw new ReplayPublicationException(message, firstFailureCause, acknowledgedCount, failedCount, unconfirmedCount);
+            Throwable cause = flushError != null ? flushError : publicationFailureCause;
+            throw new ReplayPublicationException(message, cause, publication);
         }
     }
 
-    public enum PublicationStatus {
-        ACKNOWLEDGED,
-        FAILED,
-        UNCONFIRMED
+    static void isolateCandidates(
+            Connection conn,
+            WarehousePreflightValidator validator,
+            Contract contract,
+            List<Candidate> candidates,
+            String initialReason,
+            IsolationState state) throws SQLException {
+
+        Map<GroupKey, List<Candidate>> groups = new LinkedHashMap<>();
+        for (Candidate c : candidates) {
+            GroupKey key = new GroupKey(c.routedEvent().event().sourceId(), c.routedEvent().event().table());
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(c);
+        }
+
+        for (List<Candidate> groupCandidates : groups.values()) {
+            if (state.isAborted()) {
+                break;
+            }
+
+            Map<EntityKey, List<Candidate>> entityMap = new LinkedHashMap<>();
+            boolean resolvable = true;
+            for (Candidate c : groupCandidates) {
+                EntityKey eKey = extractEntityKey(contract, c);
+                if (eKey == null) {
+                    resolvable = false;
+                    break;
+                }
+                entityMap.computeIfAbsent(eKey, k -> new ArrayList<>()).add(c);
+            }
+
+            if (!resolvable) {
+                for (Candidate c : groupCandidates) {
+                    state.markInconclusive(c.index(),
+                            "Warehouse validation inconclusive: primary-key identity could not be reliably determined for entity isolation");
+                }
+                continue;
+            }
+
+            List<List<Candidate>> entityUnits = new ArrayList<>(entityMap.values());
+            if (groups.size() == 1) {
+                if (entityUnits.size() == 1) {
+                    List<Candidate> singleUnit = entityUnits.get(0);
+                    if (singleUnit.size() == 1) {
+                        Candidate c = singleUnit.get(0);
+                        state.markIndividuallyInvalid(c.index(), initialReason);
+                    } else {
+                        for (Candidate c : singleUnit) {
+                            state.markInconclusive(c.index(),
+                                    "Warehouse validation inconclusive: multi-record entity unit failed validation and individual attribution is unsafe ("
+                                            + initialReason + ")");
+                        }
+                    }
+                } else {
+                    int mid = entityUnits.size() / 2;
+                    List<List<Candidate>> left = entityUnits.subList(0, mid);
+                    List<List<Candidate>> right = entityUnits.subList(mid, entityUnits.size());
+                    bisectEntitySlice(conn, validator, left, state);
+                    if (!state.isAborted()) {
+                        bisectEntitySlice(conn, validator, right, state);
+                    }
+                }
+            } else {
+                bisectEntitySlice(conn, validator, entityUnits, state);
+            }
+        }
+    }
+
+    static void bisectEntitySlice(
+            Connection conn,
+            WarehousePreflightValidator validator,
+            List<List<Candidate>> entityUnits,
+            IsolationState state) throws SQLException {
+
+        if (state.isAborted() || entityUnits == null || entityUnits.isEmpty()) {
+            return;
+        }
+
+        List<Candidate> sliceCandidates = new ArrayList<>();
+        for (List<Candidate> unit : entityUnits) {
+            sliceCandidates.addAll(unit);
+        }
+        List<RoutedEvent> sliceEvents = sliceCandidates.stream().map(Candidate::routedEvent).toList();
+        WarehousePreflightValidator.BatchValidationResult sliceResult =
+                validator.validateWarehouse(conn, sliceEvents);
+
+        if (sliceResult.passed()) {
+            for (Candidate c : sliceCandidates) {
+                state.markProvisionallyValid(c.index());
+            }
+        } else if (!sliceResult.isRecordLevelError()) {
+            state.abort(sliceResult.reason());
+        } else if (entityUnits.size() == 1) {
+            List<Candidate> singleUnit = entityUnits.get(0);
+            if (singleUnit.size() == 1) {
+                Candidate c = singleUnit.get(0);
+                state.markIndividuallyInvalid(c.index(), sliceResult.reason());
+            } else {
+                for (Candidate c : singleUnit) {
+                    state.markInconclusive(c.index(),
+                            "Warehouse validation inconclusive: multi-record entity unit failed validation and individual attribution is unsafe ("
+                                    + sliceResult.reason() + ")");
+                }
+            }
+        } else {
+            int mid = entityUnits.size() / 2;
+            List<List<Candidate>> left = entityUnits.subList(0, mid);
+            List<List<Candidate>> right = entityUnits.subList(mid, entityUnits.size());
+            bisectEntitySlice(conn, validator, left, state);
+            if (!state.isAborted()) {
+                bisectEntitySlice(conn, validator, right, state);
+            }
+        }
+    }
+
+    public record PublicationSnapshot(
+            int acknowledgedCount,
+            int failedCount,
+            int pendingCallbacks,
+            Map<DeadLetterRecord, String> failureReasons) {
+
+        public PublicationSnapshot(
+                int acknowledgedCount,
+                int failedCount,
+                int pendingCallbacks,
+                Map<DeadLetterRecord, String> failureReasons) {
+            this.acknowledgedCount = acknowledgedCount;
+            this.failedCount = failedCount;
+            this.pendingCallbacks = pendingCallbacks;
+            this.failureReasons = failureReasons != null
+                    ? Collections.unmodifiableMap(new LinkedHashMap<>(failureReasons))
+                    : Map.of();
+        }
+
+        public PublicationSnapshot(int acknowledgedCount, int failedCount, int pendingCallbacks) {
+            this(acknowledgedCount, failedCount, pendingCallbacks, Map.of());
+        }
+
+        public PublicationSnapshot(int acknowledgedCount, int failedCount) {
+            this(acknowledgedCount, failedCount, 0, Map.of());
+        }
     }
 
     public static class ReplayPublicationException extends IllegalStateException {
-        private final int acknowledgedCount;
-        private final int failedCount;
-        private final int unconfirmedCount;
+        private final PublicationSnapshot publication;
+
+        public ReplayPublicationException(
+                String message,
+                Throwable cause,
+                PublicationSnapshot publication) {
+            super(message, cause);
+            this.publication = publication != null ? publication : new PublicationSnapshot(0, 0, 0, Map.of());
+        }
 
         public ReplayPublicationException(
                 String message,
                 Throwable cause,
                 int acknowledgedCount,
-                int failedCount,
-                int unconfirmedCount) {
-            super(message, cause);
-            this.acknowledgedCount = acknowledgedCount;
-            this.failedCount = failedCount;
-            this.unconfirmedCount = unconfirmedCount;
+                int failedCount) {
+            this(message, cause, new PublicationSnapshot(acknowledgedCount, failedCount, 0, Map.of()));
         }
 
         public int acknowledgedCount() {
-            return acknowledgedCount;
+            return publication.acknowledgedCount();
         }
 
         public int failedCount() {
-            return failedCount;
+            return publication.failedCount();
         }
 
-        public int unconfirmedCount() {
-            return unconfirmedCount;
+        public PublicationSnapshot publication() {
+            return publication;
         }
-    }
-
-    public static final class PublicationAttempt {
-        private final DeadLetterRecord record;
-        private boolean attempted;
-        private Future<RecordMetadata> future;
-        private PublicationStatus status;
-        private String errorMessage;
-        private Throwable errorCause;
-
-        PublicationAttempt(DeadLetterRecord record) {
-            this.record = record;
-            this.attempted = false;
-            this.future = null;
-            this.status = PublicationStatus.UNCONFIRMED;
-        }
-
-        public DeadLetterRecord record() { return record; }
-        public boolean attempted() { return attempted; }
-        public Future<RecordMetadata> future() { return future; }
-        public PublicationStatus status() { return status; }
-        public String errorMessage() { return errorMessage; }
-        public Throwable errorCause() { return errorCause; }
-
-        public boolean isAcknowledged() { return status == PublicationStatus.ACKNOWLEDGED; }
-        public boolean isFailed() { return status == PublicationStatus.FAILED; }
-        public boolean isUnconfirmed() { return status == PublicationStatus.UNCONFIRMED; }
     }
 
     public enum LedgerCheckStatus {
@@ -712,119 +954,12 @@ public final class DeadLetterReplayCommand {
             List<DeadLetterRecord> matched,
             List<DeadLetterRecord> rejectedPayloads,
             List<DeadLetterRecord> invalidReplayHeaders,
-            List<DeadLetterRecord> preflightFailed,
-            List<DeadLetterRecord> readyToReplay,
-            int replayedCount,
-            Map<DeadLetterRecord, String> failureReasons,
-            PrintStream out) {
-        renderReport(scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
-                invalidReplayHeaders, List.of(), Map.of(), preflightFailed, readyToReplay,
-                replayedCount, 0, 0, failureReasons, LedgerCheckStatus.NOT_NEEDED, null, Map.of(), out);
-    }
-
-    static void renderReport(
-            DeadLetterReader.ScanResult scan,
-            ReplayFilter filter,
-            boolean dryRun,
-            boolean skipPreflight,
-            List<DeadLetterRecord> matched,
-            List<DeadLetterRecord> rejectedPayloads,
-            List<DeadLetterRecord> invalidReplayHeaders,
-            List<DeadLetterRecord> alreadyCompleted,
-            List<DeadLetterRecord> preflightFailed,
-            List<DeadLetterRecord> readyToReplay,
-            int replayedCount,
-            Map<DeadLetterRecord, String> failureReasons,
-            PrintStream out) {
-        renderReport(scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
-                invalidReplayHeaders, alreadyCompleted, Map.of(), preflightFailed, readyToReplay,
-                replayedCount, 0, 0, failureReasons,
-                alreadyCompleted.isEmpty() ? LedgerCheckStatus.NOT_NEEDED : LedgerCheckStatus.PERFORMED,
-                null, Map.of(), out);
-    }
-
-    static void renderReport(
-            DeadLetterReader.ScanResult scan,
-            ReplayFilter filter,
-            boolean dryRun,
-            boolean skipPreflight,
-            List<DeadLetterRecord> matched,
-            List<DeadLetterRecord> rejectedPayloads,
-            List<DeadLetterRecord> invalidReplayHeaders,
-            List<DeadLetterRecord> alreadyCompleted,
-            List<DeadLetterRecord> preflightFailed,
-            List<DeadLetterRecord> readyToReplay,
-            int replayedCount,
-            Map<DeadLetterRecord, String> failureReasons,
-            LedgerCheckStatus ledgerCheckStatus,
-            PrintStream out) {
-        renderReport(scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
-                invalidReplayHeaders, alreadyCompleted, Map.of(), preflightFailed, readyToReplay,
-                replayedCount, 0, 0, failureReasons, ledgerCheckStatus, null, Map.of(), out);
-    }
-
-    static void renderReport(
-            DeadLetterReader.ScanResult scan,
-            ReplayFilter filter,
-            boolean dryRun,
-            boolean skipPreflight,
-            List<DeadLetterRecord> matched,
-            List<DeadLetterRecord> rejectedPayloads,
-            List<DeadLetterRecord> invalidReplayHeaders,
-            List<DeadLetterRecord> alreadyCompleted,
-            List<DeadLetterRecord> preflightFailed,
-            List<DeadLetterRecord> readyToReplay,
-            int replayedCount,
-            int failedCount,
-            int unconfirmedCount,
-            Map<DeadLetterRecord, String> failureReasons,
-            LedgerCheckStatus ledgerCheckStatus,
-            PrintStream out) {
-        renderReport(scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
-                invalidReplayHeaders, alreadyCompleted, Map.of(), preflightFailed, readyToReplay,
-                replayedCount, failedCount, unconfirmedCount, failureReasons,
-                ledgerCheckStatus, null, Map.of(), out);
-    }
-
-    static void renderReport(
-            DeadLetterReader.ScanResult scan,
-            ReplayFilter filter,
-            boolean dryRun,
-            boolean skipPreflight,
-            List<DeadLetterRecord> matched,
-            List<DeadLetterRecord> rejectedPayloads,
-            List<DeadLetterRecord> invalidReplayHeaders,
-            List<DeadLetterRecord> alreadyCompleted,
-            List<DeadLetterRecord> preflightFailed,
-            List<DeadLetterRecord> readyToReplay,
-            int replayedCount,
-            int failedCount,
-            int unconfirmedCount,
-            Map<DeadLetterRecord, String> failureReasons,
-            LedgerCheckStatus ledgerCheckStatus,
-            Throwable flushError,
-            PrintStream out) {
-        renderReport(scan, filter, dryRun, skipPreflight, matched, rejectedPayloads,
-                invalidReplayHeaders, alreadyCompleted, Map.of(), preflightFailed, readyToReplay,
-                replayedCount, failedCount, unconfirmedCount, failureReasons,
-                ledgerCheckStatus, flushError, Map.of(), out);
-    }
-
-    static void renderReport(
-            DeadLetterReader.ScanResult scan,
-            ReplayFilter filter,
-            boolean dryRun,
-            boolean skipPreflight,
-            List<DeadLetterRecord> matched,
-            List<DeadLetterRecord> rejectedPayloads,
-            List<DeadLetterRecord> invalidReplayHeaders,
             List<DeadLetterRecord> alreadyCompleted,
             Map<DeadLetterRecord, ReplayOutcome> alreadyCompletedOutcomes,
             List<DeadLetterRecord> preflightFailed,
+            List<DeadLetterRecord> preflightInconclusive,
             List<DeadLetterRecord> readyToReplay,
-            int replayedCount,
-            int failedCount,
-            int unconfirmedCount,
+            PublicationSnapshot publication,
             Map<DeadLetterRecord, String> failureReasons,
             LedgerCheckStatus ledgerCheckStatus,
             Throwable flushError,
@@ -856,7 +991,6 @@ public final class DeadLetterReplayCommand {
                     long applied = 0;
                     long stale = 0;
                     long superseded = 0;
-                    long unknown = 0;
                     long claimed = 0;
                     if (alreadyCompletedOutcomes != null) {
                         for (DeadLetterRecord r : alreadyCompleted) {
@@ -867,8 +1001,6 @@ public final class DeadLetterReplayCommand {
                                 stale++;
                             } else if (o == ReplayOutcome.SKIPPED_SUPERSEDED) {
                                 superseded++;
-                            } else if (o == ReplayOutcome.LEGACY_UNKNOWN) {
-                                unknown++;
                             } else if (o == ReplayOutcome.CLAIMED) {
                                 claimed++;
                             }
@@ -877,9 +1009,6 @@ public final class DeadLetterReplayCommand {
                     out.printf("      - APPLIED: %d%n", applied);
                     out.printf("      - SKIPPED_STALE: %d%n", stale);
                     out.printf("      - SKIPPED_SUPERSEDED: %d%n", superseded);
-                    if (unknown > 0) {
-                        out.printf("      - LEGACY_UNKNOWN: %d%n", unknown);
-                    }
                     if (claimed > 0) {
                         out.printf("      - CLAIMED: %d (in-progress/unresolved)%n", claimed);
                     }
@@ -889,6 +1018,9 @@ public final class DeadLetterReplayCommand {
             case NOT_PERFORMED -> out.println("  - Already completed (in ledger): not checked (ledger check not performed: no database connection)");
         }
         out.printf("  - Preflight failed: %d%n", preflightFailed.size());
+        if (preflightInconclusive != null && !preflightInconclusive.isEmpty()) {
+            out.printf("  - Preflight inconclusive: %d%n", preflightInconclusive.size());
+        }
         out.printf("  - Preflight passed: %d%n", readyToReplay.size());
         if (dryRun && !skipPreflight && predictedOutcomes != null && !predictedOutcomes.isEmpty()) {
             long predictedApplied = 0;
@@ -911,18 +1043,28 @@ public final class DeadLetterReplayCommand {
         }
         if (!dryRun) {
             out.printf("Records ready for replay: %d%n", readyToReplay.size());
-            out.printf("Records replayed to Kafka: %d%n", replayedCount);
-            out.printf("  - Acknowledged: %d%n", replayedCount);
-            out.printf("  - Failed: %d%n", failedCount);
-            out.printf("  - Unconfirmed: %d%n", unconfirmedCount);
-            if (flushError != null) {
+            int replayedCount = publication != null ? publication.acknowledgedCount() : 0;
+            int failedCount = publication != null ? publication.failedCount() : 0;
+            int pendingCallbacks = publication != null ? publication.pendingCallbacks() : 0;
+            if (flushError != null && pendingCallbacks > 0) {
+                out.println("Callback outcomes observed at reporting time after flush failure:");
+                out.printf("  - Acknowledged: %d%n", replayedCount);
+                out.printf("  - Failed: %d%n", failedCount);
                 out.printf("Producer flush failed: %s%n", flushError.getMessage());
-            }
-            if (failedCount > 0 || unconfirmedCount > 0 || flushError != null) {
-                if (failedCount > 0 || unconfirmedCount > 0) {
-                    out.println("PARTIAL PUBLICATION: some records failed to publish or remain unconfirmed.");
-                } else {
-                    out.println("PUBLICATION FAILED: producer flush encountered an error despite acknowledged futures.");
+                out.println("PUBLICATION FAILED: producer flush encountered an error before all callbacks completed.");
+            } else {
+                out.printf("Records replayed to Kafka: %d%n", replayedCount);
+                out.printf("  - Acknowledged: %d%n", replayedCount);
+                out.printf("  - Failed: %d%n", failedCount);
+                if (flushError != null) {
+                    out.printf("Producer flush failed: %s%n", flushError.getMessage());
+                }
+                if (failedCount > 0 || flushError != null) {
+                    if (failedCount > 0) {
+                        out.println("PARTIAL PUBLICATION: some records failed to publish.");
+                    } else {
+                        out.println("PUBLICATION FAILED: producer flush encountered an error despite acknowledged records.");
+                    }
                 }
             }
             out.println();
@@ -932,10 +1074,14 @@ public final class DeadLetterReplayCommand {
         }
         out.println();
 
-        if (!failureReasons.isEmpty()) {
+        Map<DeadLetterRecord, String> reportedFailureReasons = publication != null && publication.failureReasons() != null && (!publication.failureReasons().isEmpty() || failureReasons == null || failureReasons.isEmpty())
+                ? publication.failureReasons()
+                : failureReasons;
+
+        if (reportedFailureReasons != null && !reportedFailureReasons.isEmpty()) {
             out.println("Rejected / Failed records:");
             out.println("DLT Coordinate\tOriginal Target\tReason");
-            for (Map.Entry<DeadLetterRecord, String> entry : failureReasons.entrySet()) {
+            for (Map.Entry<DeadLetterRecord, String> entry : reportedFailureReasons.entrySet()) {
                 DeadLetterRecord r = entry.getKey();
                 out.printf("%s[%d]@%d\t%s[%d]\t%s%n",
                         r.dltTopic(), r.dltPartition(), r.dltOffset(),
@@ -965,81 +1111,8 @@ public final class DeadLetterReplayCommand {
             "execute", "dry-run", "skip-preflight", "confirm-all"
     );
 
-    private static final Map<String, String> REMOVED_ALIASES = Map.of(
-            "source-id", "source",
-            "offsets", "offset-range",
-            "preflight-only", "dry-run",
-            "confirm-unfiltered", "confirm-all"
-    );
-
     static Map<String, String> parseArgs(String[] args) {
-        Map<String, String> values = new HashMap<>();
-        if (args == null || args.length == 0) {
-            return values;
-        }
-        for (int i = 0; i < args.length; i++) {
-            String a = args[i];
-            if (a == null) {
-                throw new IllegalArgumentException("Argument at index " + i + " must not be null.");
-            }
-            if (!a.startsWith("--")) {
-                throw new IllegalArgumentException("Unexpected positional argument: '" + a + "'. Options must start with '--'.");
-            }
-            if (a.equals("--")) {
-                throw new IllegalArgumentException("Empty option name: '--'.");
-            }
-            int eq = a.indexOf('=');
-            if (eq == 2) {
-                throw new IllegalArgumentException("Empty option name in '" + a + "'.");
-            }
-
-            String rawName = eq > 0 ? a.substring(2, eq) : a.substring(2);
-            String optName = rawName.trim().toLowerCase(Locale.ROOT);
-            if (optName.isEmpty()) {
-                throw new IllegalArgumentException("Empty option name in '" + a + "'.");
-            }
-
-            if (REMOVED_ALIASES.containsKey(optName)) {
-                String replacement = REMOVED_ALIASES.get(optName);
-                throw new IllegalArgumentException(
-                        "Option '--" + optName + "' is no longer supported. Use '--" + replacement + "' instead.");
-            }
-
-            if (!VALUE_OPTIONS.contains(optName) && !BOOLEAN_OPTIONS.contains(optName)) {
-                throw new IllegalArgumentException("Unknown option: '--" + optName + "'.");
-            }
-
-            if (values.containsKey(optName)) {
-                throw new IllegalArgumentException("Duplicate option: '--" + optName + "'.");
-            }
-
-            if (VALUE_OPTIONS.contains(optName)) {
-                if (eq < 0) {
-                    throw new IllegalArgumentException(
-                            "Missing value for option '--" + optName + "'. Expected '--" + optName + "=<value>'.");
-                }
-                String val = a.substring(eq + 1).trim();
-                if (val.isEmpty()) {
-                    throw new IllegalArgumentException(
-                            "Empty value for option '--" + optName + "'. Expected '--" + optName + "=<value>'.");
-                }
-                values.put(optName, val);
-            } else {
-                if (eq < 0) {
-                    values.put(optName, "true");
-                } else {
-                    String val = a.substring(eq + 1).trim();
-                    if ("true".equalsIgnoreCase(val)) {
-                        values.put(optName, "true");
-                    } else if ("false".equalsIgnoreCase(val)) {
-                        values.put(optName, "false");
-                    } else {
-                        throw new IllegalArgumentException(
-                                "Invalid boolean value '" + val + "' for option '--" + optName + "'. Expected 'true' or 'false'.");
-                    }
-                }
-            }
-        }
+        Map<String, String> values = DeadLetterListCommand.parseArgs(args, VALUE_OPTIONS, BOOLEAN_OPTIONS);
 
         boolean hasExecute = "true".equals(values.get("execute"));
         boolean hasDryRun = "true".equals(values.get("dry-run"));

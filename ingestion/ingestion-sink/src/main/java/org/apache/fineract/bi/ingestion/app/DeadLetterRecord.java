@@ -50,6 +50,7 @@ public record DeadLetterRecord(
         byte[] key,
         UUID dltId,
         ReplayIdentity replayIdentityHeader,
+        boolean hasExplicitReplayId,
         boolean hasInvalidReplayIdentity,
         String replayIdentityError) {
 
@@ -158,6 +159,49 @@ public record DeadLetterRecord(
         return !valueOmitted && value != null;
     }
 
+    public DeadLetterRecord(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            long dltTimestamp,
+            String originalTopic,
+            int originalPartition,
+            long originalOffset,
+            String reason,
+            String message,
+            String table,
+            String sourceId,
+            boolean valueOmitted,
+            Integer valueBytes,
+            byte[] value,
+            byte[] key,
+            UUID dltId,
+            ReplayIdentity replayIdentityHeader,
+            boolean hasInvalidReplayIdentity,
+            String replayIdentityError) {
+        this(
+                dltTopic,
+                dltPartition,
+                dltOffset,
+                dltTimestamp,
+                originalTopic,
+                originalPartition,
+                originalOffset,
+                reason,
+                message,
+                table,
+                sourceId,
+                valueOmitted,
+                valueBytes,
+                value,
+                key,
+                dltId,
+                replayIdentityHeader,
+                false,
+                hasInvalidReplayIdentity,
+                replayIdentityError);
+    }
+
     public boolean hasKnownTable() {
         return !UNKNOWN_TABLE.equals(table);
     }
@@ -174,17 +218,23 @@ public record DeadLetterRecord(
         if (hasInvalidReplayIdentity) {
             throw new IllegalStateException("DLT record has invalid replay identity: " + replayIdentityError);
         }
-        if (replayIdentityHeader != null) {
+        if (hasExplicitReplayId && replayIdentityHeader != null) {
             return replayIdentityHeader;
         }
+        String topic = replayIdentityHeader != null ? replayIdentityHeader.dltTopic() : dltTopic;
+        int partition = replayIdentityHeader != null ? replayIdentityHeader.dltPartition() : dltPartition;
+        long offset = replayIdentityHeader != null ? replayIdentityHeader.dltOffset() : dltOffset;
+
         if (dltId != null) {
-            return new ReplayIdentity(dltId, dltTopic, dltPartition, dltOffset);
+            return new ReplayIdentity(dltId, topic, partition, offset);
         }
         return new ReplayIdentity(
-                dltTopic,
-                dltPartition,
-                dltOffset,
+                topic,
+                partition,
+                offset,
                 dltTimestamp,
+                sourceId,
+                hasKnownTable() ? table : null,
                 originalTopic,
                 originalPartition,
                 originalOffset);
@@ -294,18 +344,21 @@ public record DeadLetterRecord(
                         key,
                         null,
                         null,
+                        false,
                         true,
                         "Invalid UUID in " + ReplayIdentity.DLT_ID_HEADER + ": " + dltIdHeader);
             }
         }
 
         ReplayIdentity replayId = null;
+        boolean hasExplicitReplayId = false;
         boolean invalidReplay = false;
         String replayError = null;
 
         if (ReplayIdentityHeaders.hasReplayHeaders(headers)) {
             try {
                 replayId = ReplayIdentityHeaders.read(headers).orElse(null);
+                hasExplicitReplayId = ReplayIdentityHeaders.hasExplicitReplayId(headers);
             } catch (Exception e) {
                 invalidReplay = true;
                 replayError = e.getMessage();
@@ -330,6 +383,7 @@ public record DeadLetterRecord(
                 key,
                 dltId,
                 replayId,
+                hasExplicitReplayId,
                 invalidReplay,
                 replayError);
     }

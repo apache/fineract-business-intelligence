@@ -307,8 +307,7 @@ public final class WarehouseWriter implements BatchWriter {
                     try (ResultSet rs = ps.executeQuery()) {
                         if (rs.next()) {
                             String outcomeStr = rs.getString(2);
-                            ReplayOutcome outcome = outcomeStr != null ? ReplayOutcome.valueOf(outcomeStr)
-                                    : ReplayOutcome.LEGACY_UNKNOWN;
+                            ReplayOutcome outcome = outcomeStr != null ? ReplayOutcome.valueOf(outcomeStr) : null;
                             outcomeByUuid.put(uuid, outcome);
                         } else {
                             outcomeByUuid.put(uuid, null);

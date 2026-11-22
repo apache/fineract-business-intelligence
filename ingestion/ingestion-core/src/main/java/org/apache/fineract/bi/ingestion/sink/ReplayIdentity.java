@@ -70,6 +70,32 @@ public record ReplayIdentity(UUID replayId, String dltTopic, int dltPartition, l
                 dltOffset);
     }
 
+    public ReplayIdentity(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            long dltTimestamp,
+            String sourceId,
+            String table,
+            String originalTopic,
+            int originalPartition,
+            long originalOffset) {
+        this(
+                legacyFallbackId(
+                        dltTopic,
+                        dltPartition,
+                        dltOffset,
+                        dltTimestamp,
+                        sourceId,
+                        table,
+                        originalTopic,
+                        originalPartition,
+                        originalOffset),
+                dltTopic,
+                dltPartition,
+                dltOffset);
+    }
+
     public static UUID legacyLineageId(String topic, int partition, long offset) {
         Objects.requireNonNull(topic, "topic");
         String key = "fbi:replay:" + topic + ":" + partition + ":" + offset;
@@ -91,6 +117,48 @@ public record ReplayIdentity(UUID replayId, String dltTopic, int dltPartition, l
                 + ":" + originalPartition
                 + ":" + originalOffset;
         return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public static UUID legacyFallbackId(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            long dltTimestamp,
+            String sourceId,
+            String table,
+            String originalTopic,
+            int originalPartition,
+            long originalOffset) {
+        Objects.requireNonNull(dltTopic, "dltTopic");
+        if (sourceId == null && table == null) {
+            return legacyFallbackId(
+                    dltTopic,
+                    dltPartition,
+                    dltOffset,
+                    dltTimestamp,
+                    originalTopic,
+                    originalPartition,
+                    originalOffset);
+        }
+        StringBuilder sb = new StringBuilder("fbi:dlt:v2:");
+        encodeField(sb, dltTopic);
+        sb.append(dltPartition).append(';');
+        sb.append(dltOffset).append(';');
+        sb.append(dltTimestamp).append(';');
+        encodeField(sb, sourceId);
+        encodeField(sb, table);
+        encodeField(sb, originalTopic);
+        sb.append(originalPartition).append(';');
+        sb.append(originalOffset);
+        return UUID.nameUUIDFromBytes(sb.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void encodeField(StringBuilder sb, String val) {
+        if (val == null) {
+            sb.append("-1;");
+        } else {
+            sb.append(val.length()).append(':').append(val).append(';');
+        }
     }
 
     @Override

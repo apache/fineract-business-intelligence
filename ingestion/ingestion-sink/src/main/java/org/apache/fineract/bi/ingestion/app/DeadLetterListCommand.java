@@ -77,6 +77,10 @@ public final class DeadLetterListCommand {
     }
 
     static Map<String, String> parseArgs(String[] args) {
+        return parseArgs(args, VALUE_OPTIONS, BOOLEAN_OPTIONS);
+    }
+
+    static Map<String, String> parseArgs(String[] args, Set<String> valueOptions, Set<String> booleanOptions) {
         Map<String, String> values = new HashMap<>();
         if (args == null || args.length == 0) {
             return values;
@@ -103,7 +107,7 @@ public final class DeadLetterListCommand {
                 throw new IllegalArgumentException("Empty option name in '" + a + "'.");
             }
 
-            if (!VALUE_OPTIONS.contains(optName) && !BOOLEAN_OPTIONS.contains(optName)) {
+            if (!valueOptions.contains(optName) && !booleanOptions.contains(optName)) {
                 throw new IllegalArgumentException("Unknown option: '--" + optName + "'.");
             }
 
@@ -111,7 +115,7 @@ public final class DeadLetterListCommand {
                 throw new IllegalArgumentException("Duplicate option: '--" + optName + "'.");
             }
 
-            if (VALUE_OPTIONS.contains(optName)) {
+            if (valueOptions.contains(optName)) {
                 if (eq < 0) {
                     throw new IllegalArgumentException(
                             "Missing value for option '--" + optName + "'. Expected '--" + optName + "=<value>'.");
@@ -174,7 +178,13 @@ public final class DeadLetterListCommand {
             }
         }
 
-        long maxBytes = DeadLetterReader.DEFAULT_MAX_BYTES;
+        boolean withLedger = "true".equals(opts.get("with-ledger"));
+
+        if (!withLedger && opts.containsKey("max-bytes")) {
+            throw new IllegalArgumentException("Cannot specify --max-bytes without --with-ledger.");
+        }
+
+        long maxBytes = withLedger ? DeadLetterReader.DEFAULT_MAX_BYTES : Long.MAX_VALUE;
         if (opts.containsKey("max-bytes")) {
             try {
                 maxBytes = Long.parseLong(opts.get("max-bytes"));
@@ -187,16 +197,17 @@ public final class DeadLetterListCommand {
         }
 
         DeadLetterReader.ScanOptions scanOptions = new DeadLetterReader.ScanOptions(limit, maxBytes);
-        boolean withLedger = "true".equals(opts.get("with-ledger"));
 
         DeadLetterSummary.Accumulator accumulator = new DeadLetterSummary.Accumulator();
-        List<DeadLetterRecord> records = new ArrayList<>();
+        List<DeadLetterRecord> records = withLedger ? new ArrayList<>() : null;
         DeadLetterReader.ScanResult scan;
 
         try (DeadLetterReader reader = readerOverride != null ? readerOverride : new DeadLetterReader(config, contract)) {
             scan = reader.scan(scanOptions, record -> {
                 accumulator.add(record);
-                records.add(record);
+                if (withLedger) {
+                    records.add(record);
+                }
                 return new DeadLetterReader.VisitResult(true, false);
             });
         }
@@ -206,7 +217,7 @@ public final class DeadLetterListCommand {
             ledgerResult = inspectLedger(config, records, dsOverride);
         }
 
-        render(config.dltTopic(), scan, accumulator.snapshot(), accumulator.invalidReplayRecords(), ledgerResult, out);
+        render(config.dltTopic(), scan, accumulator.snapshot(), accumulator.invalidReplayRecordCount(), ledgerResult, out);
     }
 
     static LedgerInspectionResult inspectLedger(
@@ -264,7 +275,6 @@ public final class DeadLetterListCommand {
         outcomeCounts.put(ReplayOutcome.APPLIED.name(), 0L);
         outcomeCounts.put(ReplayOutcome.SKIPPED_STALE.name(), 0L);
         outcomeCounts.put(ReplayOutcome.SKIPPED_SUPERSEDED.name(), 0L);
-        outcomeCounts.put(ReplayOutcome.LEGACY_UNKNOWN.name(), 0L);
         outcomeCounts.put(ReplayOutcome.CLAIMED.name(), 0L);
         outcomeCounts.put(STATUS_NO_LEDGER_ENTRY, 0L);
         outcomeCounts.put(STATUS_IDENTITY_UNAVAILABLE, 0L);
@@ -319,23 +329,23 @@ public final class DeadLetterListCommand {
             DeadLetterReader.ScanResult scan,
             List<DeadLetterSummary.Group> groups,
             PrintStream out) {
-        render(topic, scan, groups, List.of(), null, out);
+        render(topic, scan, groups, 0L, null, out);
     }
 
     static void render(
             String topic,
             DeadLetterReader.ScanResult scan,
             List<DeadLetterSummary.Group> groups,
-            List<DeadLetterRecord> invalidReplayRecords,
+            long invalidReplayRecordCount,
             PrintStream out) {
-        render(topic, scan, groups, invalidReplayRecords, null, out);
+        render(topic, scan, groups, invalidReplayRecordCount, null, out);
     }
 
     static void render(
             String topic,
             DeadLetterReader.ScanResult scan,
             List<DeadLetterSummary.Group> groups,
-            List<DeadLetterRecord> invalidReplayRecords,
+            long invalidReplayRecordCount,
             LedgerInspectionResult ledgerResult,
             PrintStream out) {
 
@@ -394,15 +404,10 @@ public final class DeadLetterListCommand {
                     formatRanges(group.dltOffsets())));
         }
 
-        if (invalidReplayRecords != null && !invalidReplayRecords.isEmpty()) {
+        if (invalidReplayRecordCount > 0) {
             out.println();
-            out.println("Warning: Found " + invalidReplayRecords.size()
-                    + " record(s) with invalid replay identity metadata (refused by dlt-replay):");
-            for (DeadLetterRecord r : invalidReplayRecords) {
-                out.printf("  %s[%d]@%d: %s%n",
-                        escape(r.dltTopic()), r.dltPartition(), r.dltOffset(),
-                        escape(r.replayIdentityError()));
-            }
+            out.println("Warning: Found " + invalidReplayRecordCount
+                    + " record(s) with invalid replay identity metadata (refused by dlt-replay).");
         }
 
         if (ledgerResult != null) {

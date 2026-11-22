@@ -750,14 +750,26 @@ To cross-reference dead-letter records against durable outcomes in `meta.replay_
 docker compose --profile cdc exec sink java -cp /app/sink.jar org.apache.fineract.bi.ingestion.app.SinkApplication dlt-list --with-ledger
 ```
 
+##### Scan behavior and options
+
+By default, `dlt-list` scans all available dead-letter records without a cumulative byte limit.
+When `--with-ledger` is specified, the command cross-references records against `meta.replay_ledger` and applies a default cumulative scan budget of 64 MiB (67,108,864 bytes).
+
+| Option | Description |
+|---|---|
+| `--with-ledger` | Cross-reference dead-letter records against durable outcomes in `meta.replay_ledger`. Enables the default 64 MiB cumulative scan budget. |
+| `--max-bytes=<bytes>` | Override the cumulative scan budget. Valid only when `--with-ledger` is specified; the command rejects `--max-bytes` without `--with-ledger`. |
+
+Byte accounting tracks logical record bytes (key, value, and header bytes), not exact Kafka wire transport bytes or a strict JVM consumer-memory bound.
+
 The output displays:
 - Overall summary: total records on DLT, available payloads vs. omitted payloads (`fbi.dlt.value_omitted`).
 - Counts grouped by rejection reason (e.g. `UNKNOWN_SOURCE`, `WAREHOUSE_REJECTED`, `MALFORMED_JSON`).
 - Counts grouped by source ID and table.
 - Detailed record coordinate breakdown (`DLT[partition]@offset -> original topic[partition]@offset`).
 - A warning if any records contain invalid or malformed replay identity headers.
-- When `--with-ledger` is specified: historical outcome counts (`APPLIED`, `SKIPPED_STALE`, `SKIPPED_SUPERSEDED`, `LEGACY_UNKNOWN`, `CLAIMED`, `No ledger entry`, `Identity unavailable`) and individual record ledger statuses.
-  - *Distinction between missing ledger entries and confirmed unprocessed records:* A status of `No ledger entry` indicates that no row matching the record's logical replay UUID is present in `meta.replay_ledger`. Records may be un-replayed, or earlier ledger entries may have been purged by retention policies; a missing ledger entry is not cryptographic proof that an event was never processed.
+- When `--with-ledger` is specified: historical outcome counts (`APPLIED`, `SKIPPED_STALE`, `SKIPPED_SUPERSEDED`, `CLAIMED`, `No ledger entry`, `Identity unavailable`) and individual record ledger statuses.
+  - *Distinction between missing ledger entries and confirmed unprocessed records:* A status of `No ledger entry` indicates that no row matching the record's logical replay UUID is present in `meta.replay_ledger`. Records may be un-replayed, or earlier ledger entries may have been purged by retention policies (`replay_ledger_retention_days`, default 90 days); a missing ledger entry is not cryptographic proof that an event was never processed.
 
 #### 2. Replaying dead letters (`dlt-replay`)
 
@@ -829,7 +841,9 @@ The replay pipeline provides **effectively-once / idempotent replay processing**
 6. **Payload Availability Enforcement:**
    Records whose payload is unavailable or omitted (`fbi.dlt.value_omitted = true`) are rejected by `dlt-replay` and cannot be replayed.
 7. **Pre-Publication Outcome-Aware Replay Ledger Lookup:**
-   Before publishing to Kafka or running warehouse preflight, `dlt-replay` queries `meta.replay_ledger` using `WarehouseWriter.findCompletedReplayOutcomes()`. Candidate records whose `replay_id` is already recorded in the ledger are excluded from publication and reported explicitly with their stored outcome (`APPLIED`, `SKIPPED_STALE`, `SKIPPED_SUPERSEDED`, `LEGACY_UNKNOWN`, or non-terminal `CLAIMED`). An outcome breakdown is included in the summary report.
+   Before publishing to Kafka or running warehouse preflight, `dlt-replay` queries `meta.replay_ledger` using `WarehouseWriter.findCompletedReplayOutcomes()`. Candidate records whose `replay_id` is already recorded in the ledger are excluded from publication and reported explicitly with their stored outcome (`APPLIED`, `SKIPPED_STALE`, `SKIPPED_SUPERSEDED`, or non-terminal `CLAIMED`). An outcome breakdown is included in the summary report.
+8. **Replay Ledger Retention and Restoring Archived Records:**
+   The default 90-day retention in `meta.platform_settings` (`replay_ledger_retention_days`) assumes the default 14-day Kafka DLT retention (`TOPIC_DLT_RETENTION_MS`). Operators extending Kafka DLT retention should increase `replay_ledger_retention_days` accordingly so that the ledger outlives Kafka DLT messages. Restoring cold-archived DLT records after their ledger entries have expired and been purged by `meta.purge_replay_ledger()` risks duplicate application: the warehouse LSN/generation guard only protects newer rows that still exist in the warehouse raw table; rows deleted and purged from change logs or never inserted would be reapplied if re-injected after ledger expiry.
 
 #### 4. Warehouse preflight validation, prediction semantics, and asynchronous live execution
 

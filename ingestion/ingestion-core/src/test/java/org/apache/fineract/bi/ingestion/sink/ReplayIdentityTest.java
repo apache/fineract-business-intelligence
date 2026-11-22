@@ -70,6 +70,72 @@ public class ReplayIdentityTest {
         assertNotEquals(first, differentTimestamp);
     }
 
+    @Test
+    public void legacyFallbackWithDifferentSourceIdsProducesDifferentUuids() {
+        ReplayIdentity first = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 1000L, "bank-a", "m_loan", "fineract.cdc.m_loan", 0, 50L);
+        ReplayIdentity second = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 1000L, "bank-b", "m_loan", "fineract.cdc.m_loan", 0, 50L);
+
+        assertNotEquals(first, second);
+        assertNotEquals(first.replayId(), second.replayId());
+    }
+
+    @Test
+    public void legacyFallbackWithDifferentTableNamesProducesDifferentUuids() {
+        ReplayIdentity first = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 1000L, "bank-a", "m_loan", "fineract.cdc.m_loan", 0, 50L);
+        ReplayIdentity second = new ReplayIdentity(
+                "fineract.cdc.dlt", 1, 42, 1000L, "bank-a", "m_client", "fineract.cdc.m_loan", 0, 50L);
+
+        assertNotEquals(first, second);
+        assertNotEquals(first.replayId(), second.replayId());
+    }
+
+    @Test
+    public void legacyFallbackRetainsOriginalUuidWhenSourceIdAndTableUnavailable() {
+        String topic = "fineract.cdc.dlt";
+        int partition = 1;
+        long offset = 42L;
+        long timestamp = 1000L;
+        String origTopic = "fineract.cdc.m_loan";
+        int origPart = 0;
+        long origOff = 50L;
+
+        String expectedKey = "fbi:dlt:" + topic + ":" + partition + ":" + offset
+                + ":" + timestamp
+                + ":" + origTopic
+                + ":" + origPart
+                + ":" + origOff;
+        UUID expectedUuid = UUID.nameUUIDFromBytes(expectedKey.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        UUID from7ArgMethod = ReplayIdentity.legacyFallbackId(
+                topic, partition, offset, timestamp, origTopic, origPart, origOff);
+        assertEquals(from7ArgMethod, expectedUuid);
+
+        UUID from9ArgMethod = ReplayIdentity.legacyFallbackId(
+                topic, partition, offset, timestamp, null, null, origTopic, origPart, origOff);
+        assertEquals(from9ArgMethod, expectedUuid);
+
+        ReplayIdentity from7ArgConstructor = new ReplayIdentity(
+                topic, partition, offset, timestamp, origTopic, origPart, origOff);
+        assertEquals(from7ArgConstructor.replayId(), expectedUuid);
+
+        ReplayIdentity from9ArgConstructor = new ReplayIdentity(
+                topic, partition, offset, timestamp, null, null, origTopic, origPart, origOff);
+        assertEquals(from9ArgConstructor.replayId(), expectedUuid);
+    }
+
+    @Test
+    public void fallbackEncodingPreventsDelimiterCollisions() {
+        UUID id1 = ReplayIdentity.legacyFallbackId(
+                "fineract.cdc.dlt", 1, 42, 1000L, "bank:a", "m_loan", "fineract.cdc.m_loan", 0, 50L);
+        UUID id2 = ReplayIdentity.legacyFallbackId(
+                "fineract.cdc.dlt", 1, 42, 1000L, "bank", "a:m_loan", "fineract.cdc.m_loan", 0, 50L);
+
+        assertNotEquals(id1, id2);
+    }
+
     @Test(expectedExceptions = NullPointerException.class)
     public void rejectsNullUuid() {
         new ReplayIdentity(null, "fineract.cdc.dlt", 0, 0);

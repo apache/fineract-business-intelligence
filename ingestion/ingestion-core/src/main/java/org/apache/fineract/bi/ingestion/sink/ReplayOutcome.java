@@ -22,6 +22,5 @@ public enum ReplayOutcome {
     CLAIMED,
     APPLIED,
     SKIPPED_STALE,
-    SKIPPED_SUPERSEDED,
-    LEGACY_UNKNOWN
+    SKIPPED_SUPERSEDED
 }

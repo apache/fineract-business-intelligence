@@ -26,6 +26,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -518,5 +519,29 @@ public class WarehousePreflightValidatorTest {
         assertThat(result.passed()).isFalse();
         assertThat(result.reason()).contains("Replay identity did not receive a terminal predicted outcome");
         assertThat(result.predictedOutcomes()).isEmpty();
+    }
+
+    @Test
+    public void isRecordLevelErrorAcceptsOnlyAllowlistedSqlStates() {
+        List<String> allowed = List.of(
+                "22001", "22003", "22007", "22008", "22012", "22021", "22P02", "23502", "23514"
+        );
+        for (String sqlState : allowed) {
+            WarehousePreflightValidator.BatchValidationResult result =
+                    new WarehousePreflightValidator.BatchValidationResult(false, "error", List.of(), Map.of(), sqlState);
+            assertThat(result.isRecordLevelError()).isTrue();
+        }
+    }
+
+    @Test
+    public void isRecordLevelErrorRejectsAmbiguousAndSystemicSqlStates() {
+        List<String> rejected = Arrays.asList(
+                "23505", "23503", "23P01", "23000", "22000", "08006", "42P01", "53300", "57014", "58000", "", null
+        );
+        for (String sqlState : rejected) {
+            WarehousePreflightValidator.BatchValidationResult result =
+                    new WarehousePreflightValidator.BatchValidationResult(false, "error", List.of(), Map.of(), sqlState);
+            assertThat(result.isRecordLevelError()).isFalse();
+        }
     }
 }

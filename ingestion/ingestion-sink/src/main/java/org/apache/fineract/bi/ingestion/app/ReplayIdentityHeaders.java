@@ -43,6 +43,13 @@ final class ReplayIdentityHeaders {
                 || headers.lastHeader(ReplayIdentity.OFFSET_HEADER) != null;
     }
 
+    static boolean hasExplicitReplayId(Headers headers) {
+        if (headers == null) {
+            return false;
+        }
+        return headers.lastHeader(ReplayIdentity.ID_HEADER) != null;
+    }
+
     static Optional<ReplayIdentity> read(Headers headers) {
         if (headers == null) {
             return Optional.empty();

@@ -77,12 +77,26 @@ public class DeadLetterListCommandTest {
             long sourceOffset,
             UUID replayId,
             boolean invalidReplayHeader) {
+        return createConsumerRecordWithKey(
+                dltTopic, dltPartition, dltOffset, null, sourceId, table, sourceOffset, replayId, invalidReplayHeader);
+    }
+
+    private static ConsumerRecord<byte[], byte[]> createConsumerRecordWithKey(
+            String dltTopic,
+            int dltPartition,
+            long dltOffset,
+            byte[] key,
+            String sourceId,
+            String table,
+            long sourceOffset,
+            UUID replayId,
+            boolean invalidReplayHeader) {
 
         byte[] payload = ("{\"source\":{\"name\":\"" + sourceId + "\",\"table\":\"" + table + "\"},\"op\":\"c\"}")
                 .getBytes(StandardCharsets.UTF_8);
 
         ConsumerRecord<byte[], byte[]> record =
-                new ConsumerRecord<>(dltTopic, dltPartition, dltOffset, null, payload);
+                new ConsumerRecord<>(dltTopic, dltPartition, dltOffset, key, payload);
 
         record.headers().add("fbi.dlt.reason", "WAREHOUSE_REJECTED".getBytes(StandardCharsets.UTF_8));
         record.headers().add("fbi.dlt.message", "test rejection".getBytes(StandardCharsets.UTF_8));
@@ -429,30 +443,6 @@ public class DeadLetterListCommandTest {
     }
 
     @Test
-    public void withLedgerDisplaysLegacyUnknownAndNotAsApplied() throws Exception {
-        UUID legacyUuid = UUID.randomUUID();
-
-        ConsumerRecord<byte[], byte[]> r = createConsumerRecord(DLT, 0, 10L, "bank-a", "batch_job_instance", 100L, legacyUuid, false);
-        MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(r));
-        DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
-
-        Connection conn = mockConnection(Map.of(legacyUuid, ReplayOutcome.LEGACY_UNKNOWN),
-                new ArrayList<>(), new AtomicInteger(0), null);
-        MockDataSource ds = new MockDataSource(conn);
-
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        DeadLetterListCommand.run(testConfig(), CONTRACT, new String[]{"--with-ledger"},
-                new PrintStream(out, true, StandardCharsets.UTF_8), ds, reader);
-
-        String result = out.toString(StandardCharsets.UTF_8);
-        assertThat(result)
-                .contains("- APPLIED: 0")
-                .contains("- LEGACY_UNKNOWN: 1")
-                .contains(legacyUuid.toString() + "\tLEGACY_UNKNOWN")
-                .doesNotContain(legacyUuid.toString() + "\tAPPLIED");
-    }
-
-    @Test
     public void withLedgerDisplaysNoLedgerEntryNotUnprocessed() throws Exception {
         UUID absentUuid = UUID.randomUUID();
 
@@ -645,9 +635,110 @@ public class DeadLetterListCommandTest {
         MockConsumer<byte[], byte[]> consumer2 = createMockConsumer(DLT, List.of(r));
         DeadLetterReader reader2 = new DeadLetterReader(consumer2, DLT, CONTRACT);
         assertThatThrownBy(() -> DeadLetterListCommand.run(
-                testConfig(), CONTRACT, new String[]{"--max-bytes=-10"},
+                testConfig(), CONTRACT, new String[]{"--with-ledger", "--max-bytes=-10"},
                 new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8), null, reader2))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("max-bytes must be positive: -10");
+
+        MockConsumer<byte[], byte[]> consumer3 = createMockConsumer(DLT, List.of(r));
+        DeadLetterReader reader3 = new DeadLetterReader(consumer3, DLT, CONTRACT);
+        assertThatThrownBy(() -> DeadLetterListCommand.run(
+                testConfig(), CONTRACT, new String[]{"--max-bytes=100"},
+                new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8), null, reader3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("Cannot specify --max-bytes without --with-ledger.");
+    }
+
+    @Test
+    public void defaultListingScansEntireSnapshotWithoutByteBudgetTruncation() throws Exception {
+        byte[] largeKey = new byte[35 * 1024 * 1024];
+        ConsumerRecord<byte[], byte[]> big1 = createConsumerRecordWithKey(
+                DLT, 0, 10L, largeKey, "bank-a", "batch_job_instance", 100L, UUID.randomUUID(), false);
+        ConsumerRecord<byte[], byte[]> big2 = createConsumerRecordWithKey(
+                DLT, 0, 11L, largeKey, "bank-a", "batch_job_instance", 101L, UUID.randomUUID(), false);
+
+        MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(big1, big2));
+        DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DeadLetterListCommand.run(testConfig(), CONTRACT, new String[0],
+                new PrintStream(out, true, StandardCharsets.UTF_8), null, reader);
+
+        String result = out.toString(StandardCharsets.UTF_8);
+        assertThat(result)
+                .contains("Records scanned: 2")
+                .contains("Records matched: 2")
+                .contains("Stop reason: COMPLETED")
+                .contains("Partitions scanned: 1")
+                .doesNotContain("Warning: Listing stopped early");
+    }
+
+    @Test
+    public void withLedgerEnforcesDefaultByteBudget() throws Exception {
+        byte[] largeKey = new byte[35 * 1024 * 1024];
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        ConsumerRecord<byte[], byte[]> big1 = createConsumerRecordWithKey(
+                DLT, 0, 10L, largeKey, "bank-a", "batch_job_instance", 100L, u1, false);
+        ConsumerRecord<byte[], byte[]> big2 = createConsumerRecordWithKey(
+                DLT, 0, 11L, largeKey, "bank-a", "batch_job_instance", 101L, u2, false);
+
+        MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(big1, big2));
+        DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
+
+        Connection conn = mockConnection(Map.of(u1, ReplayOutcome.APPLIED), new ArrayList<>(), new AtomicInteger(0), null);
+        MockDataSource ds = new MockDataSource(conn);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DeadLetterListCommand.run(testConfig(), CONTRACT, new String[]{"--with-ledger"},
+                new PrintStream(out, true, StandardCharsets.UTF_8), ds, reader);
+
+        String result = out.toString(StandardCharsets.UTF_8);
+        assertThat(result)
+                .contains("Records scanned: 1")
+                .contains("Stop reason: BYTE_BUDGET_REACHED")
+                .contains("Warning: Listing stopped early because the byte budget was reached; not all partitions were fully scanned.")
+                .contains("Partitions in snapshot: 1 (scan stopped early: BYTE_BUDGET_REACHED)");
+    }
+
+    @Test
+    public void withLedgerSupportsExplicitMaxBytesOverride() throws Exception {
+        UUID u1 = UUID.randomUUID();
+        UUID u2 = UUID.randomUUID();
+        ConsumerRecord<byte[], byte[]> r1 = createConsumerRecord(DLT, 0, 10L, "bank-a", "batch_job_instance", 100L, u1, false);
+        ConsumerRecord<byte[], byte[]> r2 = createConsumerRecord(DLT, 0, 11L, "bank-a", "batch_job_instance", 101L, u2, false);
+
+        MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(r1, r2));
+        DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
+
+        Connection conn = mockConnection(Map.of(u1, ReplayOutcome.APPLIED), new ArrayList<>(), new AtomicInteger(0), null);
+        MockDataSource ds = new MockDataSource(conn);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DeadLetterListCommand.run(testConfig(), CONTRACT, new String[]{"--with-ledger", "--max-bytes=1"},
+                new PrintStream(out, true, StandardCharsets.UTF_8), ds, reader);
+
+        String result = out.toString(StandardCharsets.UTF_8);
+        assertThat(result)
+                .contains("Records scanned: 0")
+                .contains("Stop reason: BYTE_BUDGET_REACHED")
+                .contains("Warning: Listing stopped early because the byte budget was reached; not all partitions were fully scanned.");
+    }
+
+    @Test
+    public void defaultListingDisplaysInvalidIdentityWarningWithoutRetainingRecords() throws Exception {
+        ConsumerRecord<byte[], byte[]> invalidRecord = createConsumerRecord(
+                DLT, 0, 10L, "bank-a", "batch_job_instance", 100L, null, true);
+        MockConsumer<byte[], byte[]> consumer = createMockConsumer(DLT, List.of(invalidRecord));
+        DeadLetterReader reader = new DeadLetterReader(consumer, DLT, CONTRACT);
+
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        DeadLetterListCommand.run(testConfig(), CONTRACT, new String[0],
+                new PrintStream(out, true, StandardCharsets.UTF_8), null, reader);
+
+        String result = out.toString(StandardCharsets.UTF_8);
+        assertThat(result)
+                .contains("Warning: Found 1 record(s) with invalid replay identity metadata (refused by dlt-replay).")
+                .doesNotContain("Historical replay ledger outcomes");
     }
 }

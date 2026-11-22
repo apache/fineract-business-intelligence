@@ -298,6 +298,7 @@ public class DeadLetterRecordTest {
         DeadLetterRecord record = parse(headers, bytes("{}"));
 
         assertThat(record.hasReplayHeaders()).isTrue();
+        assertThat(record.hasExplicitReplayId()).isTrue();
         assertThat(record.hasInvalidReplayIdentity()).isFalse();
         assertThat(record.replayIdentity().replayId()).isEqualTo(replayUuid);
         assertThat(record.replayIdentity().dltTopic()).isEqualTo("orig.dlt");
@@ -315,11 +316,34 @@ public class DeadLetterRecordTest {
         DeadLetterRecord record = parse(headers, bytes("{}"));
 
         assertThat(record.hasReplayHeaders()).isTrue();
+        assertThat(record.hasExplicitReplayId()).isFalse();
         assertThat(record.hasInvalidReplayIdentity()).isFalse();
         assertThat(record.replayIdentity().replayId()).isEqualTo(dltUuid);
         assertThat(record.replayIdentity().dltTopic()).isEqualTo("fineract.cdc.dlt");
         assertThat(record.replayIdentity().dltPartition()).isEqualTo(1);
         assertThat(record.replayIdentity().dltOffset()).isEqualTo(25L);
+    }
+
+    @Test
+    public void legacyRecordWithValidDltIdUsesDltIdRatherThanCoordinateOnlySynthesizedUuid() {
+        java.util.UUID dltUuid = java.util.UUID.randomUUID();
+        RecordHeaders headers = validHeaders();
+        headers.add("fbi.replay.dlt.topic", bytes("orig.dlt"));
+        headers.add("fbi.replay.dlt.partition", bytes("3"));
+        headers.add("fbi.replay.dlt.offset", bytes("77"));
+        headers.add("fbi.dlt.id", bytes(dltUuid.toString()));
+
+        DeadLetterRecord record = parse(headers, bytes("{}"));
+
+        assertThat(record.hasReplayHeaders()).isTrue();
+        assertThat(record.hasExplicitReplayId()).isFalse();
+        assertThat(record.hasInvalidReplayIdentity()).isFalse();
+        assertThat(record.replayIdentity().replayId()).isEqualTo(dltUuid);
+        assertThat(record.replayIdentity().replayId())
+                .isNotEqualTo(org.apache.fineract.bi.ingestion.sink.ReplayIdentity.legacyLineageId("orig.dlt", 3, 77L));
+        assertThat(record.replayIdentity().dltTopic()).isEqualTo("orig.dlt");
+        assertThat(record.replayIdentity().dltPartition()).isEqualTo(3);
+        assertThat(record.replayIdentity().dltOffset()).isEqualTo(77L);
     }
 
     @Test
@@ -334,10 +358,45 @@ public class DeadLetterRecordTest {
 
         org.apache.fineract.bi.ingestion.sink.ReplayIdentity expected =
                 new org.apache.fineract.bi.ingestion.sink.ReplayIdentity(
-                        "fineract.cdc.dlt", 1, 25L, timestamp, "fineract.cdc.batch_job_instance", 2, 91L);
+                        "fineract.cdc.dlt", 1, 25L, timestamp, null, "batch_job_instance", "fineract.cdc.batch_job_instance", 2, 91L);
 
         assertThat(record.replayIdentity()).isEqualTo(expected);
         assertThat(record.replayIdentity().replayId()).isEqualTo(expected.replayId());
+    }
+
+    @Test
+    public void legacyFallbackWhenSourceAndTableUnavailableRetainsOriginalUuid() {
+        long timestamp = 1700000000123L;
+        RecordHeaders headers = validHeaders();
+        headers.remove("fbi.source.topic");
+        headers.add("fbi.source.topic", bytes("fineract.cdc.unknown_table"));
+
+        DeadLetterRecord record = DeadLetterRecord.parse(
+                "fineract.cdc.dlt", 1, 25L, timestamp, headers, null, bytes("{}"), CONTRACT);
+
+        assertThat(record.hasKnownTable()).isFalse();
+        assertThat(record.sourceId()).isNull();
+
+        org.apache.fineract.bi.ingestion.sink.ReplayIdentity expected =
+                new org.apache.fineract.bi.ingestion.sink.ReplayIdentity(
+                        "fineract.cdc.dlt", 1, 25L, timestamp, "fineract.cdc.unknown_table", 2, 91L);
+
+        assertThat(record.replayIdentity()).isEqualTo(expected);
+        assertThat(record.replayIdentity().replayId()).isEqualTo(expected.replayId());
+    }
+
+    @Test
+    public void compatibilityConstructorDefaultsHasExplicitReplayIdToFalse() {
+        org.apache.fineract.bi.ingestion.sink.ReplayIdentity synthesized =
+                new org.apache.fineract.bi.ingestion.sink.ReplayIdentity("orig.dlt", 1, 10L);
+        DeadLetterRecord record = new DeadLetterRecord(
+                "fineract.cdc.dlt", 0, 5L, 1000L,
+                "fineract.cdc.m_loan", 1, 20L,
+                "REASON", "msg", "m_loan", "bank-a",
+                false, null, bytes("{}"), bytes("k"),
+                null, synthesized, false, null);
+
+        assertThat(record.hasExplicitReplayId()).isFalse();
     }
 
     @Test

@@ -92,8 +92,7 @@ public final class SinkMetrics implements AutoCloseable {
         APPLIED("applied"),
         SKIPPED_STALE("skipped_stale"),
         SKIPPED_SUPERSEDED("skipped_superseded"),
-        ALREADY_COMPLETED("already_completed"),
-        LEGACY_UNKNOWN("legacy_unknown");
+        ALREADY_COMPLETED("already_completed");
 
         private final String tag;
 
@@ -113,7 +112,6 @@ public final class SinkMetrics implements AutoCloseable {
                 case APPLIED -> Optional.of(APPLIED);
                 case SKIPPED_STALE -> Optional.of(SKIPPED_STALE);
                 case SKIPPED_SUPERSEDED -> Optional.of(SKIPPED_SUPERSEDED);
-                case LEGACY_UNKNOWN -> Optional.of(LEGACY_UNKNOWN);
                 case CLAIMED -> Optional.empty();
             };
         }

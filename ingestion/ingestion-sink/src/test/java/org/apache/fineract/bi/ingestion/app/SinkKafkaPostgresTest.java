@@ -168,7 +168,7 @@ public class SinkKafkaPostgresTest {
                 + "GRANT INSERT, UPDATE, DELETE ON meta.consumer_offsets, meta.extract_watermarks, "
                 + "meta.ingestion_progress, meta.ingestion_audit, meta.pipeline_state TO analytics_engine; "
                 + "GRANT INSERT ON meta.entity_change_log TO analytics_engine; "
-                + "GRANT SELECT, INSERT ON meta.replay_ledger TO analytics_engine; "
+                + "GRANT SELECT, INSERT, UPDATE (outcome) ON meta.replay_ledger TO analytics_engine; "
                 + "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta TO analytics_engine\"");
         update("INSERT INTO meta.source_registry (source_id, tenant_id, lifecycle_state) VALUES ('" + SOURCE
                 + "', 'tenant-a', 'ACTIVE')");
@@ -843,6 +843,73 @@ public class SinkKafkaPostgresTest {
     }
 
     @Test(dependsOnMethods = "unavailableToastMergedReplayMarksContributingRowApplied")
+    public void unavailableToastNonReplayBatchAndSubsequentReplayBatch() throws Exception {
+        long epoch = scalar("SELECT epoch FROM meta.ingestion_ownership WHERE source_id = '" + SOURCE + "' AND table_name = '" + TABLE + "'");
+        Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
+        WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
+
+        long entityIdNonReplay = 345671L;
+        ChangeEvent contribNonReplay = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {String.valueOf(entityIdNonReplay), "name_nonreplay_contrib", "key_orig_nonreplay"},
+                List.of(), 3010L, System.currentTimeMillis() * 1000L);
+
+        ChangeEvent toastNonReplay = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {String.valueOf(entityIdNonReplay), null, "key_toast_updated_nonreplay"},
+                List.of("job_name"), 3011L, System.currentTimeMillis() * 1000L);
+
+        try (Connection c = engineSource.getConnection()) {
+            BatchWriter.WriteResult res = writer.write(c,
+                    List.of(new RoutedEvent(contribNonReplay, route, null), new RoutedEvent(toastNonReplay, route, null)),
+                    List.of(), "g-toast-nonreplay", List.of());
+            assertThat(res.replayOutcomes()).isEmpty();
+        }
+
+        try (Connection c = postgres.createConnection("");
+             Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT job_name, job_key FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityIdNonReplay)) {
+            assertThat(rs.next()).isTrue();
+            assertThat(rs.getString("job_name")).isEqualTo("name_nonreplay_contrib");
+            assertThat(rs.getString("job_key")).isEqualTo("key_toast_updated_nonreplay");
+        }
+
+        long entityIdReplay = 345672L;
+        UUID replayUuid1 = UUID.randomUUID();
+        ReplayIdentity replayId1 = new ReplayIdentity(replayUuid1, DLT, 0, 3020L);
+        ChangeEvent contribReplay = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {String.valueOf(entityIdReplay), "name_subsequent_replay_contrib", "key_orig_replay"},
+                List.of(), 3020L, System.currentTimeMillis() * 1000L);
+
+        UUID replayUuid2 = UUID.randomUUID();
+        ReplayIdentity replayId2 = new ReplayIdentity(replayUuid2, DLT, 0, 3021L);
+        ChangeEvent toastReplay = new ChangeEvent(
+                SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                new String[] {String.valueOf(entityIdReplay), null, "key_toast_updated_replay"},
+                List.of("job_name"), 3021L, System.currentTimeMillis() * 1000L);
+
+        try (Connection c = engineSource.getConnection()) {
+            BatchWriter.WriteResult res = writer.write(c,
+                    List.of(new RoutedEvent(contribReplay, route, replayId1), new RoutedEvent(toastReplay, route, replayId2)),
+                    List.of(), "g-toast-subsequent-replay", List.of());
+            assertThat(res.replayOutcomes().get(replayId1)).isEqualTo(ReplayOutcome.APPLIED);
+            assertThat(res.replayOutcomes().get(replayId2)).isEqualTo(ReplayOutcome.APPLIED);
+        }
+
+        assertThat(queryLedgerOutcome(replayUuid1)).isEqualTo("APPLIED");
+        assertThat(queryLedgerOutcome(replayUuid2)).isEqualTo("APPLIED");
+
+        try (Connection c = postgres.createConnection("");
+             Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT job_name, job_key FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityIdReplay)) {
+            assertThat(rs.next()).isTrue();
+            assertThat(rs.getString("job_name")).isEqualTo("name_subsequent_replay_contrib");
+            assertThat(rs.getString("job_key")).isEqualTo("key_toast_updated_replay");
+        }
+    }
+
+    @Test(dependsOnMethods = "unavailableToastNonReplayBatchAndSubsequentReplayBatch")
     public void pythonExtractorStagingCompatibility() throws Exception {
         long pyJobId = 456780L;
         String pySource = "bank-py-test";
@@ -1109,62 +1176,116 @@ public class SinkKafkaPostgresTest {
         Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
 
         long idStaleEntity = 9101L;
-        update("INSERT INTO raw.raw_" + TABLE
-                + " (source_id, tenant_id, job_instance_id, job_name, job_key, _source_generation, _source_lsn, _source_ts, _ingested_at, _ingest_engine, _is_deleted) "
-                + "VALUES ('" + SOURCE + "', 'tenant-a', " + idStaleEntity + ", 'existing-job', 'existing-key', 0, 500, NOW(), NOW(), 'KAFKA', false) "
-                + "ON CONFLICT (source_id, tenant_id, job_instance_id) DO UPDATE SET _source_lsn = 500, job_name = 'existing-job'");
-
-        UUID uuidStale = UUID.randomUUID();
-        ReplayIdentity idStale = new ReplayIdentity(uuidStale, DLT, 0, 5001L);
-        ChangeEvent eventStale = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
-                new String[] {String.valueOf(idStaleEntity), "stale-job", "stale-key"},
-                List.of(), 200L, System.currentTimeMillis() * 1000L);
-
         long idDedupEntity = 9102L;
-        UUID uuidOlder = UUID.randomUUID();
-        ReplayIdentity idOlder = new ReplayIdentity(uuidOlder, DLT, 0, 5002L);
-        ChangeEvent eventOlder = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
-                new String[] {String.valueOf(idDedupEntity), "older-job", "older-key"},
-                List.of(), 100L, System.currentTimeMillis() * 1000L);
+        update("DELETE FROM raw.raw_" + TABLE + " WHERE job_instance_id IN (" + idStaleEntity + ", " + idDedupEntity + ")");
 
-        UUID uuidNewer = UUID.randomUUID();
-        ReplayIdentity idNewer = new ReplayIdentity(uuidNewer, DLT, 0, 5003L);
-        ChangeEvent eventNewer = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
-                new String[] {String.valueOf(idDedupEntity), "newer-job", "newer-key"},
-                List.of(), 200L, System.currentTimeMillis() * 1000L);
+        try {
+            update("INSERT INTO raw.raw_" + TABLE
+                    + " (source_id, tenant_id, job_instance_id, job_name, job_key, _source_generation, _source_lsn, _source_ts, _ingested_at, _ingest_engine, _is_deleted) "
+                    + "VALUES ('" + SOURCE + "', 'tenant-a', " + idStaleEntity + ", 'existing-job', 'existing-key', 0, 500, NOW(), NOW(), 'KAFKA', false) "
+                    + "ON CONFLICT (source_id, tenant_id, job_instance_id) DO UPDATE SET _source_lsn = 500, job_name = 'existing-job'");
 
-        BatchWriter.PreflightResult res;
-        try (Connection c = engineSource.getConnection()) {
-            c.setAutoCommit(true);
-            res = writer.preflight(c, List.of(
-                    new RoutedEvent(eventOlder, route, idOlder),
-                    new RoutedEvent(eventNewer, route, idNewer),
-                    new RoutedEvent(eventStale, route, idStale)));
+            UUID uuidStale = UUID.randomUUID();
+            ReplayIdentity idStale = new ReplayIdentity(uuidStale, DLT, 0, 5001L);
+            ChangeEvent eventStale = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                    new String[] {String.valueOf(idStaleEntity), "stale-job", "stale-key"},
+                    List.of(), 200L, System.currentTimeMillis() * 1000L);
 
-            assertThat(c.getAutoCommit()).isTrue();
+            UUID uuidOlder = UUID.randomUUID();
+            ReplayIdentity idOlder = new ReplayIdentity(uuidOlder, DLT, 0, 5002L);
+            ChangeEvent eventOlder = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                    new String[] {String.valueOf(idDedupEntity), "older-job", "older-key"},
+                    List.of(), 100L, System.currentTimeMillis() * 1000L);
+
+            UUID uuidNewer = UUID.randomUUID();
+            ReplayIdentity idNewer = new ReplayIdentity(uuidNewer, DLT, 0, 5003L);
+            ChangeEvent eventNewer = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                    new String[] {String.valueOf(idDedupEntity), "newer-job", "newer-key"},
+                    List.of(), 200L, System.currentTimeMillis() * 1000L);
+
+            BatchWriter.PreflightResult res;
+            try (Connection c = engineSource.getConnection()) {
+                c.setAutoCommit(true);
+                res = writer.preflight(c, List.of(
+                        new RoutedEvent(eventOlder, route, idOlder),
+                        new RoutedEvent(eventNewer, route, idNewer),
+                        new RoutedEvent(eventStale, route, idStale)));
+
+                assertThat(c.getAutoCommit()).isTrue();
+            }
+
+            assertThat(res.predictedOutcomes()).containsEntry(idStale, ReplayOutcome.SKIPPED_STALE);
+            assertThat(res.predictedOutcomes()).containsEntry(idNewer, ReplayOutcome.APPLIED);
+            assertThat(res.predictedOutcomes()).containsEntry(idOlder, ReplayOutcome.SKIPPED_SUPERSEDED);
+
+            assertThat(queryLedgerOutcome(uuidStale)).isNull();
+            assertThat(queryLedgerOutcome(uuidNewer)).isNull();
+            assertThat(queryLedgerOutcome(uuidOlder)).isNull();
+
+            try (Connection c = postgres.createConnection("");
+                 Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + idDedupEntity)) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getLong(1)).isZero();
+            }
+
+            try (Connection c = postgres.createConnection("");
+                 Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT job_name, _source_lsn FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + idStaleEntity)) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getString("job_name")).isEqualTo("existing-job");
+                assertThat(rs.getLong("_source_lsn")).isEqualTo(500L);
+            }
+        } finally {
+            update("DELETE FROM raw.raw_" + TABLE + " WHERE job_instance_id IN (" + idStaleEntity + ", " + idDedupEntity + ")");
         }
+    }
 
-        assertThat(res.predictedOutcomes()).containsEntry(idStale, ReplayOutcome.SKIPPED_STALE);
-        assertThat(res.predictedOutcomes()).containsEntry(idNewer, ReplayOutcome.APPLIED);
-        assertThat(res.predictedOutcomes()).containsEntry(idOlder, ReplayOutcome.SKIPPED_SUPERSEDED);
+    @Test
+    public void preflightEntityAtomicPairResolvesOutcomesAndRollsBackWithoutMutatingRawTable() throws Exception {
+        WarehouseWriter writer = new WarehouseWriter(contract, "KAFKA");
+        long epoch = scalar("SELECT epoch FROM meta.ingestion_ownership WHERE source_id = '" + SOURCE + "' AND table_name = '" + TABLE + "'");
+        Route route = new Route(Route.Target.PROD, epoch, "tenant-a", 0, null);
 
-        assertThat(queryLedgerOutcome(uuidStale)).isNull();
-        assertThat(queryLedgerOutcome(uuidNewer)).isNull();
-        assertThat(queryLedgerOutcome(uuidOlder)).isNull();
+        long entityPk = 9201L;
+        update("DELETE FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityPk);
 
-        try (Connection c = postgres.createConnection("");
-             Statement s = c.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + idDedupEntity)) {
-            assertThat(rs.next()).isTrue();
-            assertThat(rs.getLong(1)).isZero();
-        }
+        try {
+            UUID uuidOlder = UUID.randomUUID();
+            ReplayIdentity idOlder = new ReplayIdentity(uuidOlder, DLT, 0, 6001L);
+            ChangeEvent eventOlder = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                    new String[] {String.valueOf(entityPk), "order-1", "key-1"},
+                    List.of(), 100L, 1000L);
 
-        try (Connection c = postgres.createConnection("");
-             Statement s = c.createStatement();
-             ResultSet rs = s.executeQuery("SELECT job_name, _source_lsn FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + idStaleEntity)) {
-            assertThat(rs.next()).isTrue();
-            assertThat(rs.getString("job_name")).isEqualTo("existing-job");
-            assertThat(rs.getLong("_source_lsn")).isEqualTo(500L);
+            UUID uuidNewer = UUID.randomUUID();
+            ReplayIdentity idNewer = new ReplayIdentity(uuidNewer, DLT, 0, 6002L);
+            ChangeEvent eventNewer = new ChangeEvent(SOURCE, TABLE, ChangeEvent.Op.UPSERT,
+                    new String[] {String.valueOf(entityPk), "order-2", "key-2"},
+                    List.of(), 200L, 2000L);
+
+            BatchWriter.PreflightResult res;
+            try (Connection c = engineSource.getConnection()) {
+                c.setAutoCommit(true);
+                res = writer.preflight(c, List.of(
+                        new RoutedEvent(eventOlder, route, idOlder),
+                        new RoutedEvent(eventNewer, route, idNewer)));
+                assertThat(c.getAutoCommit()).isTrue();
+            }
+
+            assertThat(res.predictedOutcomes()).containsEntry(idOlder, ReplayOutcome.SKIPPED_SUPERSEDED);
+            assertThat(res.predictedOutcomes()).containsEntry(idNewer, ReplayOutcome.APPLIED);
+
+            assertThat(queryLedgerOutcome(uuidOlder)).isNull();
+            assertThat(queryLedgerOutcome(uuidNewer)).isNull();
+
+            try (Connection c = postgres.createConnection("");
+                 Statement s = c.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT count(*) FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityPk)) {
+                assertThat(rs.next()).isTrue();
+                assertThat(rs.getLong(1)).isZero();
+            }
+        } finally {
+            update("DELETE FROM raw.raw_" + TABLE + " WHERE job_instance_id = " + entityPk);
         }
     }
 

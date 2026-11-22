@@ -223,6 +223,12 @@ public class SinkWorkerDeliveryTest {
                                                         }
                                                         return false;
                                                     }
+                                                    if ("getString".equals(rMethod.getName())) {
+                                                        if (exists && rArgs != null && rArgs.length > 0 && Integer.valueOf(2).equals(rArgs[0])) {
+                                                            return "APPLIED";
+                                                        }
+                                                        return null;
+                                                    }
                                                     if ("close".equals(rMethod.getName())) {
                                                         return null;
                                                     }
@@ -695,7 +701,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(1.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(1.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
-        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("other_table", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
 
         assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
@@ -720,7 +725,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
-        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
 
         assertThat(metrics.registry().counter("fbi_sink_events_total", "table", "batch_job_instance", "outcome", "applied").count())
                 .isEqualTo(2.0);
@@ -756,24 +760,6 @@ public class SinkWorkerDeliveryTest {
     }
 
     @Test
-    public void legacyUnknownOutcomeIsRecordedAsLegacyUnknownAndNeverAsApplied() {
-        View view = new View(snapshot("STEADY", "KAFKA"));
-        SinkWorker w = worker(view, Map.of());
-
-        ReplayIdentity replay = new ReplayIdentity("fineract.dlt.batch_job_instance", 0, 101L);
-        ConsumerRecord<byte[], byte[]> r = record(P0, 0, "bank-a", 1);
-        ReplayIdentityHeaders.add(r.headers(), replay);
-
-        writer.replayOutcomesToReturn = Map.of(replay, ReplayOutcome.LEGACY_UNKNOWN);
-
-        w.enqueue(r);
-        w.processWithRetry(consumer);
-
-        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(1.0);
-        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.APPLIED)).isEqualTo(0.0);
-    }
-
-    @Test
     public void claimedOutcomeIsNeverRecordedAsCompleted() {
         View view = new View(snapshot("STEADY", "KAFKA"));
         SinkWorker w = worker(view, Map.of());
@@ -791,7 +777,6 @@ public class SinkWorkerDeliveryTest {
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_STALE)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.SKIPPED_SUPERSEDED)).isEqualTo(0.0);
         assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.ALREADY_COMPLETED)).isEqualTo(0.0);
-        assertThat(metrics.replayOutcomeCount("batch_job_instance", ReplayOutcomeLabel.LEGACY_UNKNOWN)).isEqualTo(0.0);
     }
 
     @Test
