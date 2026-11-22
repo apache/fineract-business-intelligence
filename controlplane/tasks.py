@@ -292,6 +292,8 @@ def maintenance() -> dict:
         purged_audit = cur.fetchone()[0]
         cur.execute("SELECT meta.purge_reconciliation_runs()")
         purged_recon = cur.fetchone()[0]
+        cur.execute("SELECT meta.purge_replay_ledger()")
+        purged_replay = cur.fetchone()[0]
     finally:
         conn.close()
     return {
@@ -300,4 +302,5 @@ def maintenance() -> dict:
         "progress_and_audit_rows": purged_progress,
         "ownership_audit_rows": purged_audit,
         "reconciliation": purged_recon,
+        "replay_ledger_rows": purged_replay,
     }

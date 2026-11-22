@@ -21,5 +21,13 @@ package org.apache.fineract.bi.ingestion.sink;
 import org.apache.fineract.bi.ingestion.cdc.ChangeEvent;
 import org.apache.fineract.bi.ingestion.routing.Route;
 
-public record RoutedEvent(ChangeEvent event, Route route) {
+public record RoutedEvent(ChangeEvent event, Route route, ReplayIdentity replayIdentity) {
+
+    public RoutedEvent(ChangeEvent event, Route route) {
+        this(event, route, null);
+    }
+
+    public boolean isReplay() {
+        return replayIdentity != null;
+    }
 }

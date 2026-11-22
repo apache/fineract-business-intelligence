@@ -87,6 +87,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA meta GRANT SELECT ON TABLES TO ${WAREHOUSE_EN
 GRANT INSERT, UPDATE, DELETE ON meta.consumer_offsets, meta.extract_watermarks, meta.ingestion_progress,
     meta.ingestion_audit, meta.pipeline_state TO ${WAREHOUSE_ENGINE_USER};
 GRANT INSERT ON meta.entity_change_log TO ${WAREHOUSE_ENGINE_USER};
+GRANT SELECT, INSERT ON meta.replay_ledger TO ${WAREHOUSE_ENGINE_USER};
+GRANT UPDATE (outcome) ON meta.replay_ledger TO ${WAREHOUSE_ENGINE_USER};
 REVOKE ALL ON meta.pii_hash_key FROM ${WAREHOUSE_ENGINE_USER};
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta TO ${WAREHOUSE_ENGINE_USER};
 
