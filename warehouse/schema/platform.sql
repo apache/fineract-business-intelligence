@@ -1016,6 +1016,74 @@ CREATE TABLE IF NOT EXISTS meta.pipeline_state (
     error_message TEXT
 );
 
+CREATE TABLE IF NOT EXISTS meta.alert_state (
+    alert_key           TEXT PRIMARY KEY,
+    alert_type          TEXT NOT NULL CHECK (alert_type IN ('FRESHNESS', 'DEAD_LETTER', 'CONNECTOR_FAILED', 'TOMBSTONE_STUCK')),
+    status              TEXT NOT NULL CHECK (status IN ('FIRING', 'RESOLVED')),
+    severity            TEXT NOT NULL DEFAULT 'CRITICAL' CHECK (severity IN ('CRITICAL', 'WARNING')),
+    first_fired_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_fired_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at         TIMESTAMPTZ,
+    details             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS meta.alert_outbox (
+    event_id            UUID PRIMARY KEY,
+    alert_key           TEXT NOT NULL,
+    alert_type          TEXT NOT NULL,
+    event_type          TEXT NOT NULL CHECK (event_type IN ('ALERT_FIRING', 'ALERT_RESOLVED')),
+    severity            TEXT NOT NULL,
+    payload             JSONB NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'SENT')),
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_attempt_at     TIMESTAMPTZ,
+    last_error          TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at             TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_outbox_pending
+    ON meta.alert_outbox (next_attempt_at, created_at)
+    WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_alert_outbox_alert_key ON meta.alert_outbox (alert_key);
+
+CREATE OR REPLACE FUNCTION meta.purge_alert_history(p_retention_days INTEGER DEFAULT NULL)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_days INTEGER;
+    v_purged_outbox INTEGER;
+    v_purged_state INTEGER;
+BEGIN
+    v_days := COALESCE(p_retention_days, 90);
+
+    DELETE FROM meta.alert_outbox
+    WHERE status = 'SENT'
+      AND sent_at < NOW() - make_interval(days => v_days);
+    GET DIAGNOSTICS v_purged_outbox = ROW_COUNT;
+
+    DELETE FROM meta.alert_state s
+    WHERE s.status = 'RESOLVED'
+      AND s.resolved_at < NOW() - make_interval(days => v_days)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM meta.alert_outbox o
+          WHERE o.alert_key = s.alert_key
+            AND o.status = 'PENDING'
+      );
+    GET DIAGNOSTICS v_purged_state = ROW_COUNT;
+
+    RETURN jsonb_build_object(
+        'purged_outbox_rows', v_purged_outbox,
+        'purged_state_rows', v_purged_state
+    );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION meta.create_stage_table(p_table TEXT)
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -1491,6 +1559,17 @@ BEGIN
     LOOP
         EXECUTE format('REVOKE ALL ON meta.pii_hash_key FROM %s', r.grantee);
     END LOOP;
+    FOR r IN
+        SELECT DISTINCT c.oid::regclass AS rel, g.grantee::regrole AS grantee
+        FROM pg_class c
+        CROSS JOIN LATERAL aclexplode(c.relacl) g
+        WHERE c.oid IN ('meta.alert_state'::regclass, 'meta.alert_outbox'::regclass)
+          AND g.grantee <> c.relowner
+          AND g.grantee <> 0
+          AND g.grantee NOT IN ('fbi_control_plane'::regrole, 'fbi_platform_admin'::regrole)
+    LOOP
+        EXECUTE format('REVOKE ALL ON %s FROM %s', r.rel, r.grantee);
+    END LOOP;
 END
 $$;
 
@@ -1527,6 +1606,12 @@ REVOKE ALL ON FUNCTION meta.scrub_pii() FROM PUBLIC;
 
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON meta.ingestion_ownership, meta.cutover_approval, meta.reconciliation_run,
     meta.ingestion_ownership_audit FROM PUBLIC;
+REVOKE ALL ON meta.alert_state, meta.alert_outbox FROM PUBLIC;
+REVOKE ALL ON FUNCTION meta.purge_alert_history(INTEGER) FROM PUBLIC;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON meta.alert_state, meta.alert_outbox TO fbi_control_plane;
+GRANT EXECUTE ON FUNCTION meta.purge_alert_history(INTEGER) TO fbi_control_plane;
+GRANT SELECT ON meta.alert_state, meta.alert_outbox TO fbi_platform_admin;
 
 REVOKE ALL ON FUNCTION
     meta.approve_cutover(TEXT, TEXT, TEXT),
